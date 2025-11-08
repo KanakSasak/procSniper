@@ -1,0 +1,134 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-10-26",
+  "description": "Ransomware file extensions database for procSniper detection",
+
+  "ransomware_extensions": [
+    ".encrypted",
+    ".omega",
+    ".locked",
+    ".enc",
+    ".crypt",
+    ".locky",
+    ".cerber",
+    ".zepto",
+    ".thor",
+    ".aesir",
+    ".cryptolocker",
+    ".cryptowall",
+    ".wannacry",
+    ".wcry",
+    ".wncry",
+    ".wncryt",
+    ".lockbit",
+    ".LockBit",
+    ".ryuk",
+    ".sodinokibi",
+    ".revil",
+    ".conti",
+    ".blackmatter",
+    ".alphv",
+    ".blackcat",
+    ".hive",
+    ".eking",
+    ".darkside",
+    ".babuk",
+    ".avaddon",
+    ".ragnarok",
+    ".netwalker",
+    ".maze",
+    ".egregor",
+    ".phobos",
+    ".dharma",
+    ".crysis",
+    ".stop",
+    ".djvu",
+    ".matrix",
+    ".snatch",
+    ".nemty",
+    ".nefilim",
+    ".pysa",
+    ".mespinoza",
+    ".clop",
+    ".ako",
+    ".medusa",
+    ".play",
+    ".royal",
+    ".lockergoga",
+    ".megacortex",
+    ".cuba",
+    ".quantum",
+    ".black",
+    ".trigona",
+    ".akira",
+    ".noescape",
+    ".8base",
+    ".cactus",
+    ".bianlian"
+  ],
+
+  "detection_thresholds": {
+    "high_entropy_file_threshold": 10,
+    "ransomware_extension_file_threshold": 5,
+    "combined_entropy_and_extension_threshold": 5,
+    "io_velocity_threshold_per_minute": 100,
+    "note": "Number of files required before triggering indicators. Combined threshold (high entropy + ransomware extension) triggers immediate termination."
+  },
+
+  "response_settings": {
+    "auto_terminate_enabled": true,
+    "immediate_response": true,
+    "terminate_on_extension_match": true,
+    "terminate_on_critical_score": true,
+    "critical_score_threshold": 50,
+    "quarantine_files": true,
+    "quarantine_directory": "C:\\ProgramData\\procSniper\\quarantine",
+    "suspend_before_terminate": false,
+    "investigation_mode": false
+  },
+
+  "whitelist": {
+    "enabled": false,
+    "processes": [],
+    "paths": [
+      "C:\\Windows\\System32",
+      "C:\\Windows\\SysWOW64",
+      "C:\\Program Files\\Windows Defender"
+    ],
+    "note": "Whitelisted paths will not trigger auto-response even if extensions match"
+  },
+
+  "alert_settings": {
+    "log_file": "C:\\ProgramData\\procSniper\\logs\\alerts.log",
+    "send_email_alerts": false,
+    "send_syslog": false,
+    "syslog_server": "",
+    "verbose_logging": true
+  },
+
+  "ransom_note_filenames": [
+    "README.txt",
+    "READ_ME.txt",
+    "DECRYPT.txt",
+    "HOW_TO_DECRYPT.txt",
+    "RECOVERY.txt",
+    "FILES_ENCRYPTED.txt",
+    "YOUR_FILES_ARE_ENCRYPTED.txt",
+    "HELP_DECRYPT.txt",
+    "HELP_RESTORE_FILES.txt",
+    "RESTORE_FILES.txt",
+    "README-DECRYPT.txt",
+    "HELP_ME_UNLOCK.txt",
+    "HOW_TO_RECOVER_FILES.txt",
+    "_readme.txt",
+    "_DECRYPT_FILES.txt"
+  ],
+
+  "notes": [
+    "Extensions are case-insensitive",
+    "Auto-terminate will kill process immediately when ransomware extension detected",
+    "Critical score threshold triggers auto-response after multi-indicator correlation",
+    "Investigation mode disables auto-terminate for manual analysis",
+    "Update this file with new ransomware family extensions as they emerge"
+  ]
+}

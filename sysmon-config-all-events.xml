@@ -1,0 +1,193 @@
+<Sysmon schemaversion="4.90">
+  <!-- Log ALL events - no filtering -->
+  <EventFiltering>
+    <!-- Event ID 1: Process creation -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- Event ID 2: File creation time changed -->
+    <RuleGroup name="" groupRelation="or">
+      <FileCreateTime onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileCreateTime>
+    </RuleGroup>
+
+    <!-- Event ID 3: Network connection -->
+    <RuleGroup name="" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- Event ID 5: Process terminated -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessTerminate onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ProcessTerminate>
+    </RuleGroup>
+
+    <!-- Event ID 6: Driver loaded -->
+    <RuleGroup name="" groupRelation="or">
+      <DriverLoad onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </DriverLoad>
+    </RuleGroup>
+
+    <!-- Event ID 7: Image loaded -->
+    <RuleGroup name="" groupRelation="or">
+      <ImageLoad onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ImageLoad>
+    </RuleGroup>
+
+    <!-- Event ID 8: CreateRemoteThread -->
+    <RuleGroup name="" groupRelation="or">
+      <CreateRemoteThread onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </CreateRemoteThread>
+    </RuleGroup>
+
+    <!-- Event ID 9: RawAccessRead -->
+    <RuleGroup name="" groupRelation="or">
+      <RawAccessRead onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </RawAccessRead>
+    </RuleGroup>
+
+    <!-- Event ID 10: Process accessed (CRITICAL for LSASS detection) -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessAccess onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ProcessAccess>
+    </RuleGroup>
+
+    <!-- Event ID 11: File created (CRITICAL for ransomware detection) -->
+    <RuleGroup name="" groupRelation="or">
+      <FileCreate onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- Event ID 12: Registry object added or deleted -->
+    <RuleGroup name="" groupRelation="or">
+      <RegistryEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- Event ID 13: Registry value set -->
+    <RuleGroup name="" groupRelation="or">
+      <RegistryEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- Event ID 14: Registry object renamed -->
+    <RuleGroup name="" groupRelation="or">
+      <RegistryEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- Event ID 15: FileCreateStreamHash -->
+    <RuleGroup name="" groupRelation="or">
+      <FileCreateStreamHash onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileCreateStreamHash>
+    </RuleGroup>
+
+    <!-- Event ID 17: Pipe created -->
+    <RuleGroup name="" groupRelation="or">
+      <PipeEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </PipeEvent>
+    </RuleGroup>
+
+    <!-- Event ID 18: Pipe connected -->
+    <RuleGroup name="" groupRelation="or">
+      <PipeEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </PipeEvent>
+    </RuleGroup>
+
+    <!-- Event ID 19: WMI event filter activity -->
+    <RuleGroup name="" groupRelation="or">
+      <WmiEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </WmiEvent>
+    </RuleGroup>
+
+    <!-- Event ID 20: WMI event consumer activity -->
+    <RuleGroup name="" groupRelation="or">
+      <WmiEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </WmiEvent>
+    </RuleGroup>
+
+    <!-- Event ID 21: WMI event consumer to filter activity -->
+    <RuleGroup name="" groupRelation="or">
+      <WmiEvent onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </WmiEvent>
+    </RuleGroup>
+
+    <!-- Event ID 22: DNS query -->
+    <RuleGroup name="" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </DnsQuery>
+    </RuleGroup>
+
+    <!-- Event ID 23: File deleted (for ransomware detection) -->
+    <RuleGroup name="" groupRelation="or">
+      <FileDelete onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileDelete>
+    </RuleGroup>
+
+    <!-- Event ID 24: Clipboard change -->
+    <RuleGroup name="" groupRelation="or">
+      <ClipboardChange onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ClipboardChange>
+    </RuleGroup>
+
+    <!-- Event ID 25: Process tampering -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessTampering onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </ProcessTampering>
+    </RuleGroup>
+
+    <!-- Event ID 26: File delete detected -->
+    <RuleGroup name="" groupRelation="or">
+      <FileDeleteDetected onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileDeleteDetected>
+    </RuleGroup>
+
+    <!-- Event ID 27: FileBlockExecutable -->
+    <RuleGroup name="" groupRelation="or">
+      <FileBlockExecutable onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileBlockExecutable>
+    </RuleGroup>
+
+    <!-- Event ID 28: FileBlockShredding -->
+    <RuleGroup name="" groupRelation="or">
+      <FileBlockShredding onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileBlockShredding>
+    </RuleGroup>
+
+    <!-- Event ID 29: FileExecutableDetected -->
+    <RuleGroup name="" groupRelation="or">
+      <FileExecutableDetected onmatch="exclude">
+        <!-- No exclusions - log everything -->
+      </FileExecutableDetected>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>
