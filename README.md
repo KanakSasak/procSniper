@@ -24,7 +24,6 @@ Most EDR solutions fail against modern ransomware because they rely on single de
 | **BackupRead/Write API Detection** | Sysmon Event ID 11 evasion | Real-time (API call) |
 | **Ransom Note Correlation** | Encrypted files + ransom notes | 10-30 seconds |
 
-**Result:** Detects **100% of ransomware types** tested, including slow-moving, in-place encryption, API evasion, and advanced variants that bypass traditional EDR.
 
 ---
 
@@ -113,18 +112,13 @@ if delta >= 2.0 {
 
 ### 3. Windows API Locked File Reading
 
-**Problem:** Ransomware locks files during encryption, preventing analysis:
-```go
-file, err := os.Open(filePath)  // ❌ FAILS: "The process cannot access the file"
-```
-
-**Solution:** Use Windows API with `FILE_SHARE_READ|FILE_SHARE_WRITE`:
+Use Windows API with `FILE_SHARE_READ|FILE_SHARE_WRITE`:
 
 ```go
 handle, err := windows.CreateFile(
     pathPtr,
     windows.GENERIC_READ,
-    windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,  // ← KEY: Read during write
+    windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, 
     nil,
     windows.OPEN_EXISTING,
     windows.FILE_ATTRIBUTE_NORMAL,
@@ -133,15 +127,14 @@ handle, err := windows.CreateFile(
 ```
 
 **Benefits:**
-- **Reads files during active encryption** (95% success rate on locked files)
+- **Reads files during active encryption**
 - **Real-time detection** (analyzes entropy while ransomware holds lock)
-- **No blind spots** (standard os.Open() fails ~60% of the time on locked files)
 
 ### 4. Progressive Directory Scanning
 
 **Traditional approach:**
 ```go
-time.Sleep(8 * time.Second)  // ❌ Gives ransomware 8 free seconds
+time.Sleep(8 * time.Second) 
 scanDirectory(path)
 ```
 
@@ -150,7 +143,7 @@ scanDirectory(path)
 // SCAN 1: Immediate (0s delay)
 scan1 := scanDirectory(path)
 if len(scan1) > 3 {
-    alert("IMMEDIATE DETECTION: Fast encryption")  // ⚡ Instant alert
+    alert("IMMEDIATE DETECTION: Fast encryption")
     return
 }
 
@@ -158,7 +151,7 @@ if len(scan1) > 3 {
 time.Sleep(2 * time.Second)
 scan2 := scanDirectory(path)
 if len(scan2) > len(scan1) + 5 {
-    alert("ENCRYPTION IN PROGRESS: +5 files in 2s")  // 🔥 Active encryption
+    alert("ENCRYPTION IN PROGRESS: +5 files in 2s")
     return
 }
 
@@ -166,7 +159,7 @@ if len(scan2) > len(scan1) + 5 {
 time.Sleep(3 * time.Second)
 scan3 := scanDirectory(path)
 if len(scan3) > threshold {
-    alert("SLOW ENCRYPTION: Detected over 5s")  // 🕒 Comprehensive scan
+    alert("SLOW ENCRYPTION: Detected over 5s")
 }
 ```
 
@@ -243,7 +236,7 @@ Event ID 4703: Process enables SeBackupPrivilege
     ↓
 Event ID 4674: BackupRead/BackupWrite API called
     ↓
-🚨 CRITICAL: Process bypassing Sysmon Event ID 11
+CRITICAL: Process bypassing Sysmon Event ID 11
 ```
 
 **Implementation:**
@@ -270,11 +263,11 @@ case 4674: // Privileged operation (actual API call)
 
 **Verbose Logging:**
 ```
-[SECURITY] 🚨 BACKUP PRIVILEGE ENABLED: Process malware.exe (PID: 1234)
-[SECURITY] 🚨 CRITICAL: Process can now use BackupRead/BackupWrite APIs!
+[SECURITY] BACKUP PRIVILEGE ENABLED: Process malware.exe (PID: 1234)
+[SECURITY] CRITICAL: Process can now use BackupRead/BackupWrite APIs!
 [SECURITY] [VERBOSE] BackupWrite API signature: BOOL BackupWrite(HANDLE, LPBYTE, ...)
 [SECURITY] [VERBOSE] Threat: Process can write files bypassing ACLs and Sysmon
-[SECURITY] 🚨 ALERT: BackupRead/BackupWrite API call detected!
+[SECURITY] ALERT: BackupRead/BackupWrite API call detected!
 ```
 
 ### 7. Ransom Note Correlation (Tier 2)
@@ -289,14 +282,14 @@ TIER 2 (30 files/min) Triggered
     ↓
 Process creates 5+ .txt files across 3+ directories
     ↓
-🔍 TRIGGER: Ransom note pattern detected
+TRIGGER: Ransom note pattern detected
     ↓
 Scan those directories for ransomware extensions
     ↓
 Found: 3+ encrypted files (.locked, .encrypted, etc.)
        + 1+ ransom note
     ↓
-🚨 HIGH CONFIDENCE: Add indicator (45 points)
+HIGH CONFIDENCE: Add indicator (45 points)
 ```
 
 **Implementation:**
@@ -344,13 +337,13 @@ func scanDirectoriesForEncryptedFiles(directories []string) {
 **Example Detection:**
 ```
 [TIER 2] .txt file created: README.txt (5 total .txt files across 4 directories)
-[TIER 2] 🔍 RANSOM NOTE PATTERN DETECTED
+[TIER 2] RANSOM NOTE PATTERN DETECTED
 [DIR SCAN] Scanning directory: C:\Users\victim\Documents (23 files)
-[DIR SCAN] 🚨 ENCRYPTED FILE FOUND: document.docx.locked
-[DIR SCAN] 🚨 ENCRYPTED FILE FOUND: taxes.pdf.locked
-[DIR SCAN] 📝 Ransom note found: README.txt
-[DIR SCAN] 🚨 HIGH CONFIDENCE DETECTION: 3 encrypted files + 1 ransom note
-[DIR SCAN] 🔴 ENCRYPTED FILES CONFIRMED (Score: 85)
+[DIR SCAN] ENCRYPTED FILE FOUND: document.docx.locked
+[DIR SCAN] ENCRYPTED FILE FOUND: taxes.pdf.locked
+[DIR SCAN] Ransom note found: README.txt
+[DIR SCAN] HIGH CONFIDENCE DETECTION: 3 encrypted files + 1 ransom note
+[DIR SCAN] ENCRYPTED FILES CONFIRMED (Score: 85)
 ```
 
 ---
@@ -408,7 +401,7 @@ procSniper uses an accumulative point system based on MITRE ATT&CK indicators:
 
 ### Prerequisites
 
-- **Windows 10/11** or **Windows Server 2016+**
+- **Windows 10/11**
 - **Administrator privileges**
 - **Sysmon** (for event monitoring)
 - **Go 1.25+** (for building from source)
@@ -478,6 +471,8 @@ cd test\simulators
 # Build test tools
 go build -o file_encryptor.exe file_encryptor.go
 
+go build -o file_generator.exe file_generator.go
+
 # Create test directory
 mkdir C:\test\ransomware
 
@@ -492,40 +487,40 @@ mkdir C:\test\ransomware
 ```
 [FILE_CREATED] C:\test\ransomware\document.txt.conti (by file_encryptor.exe)
 [VELOCITY] 120.0 files/min detected → TIER 3 CRITICAL
-[DETECTION] 🔴 TIER 3 CRITICAL: 120.00 files/min
+[DETECTION] TIER 3 CRITICAL: 120.00 files/min
 [ENTROPY] File entropy: 7.95 bits/byte (threshold: 7.5)
-[DETECTION] 🚨 HIGH ENTROPY DETECTED
+[DETECTION] HIGH ENTROPY DETECTED
 [PATH ANALYSIS] Scan 1/3: Immediate check...
-[DETECTION] ⚡ IMMEDIATE DETECTION: 12 suspicious files in C:\test\ransomware
-[DETECTION] 🔴 BULK ENCRYPTION INDICATOR ADDED [IMMEDIATE] (Score: 115, Points: +45)
+[DETECTION] IMMEDIATE DETECTION: 12 suspicious files in C:\test\ransomware
+[DETECTION] BULK ENCRYPTION INDICATOR ADDED [IMMEDIATE] (Score: 115, Points: +45)
 [THREAT_EVAL] Process PID 5432 score: 115 → CRITICAL
-[RESPONSE] 🔴 TERMINATING PROCESS: file_encryptor.exe (PID: 5432)
-[RESPONSE] ✅ Process terminated successfully
+[RESPONSE] TERMINATING PROCESS: file_encryptor.exe (PID: 5432)
+[RESPONSE] Process terminated successfully
 ```
 
 ## Known Limitations
 
 ### What procSniper Does NOT Detect
 
-❌ **Extremely slow ransomware** (< 1 file/min) between canary checks
-❌ **Memory-only encryption** (no file I/O)
-❌ **Network-based attacks** (no network monitoring)
-❌ **Kernel-mode ransomware** (userland detection only)
-❌ **Ransomware targeting specific files** that avoids canaries and stays < 10 files/min
+1. **Extremely slow ransomware** (< 1 file/min) between canary checks
+2. **Memory-only encryption** (no file I/O)
+3. **Network-based attacks** (no network monitoring)
+4. **Kernel-mode ransomware** (userland detection only)
+5. **Ransomware targeting specific files** that avoids canaries and stays < 10 files/min
 
 ### Potential False Positives
 
-⚠️ **Backup software** (Veeam, Acronis) - High I/O velocity
-→ **Solution:** Whitelist by process name
+**Backup software** (Veeam, Acronis) - High I/O velocity
+**Solution:** Whitelist by process name
 
-⚠️ **Compression tools** (7-Zip, WinRAR) - High entropy output
-→ **Solution:** Magic byte verification (already implemented)
+**Compression tools** (7-Zip, WinRAR) - High entropy output
+**Solution:** Magic byte verification (already implemented)
 
-⚠️ **Video encoding** (Handbrake, FFmpeg) - High I/O + entropy
-→ **Solution:** Multi-tier velocity allows analysis before false alert
+**Video encoding** (Handbrake, FFmpeg) - High I/O + entropy
+**Solution:** Multi-tier velocity allows analysis before false alert
 
-⚠️ **Software updates** - Many file modifications
-→ **Solution:** Whitelist installer directories (C:\Program Files)
+**Software updates** - Many file modifications
+**Solution:** Whitelist installer directories (C:\Program Files)
 
 **False Positive Rate (measured):** <10% in testing.
 
@@ -534,11 +529,6 @@ mkdir C:\test\ransomware
 ## Research & Methodology
 
 ### Entropy Analysis
-
-**Shannon Entropy Formula:**
-```
-H(X) = -Σ(p(xi) * log2(p(xi)))
-```
 
 **Interpretation:**
 - **0.0-4.0 bits/byte:** Highly repetitive (text files)
@@ -624,7 +614,7 @@ Contributions welcome! Areas of interest:
 
 ## Disclaimer
 
-⚠️ **Legal Notice**
+**Legal Notice**
 
 This is a **defensive security tool** intended for:
 - System protection on authorized systems
