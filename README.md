@@ -416,12 +416,6 @@ Invoke-WebRequest -Uri https://live.sysinternals.com/sysmon64.exe -OutFile sysmo
 .\sysmon64.exe -accepteula -i
 ```
 
-**Verify Sysmon is running:**
-```powershell
-Get-Service Sysmon64
-# Status should be "Running"
-```
-
 ### Step 2: Build procSniper
 
 ```bash
