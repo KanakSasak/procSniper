@@ -97,6 +97,7 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig) {
 		responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
 		responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
 		cfg.EnableRansomNoteDetection,
+		cfg.RansomwareExtensions,
 	)
 	log.Println("[+] Detection engine initialized")
 

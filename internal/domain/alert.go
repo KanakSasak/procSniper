@@ -106,39 +106,12 @@ type SysmonEvent struct {
 	RawXML        string
 }
 
-// RansomwareExtensions are file extensions commonly used by ransomware
-var RansomwareExtensions = []string{
-	".encrypted",
-	".locked",
-	".enc",
-	".crypt",
-	".locky",
-	".cerber",
-	".zepto",
-	".thor",
-	".aesir",
-	".cryptolocker",
-	".cryptowall",
-	".teslacrypt",
-	".wannacry",
-	".wcry",
-	".wncry",
-	".lockbit",
-	".ryuk",
-	".sodinokibi",
-	".revil",
-	".conti",
-	".blackmatter",
-	".alphv",
-	".hive",
-}
-
 // IsRansomwareExtension checks if file extension matches known ransomware patterns (case-insensitively)
-func IsRansomwareExtension(filename string) bool {
+func IsRansomwareExtension(filename string, extensions []string) bool {
 	// Convert the entire filename to lowercase
 	lowerFilename := strings.ToLower(filename)
 
-	for _, ext := range RansomwareExtensions {
+	for _, ext := range extensions {
 		// Use strings.HasSuffix for a cleaner and more readable check
 		// This checks if lowerFilename ends with ext
 		if strings.HasSuffix(lowerFilename, ext) {

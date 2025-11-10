@@ -29,6 +29,11 @@ Most EDR solutions fail against modern ransomware because they rely on single de
 
 ---
 
+## Video DEMO
+
+[![BlackBasta Terminated](screenshots/cover-video.png)](screenshots/blackBasta-terminated.mkv)
+
+
 ## Why procSniper?
 
 ### procSniper's Approach

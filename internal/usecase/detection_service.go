@@ -133,6 +133,9 @@ type DetectionService struct {
 
 	// Feature flags
 	enableRansomNoteDetection bool // Enable/disable ransom note detection (default: false, focus on behavioral)
+
+	// Detection data from config
+	ransomwareExtensions []string // List of ransomware extensions to detect
 }
 
 // NewDetectionService creates a new detection service
@@ -140,7 +143,8 @@ type DetectionService struct {
 // extensionThreshold: number of ransomware extension files required before adding extension indicator
 // combinedThreshold: files with BOTH high entropy AND ransomware extension for immediate termination
 // enableRansomNoteDetection: enable/disable ransom note detection (default: false, focus on behavioral)
-func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold int, enableRansomNoteDetection bool) *DetectionService {
+// ransomwareExtensions: list of ransomware file extensions to detect
+func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold int, enableRansomNoteDetection bool, ransomwareExtensions []string) *DetectionService {
 	return &DetectionService{
 		velocityTracker:           domain.NewFileOperationTracker(60 * time.Second),
 		threatScorer:              domain.NewThreatScorer(),
@@ -157,6 +161,7 @@ func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold
 		extensionFileThreshold:    extensionThreshold,
 		combinedThreshold:         combinedThreshold,
 		enableRansomNoteDetection: enableRansomNoteDetection,
+		ransomwareExtensions:      ransomwareExtensions,
 	}
 }
 
@@ -465,7 +470,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	ds.fileCountersMux.Unlock()
 
 	// Check both conditions: ransomware extension AND entropy
-	hasRansomExtension := domain.IsRansomwareExtension(event.TargetFile)
+	hasRansomExtension := domain.IsRansomwareExtension(event.TargetFile, ds.ransomwareExtensions)
 	entropy, entropyErr := domain.AnalyzeFileEntropy(event.TargetFile, ext)
 
 	// DEBUG: Log entropy analysis result
@@ -1642,7 +1647,7 @@ func (ds *DetectionService) scanDirectoryForRansomware(dirPath string) ([]string
 		log.Printf("[DIRECTORY SCAN FILES] File: %s", filePath)
 
 		// Check if file has ransomware extension
-		if domain.IsRansomwareExtension(filePath) {
+		if domain.IsRansomwareExtension(filePath, ds.ransomwareExtensions) {
 			log.Printf("[DIRECTORY SCAN] Found malicious file: %s", fileName)
 			ransomFiles = append(ransomFiles, fileName)
 		}
@@ -2017,7 +2022,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 
 	// Check if a ransomware-renamed version exists
 	// Common pattern: file.txt deleted -> file.txt.omega exists
-	for _, ransomExt := range domain.RansomwareExtensions {
+	for _, ransomExt := range ds.ransomwareExtensions {
 		renamedPath := event.TargetFile + ransomExt
 
 		// Check if renamed file exists
@@ -2233,7 +2238,7 @@ func (ds *DetectionService) scanDirectoriesForEncryptedFiles(processGuid string,
 			ext := filepath.Ext(fileName)
 
 			// Check if file has ransomware extension
-			if domain.IsRansomwareExtension(fullPath) {
+			if domain.IsRansomwareExtension(fullPath, ds.ransomwareExtensions) {
 				encryptedFiles = append(encryptedFiles, fullPath)
 				encryptedFilesByExt[ext]++
 				log.Printf("[DIR SCAN] 🚨 ENCRYPTED FILE FOUND: %s (extension: %s)", fullPath, ext)
