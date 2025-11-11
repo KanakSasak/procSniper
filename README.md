@@ -31,7 +31,14 @@ Most EDR solutions fail against modern ransomware because they rely on single de
 
 ## Video DEMO
 
+# BlackBasta Ransomware
 [![BlackBasta Terminated](screenshots/cover-video.png)](https://youtu.be/DC-910coM2E)
+
+# Lockbit Ransomware
+[![Lockbit Terminated](screenshots/cover-video.png)](https://youtu.be/XqE_dMzbiVw)
+
+# Conti Ransomware
+[![Conti Terminated](screenshots/cover-video.png)](https://youtu.be/5ku1HKDZ-8k)
 
 
 ## Why procSniper?
