@@ -432,17 +432,56 @@ Invoke-WebRequest -Uri https://live.sysinternals.com/sysmon64.exe -OutFile sysmo
 
 ### Step 2: Build procSniper
 
+**Option A: Command Line Interface (CLI)**
+
 ```bash
 git clone https://github.com/kanaksasak/procSniper.git
 cd procSniper
 go build -o procSniper.exe
 ```
 
+**Option B: Windows Desktop GUI (Wails v2)**
+
+The GUI provides a modern desktop interface with real-time monitoring, configuration management, and live log streaming.
+
+**Prerequisites for GUI build:**
+- [Wails CLI v2](https://wails.io/docs/gettingstarted/installation) - `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+- [Node.js 18+](https://nodejs.org/) - Required for frontend build
+- [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) - Usually pre-installed on Windows 10/11
+
+```bash
+git clone https://github.com/kanaksasak/procSniper.git
+cd procSniper
+
+# Install frontend dependencies
+cd frontend && npm install && cd ..
+
+# Build GUI application
+wails build -tags gui
+```
+
+The built executable will be at: `build/bin/procSniper-gui.exe`
+
+**GUI Features:**
+- Real-time dashboard with protection status and statistics
+- Live log viewer with color-coded log levels
+- Configuration editor for detection thresholds
+- Alert history and threat monitoring
+
+![GUI Dashboard](screenshots/gui-dashboard.png)
+
 ### Step 3: Start Protection
 
+**CLI Mode:**
 ```powershell
 # Run as Administrator
 .\procSniper.exe
+```
+
+**GUI Mode:**
+```powershell
+# Run as Administrator
+.\build\bin\procSniper-gui.exe
 ```
 
 **procSniper will:**
