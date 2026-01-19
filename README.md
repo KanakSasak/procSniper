@@ -468,7 +468,11 @@ The built executable will be at: `build/bin/procSniper-gui.exe`
 - Configuration editor for detection thresholds
 - Alert history and threat monitoring
 
-![GUI Dashboard](screenshots/gui-dashboard.png)
+![GUI Dashboard](screenshots/dashboard-gui.png)
+
+![GUI Configuration](screenshots/dashboard-gui-config.png)
+
+![GUI Ransomware Detection](screenshots/dashboard-gui-detect-ransom.png)
 
 ### Step 3: Start Protection
 
