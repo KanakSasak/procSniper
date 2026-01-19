@@ -10,6 +10,9 @@
 
 **procSniper** is a behavioral ransomware detection engine that combines **seven layered detection techniques** to catch ransomware at multiple stages of execution—from first file modification to bulk encryption. Unlike signature-based antivirus solutions, procSniper detects ransomware by analyzing behavior patterns, file entropy changes, API abuse, and honeypot tripwires, achieving **0-30 second detection times** with < 10% false positive rate.
 
+### Interactive UI
+![GUI Ransomware Detection](screenshots/dashboard-gui-detect-ransom.png)
+
 ![ProcSniper Protect](screenshots/start.png)
 
 ### Key Innovation
