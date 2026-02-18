@@ -10,7 +10,7 @@ procSniper is a Go-based Windows defensive system that combines rule correlation
 
 The detection architecture is mode-aware. In `rules_only`, threat scoring and rule indicators drive alerts and response policy. In `hybrid`, rule-path alerts remain active while ML inference is added after feature-gate conditions are met. In `ml_only`, rule indicators continue to accumulate as ML features, but rule-based fallback alerts are intentionally disabled, making ML the sole decision path once gate and threshold requirements are satisfied.
 
-The current recommended model line (`ml-2` v2) is a 2-class ONNX model (`benign`, `ransomware`) with repository-tracked threshold guidance (`0.08`) and quality artifacts in `ml-2/models/model_metadata.json` and `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`. Reported validation and test results show high ransomware recall with bounded benign false-positive rate under the project evaluation setup, but these numbers are evaluation-context results rather than universal guarantees; deployment outcomes still depend on dataset representativeness, threshold calibration, and attacker adaptation.
+The current recommended model line (v2) is a 2-class ONNX model (`benign`, `ransomware`) with repository-tracked threshold guidance (`0.08`) and quality artifacts in `ml-2/models/model_metadata.json` and `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`. Reported validation and test results show high ransomware recall with bounded benign false-positive rate under the project evaluation setup, but these numbers are evaluation-context results rather than universal guarantees; deployment outcomes still depend on dataset representativeness, threshold calibration, and attacker adaptation.
 
 For defenders, this translates into practical host-level disruption capability with explicit tradeoff controls: real-time behavioral monitoring, configurable `rules_only`/`hybrid`/`ml_only` operation, canary-backed response actions, and clear operational boundaries around low-and-slow campaigns, network-only visibility gaps, and kernel- or firmware-level threats outside current userland scope.
 
@@ -72,38 +72,8 @@ ONNX runtime behavior:
 - Runtime prediction payload remains shape-stable for downstream consumers, with stealer probability `0` for 2-class models.
 
 Recommended model for current ops examples:
-- `ml-2/models/procsniper_rf_ml2_v2.onnx`
+- `models/procsniper_rf_ml2_v2.onnx`
 
-## Evidence and Evaluation
-
-Primary evidence artifacts:
-- `ml-2/models/model_metadata.json`
-- `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`
-- `ml-2/models/procsniper_rf_ml2_v2_quality_report.json`
-
-Metadata highlights from `ml-2/models/model_metadata.json`:
-- Model: `procsniper_rf_ml2_v2`
-- Type: `RandomForestClassifier`
-- Classes: `benign`, `ransomware`
-- Training date: `2026-02-14T02:38:35.892495Z`
-- Training samples: `84000`
-- Recommended threshold: `0.08`
-
-Quality summary from `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`:
-
-| Split | Accuracy | Precision | Recall | F1 | Benign FPR | ROC AUC | PR AUC |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| VAL | 0.954389 | 0.884707 | 1.000000 | 0.938827 | 0.070171 | 0.999327 | 0.998749 |
-| TEST | 0.955167 | 0.890183 | 0.994603 | 0.939501 | 0.066068 | 0.998183 | 0.996818 |
-
-Gate context reported in quality artifacts:
-- Validation recall and benign FPR gates: pass.
-- Early ransomware slice recall gate: pass.
-- Replay high-risk pass-rate gate: pass.
-
-Evaluation caveats:
-- Metrics represent this project's datasets, scenario slices, and replay methodology.
-- Deployment outcomes depend on local workload mix, threshold tuning, and adversary behavior.
 
 ## Detection Modes and Response Semantics
 
@@ -154,7 +124,7 @@ How to use it:
   --ml-min-indicators 3
 ```
 
-2. If your model is elsewhere (for example `ml-2/models/...`), place `onnxruntime.dll` in any loader lookup location:
+2. If your model is elsewhere (for example `models/...`), place `onnxruntime.dll` in any loader lookup location:
 - same directory as `procSniper.exe` (or `build/bin/procSniper-gui.exe`)
 - same directory as the model passed via `--ml`
 - current working directory as `onnxruntime.dll`
@@ -184,9 +154,9 @@ Hybrid (rules plus ML):
 
 ```powershell
 .\procSniper.exe protect `
-  --ml ml-2/models/procsniper_rf_ml2_v2.onnx `
+  --ml models/procsniper_rf_ml2_v2.onnx `
   --detection-mode hybrid `
-  --ml-confidence 0.08 `
+  --ml-confidence 0.07 `
   --ml-min-indicators 3 `
   --canary-response suspend
 ```
@@ -195,9 +165,9 @@ ML-only:
 
 ```powershell
 .\procSniper.exe protect `
-  --ml ml-2/models/procsniper_rf_ml2_v2.onnx `
+  --ml models/procsniper_rf_ml2_v2.onnx `
   --detection-mode ml_only `
-  --ml-confidence 0.08 `
+  --ml-confidence 0.07 `
   --ml-min-indicators 3
 ```
 
@@ -205,7 +175,7 @@ Core commands:
 
 ```powershell
 .\procSniper.exe config
-.\procSniper.exe ml-test --model ml-2/models/procsniper_rf_ml2_v2.onnx
+.\procSniper.exe ml-test --model models/procsniper_rf_ml2_v2.onnx
 .\procSniper.exe version
 ```
 
@@ -238,40 +208,7 @@ For full GUI/CLI setup details, see `docs/BUILD.md`.
 Threshold note:
 - The v2 quality artifacts recommend `0.08`; set this explicitly when using `procsniper_rf_ml2_v2`.
 
-## Condensed Research Workflow
 
-Use the `ml-2` pipeline for the current v2 model line:
-
-Train:
-
-```bash
-python ml-2/train_model.py
-```
-
-Evaluate:
-
-```bash
-python ml-2/evaluate_model_accuracy.py --model-joblib ml-2/models/procsniper_rf_ml2_v2.joblib
-```
-
-Compare ONNX models:
-
-```bash
-python ml-2/compare_onnx_models.py `
-  --model-a ml-2/models/procsniper_rf_ml2_v1.onnx `
-  --model-b ml-2/models/procsniper_rf_ml2_v2.onnx
-```
-
-Key artifacts:
-- `ml-2/models/procsniper_rf_ml2_v2.joblib`
-- `ml-2/models/procsniper_rf_ml2_v2.onnx`
-- `ml-2/models/model_metadata.json`
-- `ml-2/models/procsniper_rf_ml2_v2_quality_report.json`
-- `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`
-
-Related references:
-- `ml-2/data_dictionary.md`
-- `ml-2/source_provenance.md`
 
 ## Limitations
 
