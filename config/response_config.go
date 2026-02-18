@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -11,6 +12,7 @@ import (
 type DetectionThresholds struct {
 	HighEntropyFileThreshold             int    `json:"high_entropy_file_threshold"`
 	RansomwareExtensionFileThreshold     int    `json:"ransomware_extension_file_threshold"`
+	RansomwareExtensionRenameThreshold   int    `json:"ransomware_extension_rename_threshold"`
 	CombinedEntropyAndExtensionThreshold int    `json:"combined_entropy_and_extension_threshold"`
 	IOVelocityThresholdPerMinute         int    `json:"io_velocity_threshold_per_minute"`
 	Note                                 string `json:"note"`
@@ -41,7 +43,12 @@ type ResponseSetting struct {
 	QuarantineFiles           bool   `json:"quarantine_files"`
 	QuarantineDirectory       string `json:"quarantine_directory"`
 	SuspendBeforeTerminate    bool   `json:"suspend_before_terminate"`
+	SuspendRelatedOnCanary    bool   `json:"suspend_related_on_canary"`
+	RelatedSuspicionMinScore  int    `json:"related_suspicion_min_score"`
+	RelatedActorWindowSeconds int    `json:"related_actor_window_seconds"`
 	InvestigationMode         bool   `json:"investigation_mode"`
+	DetectionMode             string `json:"detection_mode"`              // "rules_only", "hybrid", "ml_only"
+	CanaryResponseAction      string `json:"canary_response_action"`      // "terminate", "suspend", "alert_only"
 }
 
 // WhitelistConfig defines processes/paths exempt from auto-response
@@ -79,9 +86,36 @@ func LoadResponseConfig(configPath string) (*ResponseConfig, error) {
 		return nil, fmt.Errorf("failed to parse response config: %w", err)
 	}
 
+	// Parse raw response_settings keys so we can apply defaults only when fields are absent.
+	var rawConfig map[string]json.RawMessage
+	_ = json.Unmarshal(data, &rawConfig)
+	responseSettingsHas := map[string]bool{}
+	if rawResponseSettings, ok := rawConfig["response_settings"]; ok {
+		var rawResponseSettingMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawResponseSettings, &rawResponseSettingMap); err == nil {
+			for key := range rawResponseSettingMap {
+				responseSettingsHas[key] = true
+			}
+		}
+	}
+
 	// Normalize extensions to lowercase
 	for i := range config.RansomwareExtensions {
 		config.RansomwareExtensions[i] = strings.ToLower(config.RansomwareExtensions[i])
+	}
+
+	// Backward-compatible defaults for missing threshold fields.
+	if config.DetectionThresholds.RansomwareExtensionRenameThreshold <= 0 {
+		config.DetectionThresholds.RansomwareExtensionRenameThreshold = 3
+	}
+	if _, ok := responseSettingsHas["suspend_related_on_canary"]; !ok {
+		config.ResponseSettings.SuspendRelatedOnCanary = true
+	}
+	if config.ResponseSettings.RelatedSuspicionMinScore <= 0 {
+		config.ResponseSettings.RelatedSuspicionMinScore = 50
+	}
+	if config.ResponseSettings.RelatedActorWindowSeconds <= 0 {
+		config.ResponseSettings.RelatedActorWindowSeconds = 60
 	}
 
 	return &config, nil
@@ -98,8 +132,25 @@ func (rc *ResponseConfig) IsRansomwareExtension(extension string) bool {
 	return false
 }
 
-// IsWhitelisted checks if a path is whitelisted
+// IsWhitelisted checks if a process or path is whitelisted
 func (rc *ResponseConfig) IsWhitelisted(path string) bool {
+	// Always honor trusted process allowlist (process list can be used independently)
+	path = strings.TrimSpace(path)
+	if path != "" {
+		pathLower := strings.ToLower(path)
+		baseLower := strings.ToLower(filepath.Base(path))
+		for _, proc := range rc.Whitelist.Processes {
+			procLower := strings.ToLower(strings.TrimSpace(proc))
+			if procLower == "" {
+				continue
+			}
+			if procLower == baseLower || procLower == pathLower {
+				return true
+			}
+		}
+	}
+
+	// Whitelist paths only apply when enabled
 	if !rc.Whitelist.Enabled {
 		return false
 	}

@@ -18,6 +18,22 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Windows Event Log API (wevtapi.dll)
+var (
+	modWevtapi       = windows.NewLazySystemDLL("wevtapi.dll")
+	procEvtSubscribe = modWevtapi.NewProc("EvtSubscribe")
+	procEvtNext      = modWevtapi.NewProc("EvtNext")
+	procEvtRender    = modWevtapi.NewProc("EvtRender")
+	procEvtClose     = modWevtapi.NewProc("EvtClose")
+)
+
+// Event subscription flags
+const (
+	EvtSubscribeToFutureEvents = 1
+	EvtSubscribeStartAtOldestRecord = 2
+	EvtRenderEventXml          = 1
+)
+
 // Windows Security Event IDs for privilege detection
 const (
 	EventIDPrivilegeUse      = 4672 // Special privileges assigned to new logon
@@ -67,20 +83,8 @@ func (slc *SecurityLogConsumer) Stop() {
 
 // subscribeToSecurityEvents subscribes to Windows Security event log
 func (slc *SecurityLogConsumer) subscribeToSecurityEvents(ctx context.Context) {
-	// XPath query to filter relevant Security events
-	// Event IDs: 4672 (Special privileges), 4703 (Token adjusted)
-	query := "*[System[(EventID=4672 or EventID=4703 or EventID=4674)]]"
 	channelPath := "Security"
-
 	log.Printf("[SECURITY] Subscribing to Security event log...")
-	log.Printf("[SECURITY] Query: %s\n", query)
-
-	// Convert to UTF16
-	queryPtr, err := syscall.UTF16PtrFromString(query)
-	if err != nil {
-		log.Printf("[!] Failed to convert query: %v\n", err)
-		return
-	}
 
 	channelPtr, err := syscall.UTF16PtrFromString(channelPath)
 	if err != nil {
@@ -88,24 +92,94 @@ func (slc *SecurityLogConsumer) subscribeToSecurityEvents(ctx context.Context) {
 		return
 	}
 
-	// Subscribe to events (EvtSubscribeToFutureEvents = 1)
-	subscription, err := evtSubscribe(
-		0,          // Session (NULL for local)
-		0,          // SignalEvent (NULL)
-		channelPtr, // Channel path
-		queryPtr,   // Query
-		0,          // Bookmark (NULL)
-		0,          // Context
-		0,          // Callback (NULL, we'll use pull mode)
-		1,          // EvtSubscribeToFutureEvents
-	)
-
+	// Pull subscription mode requires a valid signal event when callback is NULL.
+	// Using NULL for both callback and signal event returns ERROR_INVALID_PARAMETER.
+	signalEvent, err := windows.CreateEvent(nil, 0, 0, nil)
 	if err != nil {
-		log.Printf("[!] Failed to subscribe to Security events: %v\n", err)
+		log.Printf("[!] Failed to create subscription signal event: %v\n", err)
+		return
+	}
+	defer windows.CloseHandle(signalEvent)
+
+	// Try multiple valid query forms because some systems/providers reject one form with ERROR_INVALID_PARAMETER.
+	type subscribeAttempt struct {
+		name       string
+		channelPtr *uint16
+		query      string
+		flags      uint32
+	}
+
+	queryList := `<QueryList><Query Id="0" Path="Security"><Select Path="Security">*[System[(EventID=4672 or EventID=4703 or EventID=4674)]]</Select></Query></QueryList>`
+	attempts := []subscribeAttempt{
+		{
+			name:       "XPath + FutureEvents",
+			channelPtr: channelPtr,
+			query:      "*[System[(EventID=4672 or EventID=4703 or EventID=4674)]]",
+			flags:      EvtSubscribeToFutureEvents,
+		},
+		{
+			name:       "XPath(Event[]) + FutureEvents",
+			channelPtr: channelPtr,
+			query:      "Event[System[(EventID=4672 or EventID=4703 or EventID=4674)]]",
+			flags:      EvtSubscribeToFutureEvents,
+		},
+		{
+			name:       "QueryList + FutureEvents",
+			channelPtr: nil, // QueryList embeds the channel path
+			query:      queryList,
+			flags:      EvtSubscribeToFutureEvents,
+		},
+		{
+			name:       "XPath + StartAtOldestRecord",
+			channelPtr: channelPtr,
+			query:      "*[System[(EventID=4672 or EventID=4703 or EventID=4674)]]",
+			flags:      EvtSubscribeStartAtOldestRecord,
+		},
+		{
+			name:       "QueryList + StartAtOldestRecord",
+			channelPtr: nil,
+			query:      queryList,
+			flags:      EvtSubscribeStartAtOldestRecord,
+		},
+	}
+
+	var subscription windows.Handle
+	subscriptionErr := fmt.Errorf("no subscription attempts executed")
+	for _, attempt := range attempts {
+		log.Printf("[SECURITY] Subscribe attempt: %s", attempt.name)
+		log.Printf("[SECURITY] Query: %s", attempt.query)
+
+		queryPtr, convErr := syscall.UTF16PtrFromString(attempt.query)
+		if convErr != nil {
+			log.Printf("[SECURITY] Attempt skipped (query conversion failed): %v", convErr)
+			subscriptionErr = convErr
+			continue
+		}
+
+		subscription, subscriptionErr = evtSubscribe(
+			0,                  // Session (NULL for local)
+			uintptr(signalEvent), // SignalEvent (required for pull mode)
+			attempt.channelPtr, // Channel path (NULL when using QueryList)
+			queryPtr,           // Query
+			0,                  // Bookmark (NULL)
+			0,                  // Context
+			0,                  // Callback (NULL, pull mode with EvtNext)
+			attempt.flags,      // Subscription mode
+		)
+		if subscriptionErr == nil {
+			log.Printf("[SECURITY] Subscribe succeeded with attempt: %s", attempt.name)
+			break
+		}
+
+		log.Printf("[SECURITY] Attempt failed: %v", subscriptionErr)
+	}
+
+	if subscriptionErr != nil {
+		log.Printf("[!] Failed to subscribe to Security events: %v\n", subscriptionErr)
 		log.Printf("[!] NOTE: Requires Administrator privileges and Security log access\n")
 		return
 	}
-	defer windows.CloseHandle(subscription)
+	defer evtClose(subscription)
 
 	log.Println("[SECURITY] ✓ Successfully subscribed to Windows Security Event Log")
 	log.Println("[SECURITY] Monitoring for backup privilege usage (SeBackupPrivilege/SeRestorePrivilege)...")
@@ -123,32 +197,49 @@ func (slc *SecurityLogConsumer) subscribeToSecurityEvents(ctx context.Context) {
 			log.Println("[SECURITY] Stop signal received")
 			return
 		default:
-			// Pull events from subscription (1 second timeout)
-			success := evtNext(
-				subscription,
-				uint32(len(events)),
-				&events[0],
-				1000, // 1 second timeout
-				0,
-				&returned,
-			)
-
-			if !success {
-				errno := windows.GetLastError()
-				if errno == syscall.Errno(ERROR_NO_MORE_ITEMS) || errno == syscall.Errno(ERROR_TIMEOUT) {
-					// No events available, continue polling
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-				log.Printf("[!] EvtNext failed: %v\n", errno)
+			// Wait until Windows signals that the subscription has data.
+			waitResult, waitErr := windows.WaitForSingleObject(signalEvent, 1000)
+			if waitErr != nil {
+				log.Printf("[!] WaitForSingleObject failed: %v\n", waitErr)
 				time.Sleep(1 * time.Second)
 				continue
 			}
+			if waitResult == uint32(windows.WAIT_TIMEOUT) {
+				// No events yet.
+				continue
+			}
+			if waitResult != windows.WAIT_OBJECT_0 {
+				log.Printf("[!] WaitForSingleObject returned unexpected status: %d\n", waitResult)
+				time.Sleep(250 * time.Millisecond)
+				continue
+			}
 
-			// Process retrieved events
-			for i := uint32(0); i < returned; i++ {
-				slc.processSecurityEvent(ctx, events[i])
-				windows.CloseHandle(events[i])
+			// Drain all available events from this signal.
+			for {
+				returned = 0
+				err := evtNext(
+					subscription,
+					uint32(len(events)),
+					&events[0],
+					0, // immediate return while draining signaled events
+					0,
+					&returned,
+				)
+				if err != nil {
+					if err == syscall.Errno(ERROR_NO_MORE_ITEMS) || err == syscall.Errno(ERROR_TIMEOUT) {
+						break
+					}
+					log.Printf("[!] EvtNext failed: %v\n", err)
+					break
+				}
+				if returned == 0 {
+					break
+				}
+
+				for i := uint32(0); i < returned; i++ {
+					slc.processSecurityEvent(ctx, events[i])
+					evtClose(events[i])
+				}
 			}
 		}
 	}
@@ -215,12 +306,12 @@ func (slc *SecurityLogConsumer) processPrivilegeAssignment(ctx context.Context, 
 		log.Printf("[SECURITY] 🚨 BACKUP PRIVILEGE ASSIGNED: User %s\\%s", subjectDomainName, subjectUserName)
 		log.Printf("[SECURITY] 🚨 Privileges: %s", privileges)
 		log.Printf("[SECURITY] 🚨 Event ID: 4672 (Special Privileges Assigned)")
-		log.Printf("[SECURITY] 🚨 WARNING: Process may use BackupWrite to bypass Sysmon Event ID 11!")
+		log.Printf("[SECURITY] 🚨 WARNING: Process may use BackupWrite to bypass file creation monitoring!")
 
 		// Verbose logging: BackupRead/BackupWrite API details
 		if slc.config.EnableDetailedLogs {
 			log.Printf("[SECURITY] [VERBOSE] BackupRead API: Can read files bypassing NTFS permissions\n")
-			log.Printf("[SECURITY] [VERBOSE] BackupWrite API: Can write files bypassing NTFS permissions and Sysmon Event ID 11\n")
+			log.Printf("[SECURITY] [VERBOSE] BackupWrite API: Can write files bypassing NTFS permissions and file creation monitoring\n")
 			log.Printf("[SECURITY] [VERBOSE] SeBackupPrivilege detected: %v\n", strings.Contains(privileges, "SeBackupPrivilege"))
 			log.Printf("[SECURITY] [VERBOSE] SeRestorePrivilege detected: %v\n", strings.Contains(privileges, "SeRestorePrivilege"))
 		}
@@ -259,7 +350,7 @@ func (slc *SecurityLogConsumer) processTokenAdjustment(ctx context.Context, even
 		log.Printf("[SECURITY] 🚨 Enabled Privileges: %s", privileges)
 		log.Printf("[SECURITY] 🚨 Event ID: 4703 (Token Privileges Adjusted)")
 		log.Printf("[SECURITY] 🚨 CRITICAL: Process can now use BackupRead/BackupWrite APIs!")
-		log.Printf("[SECURITY] 🚨 This may bypass Sysmon Event ID 11 file creation detection!")
+		log.Printf("[SECURITY] 🚨 This may bypass file creation detection!")
 
 		// Verbose logging: BackupRead/BackupWrite API usage details
 		if slc.config.EnableDetailedLogs {
@@ -267,7 +358,7 @@ func (slc *SecurityLogConsumer) processTokenAdjustment(ctx context.Context, even
 			log.Printf("[SECURITY] [VERBOSE] BackupRead API signature: BOOL BackupRead(HANDLE, LPBYTE, DWORD, LPDWORD, BOOL, BOOL, LPVOID*)\n")
 			log.Printf("[SECURITY] [VERBOSE] BackupWrite API signature: BOOL BackupWrite(HANDLE, LPBYTE, DWORD, LPDWORD, BOOL, BOOL, LPVOID*)\n")
 			log.Printf("[SECURITY] [VERBOSE] Process: %s (PID: %s)\n", processName, processID)
-			log.Printf("[SECURITY] [VERBOSE] Threat: Process can read/write ANY file bypassing ACLs and Sysmon monitoring\n")
+			log.Printf("[SECURITY] [VERBOSE] Threat: Process can read/write ANY file bypassing ACLs and ETW file monitoring\n")
 		}
 
 		// Create security event for detection service
@@ -321,7 +412,7 @@ func (slc *SecurityLogConsumer) processPrivilegedOperation(ctx context.Context, 
 			log.Printf("[SECURITY] [VERBOSE] API Call Context:\n")
 			log.Printf("[SECURITY] [VERBOSE]   - BackupRead: Used to read file data/metadata bypassing security\n")
 			log.Printf("[SECURITY] [VERBOSE]   - BackupWrite: Used to write file data/metadata bypassing security\n")
-			log.Printf("[SECURITY] [VERBOSE]   - Evasion Technique: Bypasses Sysmon Event ID 11 (FileCreate)\n")
+			log.Printf("[SECURITY] [VERBOSE]   - Evasion Technique: Bypasses standard file creation monitoring\n")
 			log.Printf("[SECURITY] [VERBOSE]   - Security Impact: Can exfiltrate or modify files regardless of ACLs\n")
 			log.Printf("[SECURITY] [VERBOSE]   - Detection Method: Windows Security Event ID 4674\n")
 		}
@@ -384,8 +475,7 @@ const (
 	ERROR_TIMEOUT       = 1460
 )
 
-// Windows Event Log API functions (these should already be defined in sysmon_consumer.go)
-// If not, we'll need to add them here
+// Windows Event Log API functions for Security Event Log subscription
 func evtSubscribe(session, signalEvent uintptr, channelPath, query *uint16, bookmark, context uintptr, callback uintptr, flags uint32) (windows.Handle, error) {
 	r1, _, err := procEvtSubscribe.Call(
 		session,
@@ -403,8 +493,15 @@ func evtSubscribe(session, signalEvent uintptr, channelPath, query *uint16, book
 	return windows.Handle(r1), nil
 }
 
-func evtNext(subscription windows.Handle, eventsSize uint32, events *windows.Handle, timeout, flags uint32, returned *uint32) bool {
-	r1, _, _ := procEvtNext.Call(
+func evtClose(handle windows.Handle) {
+	if handle == 0 {
+		return
+	}
+	procEvtClose.Call(uintptr(handle))
+}
+
+func evtNext(subscription windows.Handle, eventsSize uint32, events *windows.Handle, timeout, flags uint32, returned *uint32) error {
+	r1, _, err := procEvtNext.Call(
 		uintptr(subscription),
 		uintptr(eventsSize),
 		uintptr(unsafe.Pointer(events)),
@@ -412,7 +509,13 @@ func evtNext(subscription windows.Handle, eventsSize uint32, events *windows.Han
 		uintptr(flags),
 		uintptr(unsafe.Pointer(returned)),
 	)
-	return r1 != 0
+	if r1 != 0 {
+		return nil
+	}
+	if err != nil && err != syscall.Errno(0) {
+		return err
+	}
+	return fmt.Errorf("EvtNext failed without extended error")
 }
 
 // renderEventAsXML renders a Windows event handle as XML string
@@ -459,5 +562,5 @@ func renderEventAsXML(eventHandle windows.Handle) (string, error) {
 	return "", fmt.Errorf("bufferUsed is 0, cannot render event")
 }
 
-// Note: Windows Event Log API functions and constants are shared with sysmon_consumer.go
-// They are declared there to avoid duplication
+// Note: Windows Event Log API functions (wevtapi.dll) are declared in this file
+// for Security Event Log consumption

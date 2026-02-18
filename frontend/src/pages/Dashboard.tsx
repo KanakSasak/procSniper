@@ -1,11 +1,43 @@
-import { Shield, ShieldOff, Activity, AlertTriangle, FileWarning, Trash2, Server, Loader2 } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Shield, ShieldOff, Activity, AlertTriangle, FileWarning, Trash2, Server, Loader2, Target, Ban, Cpu, BarChart3 } from 'lucide-react'
 import { useProtection, useDashboardStats, useAlerts } from '../hooks/useWails'
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import LogViewer from '../components/LogViewer'
+
+interface ChartDataPoint {
+  time: string
+  events: number
+  threats: number
+}
 
 function Dashboard() {
   const { isProtecting, loading, error, startProtection, stopProtection } = useProtection()
   const stats = useDashboardStats()
   const alerts = useAlerts()
+
+  // Chart data - circular buffer of 30 data points
+  const [chartData, setChartData] = useState<ChartDataPoint[]>([])
+  const prevEventsRef = useRef<number>(0)
+
+  useEffect(() => {
+    if (!isProtecting) {
+      setChartData([])
+      prevEventsRef.current = 0
+      return
+    }
+
+    const eventsReceived = stats.etwDiagnostics?.eventsReceived || 0
+    const newEvents = prevEventsRef.current > 0 ? eventsReceived - prevEventsRef.current : 0
+    prevEventsRef.current = eventsReceived
+
+    const now = new Date()
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+    setChartData((prev) => {
+      const next = [...prev, { time: timeStr, events: Math.max(0, newEvents), threats: stats.activeThreatsCount || 0 }]
+      return next.slice(-30)
+    })
+  }, [stats, isProtecting])
 
   const getStatusColor = () => {
     if (!isProtecting) return 'bg-gray-600'
@@ -72,7 +104,7 @@ function Dashboard() {
       </div>
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
         <StatCard
           icon={<Activity className="w-6 h-6 text-blue-400" />}
           label="Alerts Processed"
@@ -92,6 +124,18 @@ function Dashboard() {
           color="yellow"
         />
         <StatCard
+          icon={<Target className="w-6 h-6 text-red-400" />}
+          label="Active Threats"
+          value={stats.activeThreatsCount}
+          color="red"
+        />
+        <StatCard
+          icon={<Ban className="w-6 h-6 text-green-400" />}
+          label="Responses Blocked"
+          value={stats.autoResponsesBlocked}
+          color="green"
+        />
+        <StatCard
           icon={<Trash2 className="w-6 h-6 text-purple-400" />}
           label="Canary Files"
           value={stats.canaryFilesCount}
@@ -99,8 +143,41 @@ function Dashboard() {
         />
       </div>
 
-      {/* System Status */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+      {/* Event Activity Chart */}
+      {isProtecting && chartData.length > 1 && (
+        <div className="bg-ps-darker rounded-xl p-6 border border-ps-accent/30 mb-8">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <BarChart3 className="w-5 h-5 text-ps-primary" />
+            Event Activity
+          </h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <AreaChart data={chartData}>
+              <defs>
+                <linearGradient id="colorEvents" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                  <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="colorThreats" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
+                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <XAxis dataKey="time" tick={{ fill: '#6b7280', fontSize: 10 }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fill: '#6b7280', fontSize: 10 }} tickLine={false} axisLine={false} width={40} />
+              <Tooltip
+                contentStyle={{ backgroundColor: '#16213e', border: '1px solid #0f3460', borderRadius: '8px' }}
+                labelStyle={{ color: '#9ca3af' }}
+              />
+              <Area type="monotone" dataKey="events" name="New Events" stroke="#3b82f6" fill="url(#colorEvents)" strokeWidth={2} />
+              <Area type="monotone" dataKey="threats" name="Active Threats" stroke="#ef4444" fill="url(#colorThreats)" strokeWidth={2} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* System Status + ETW Diagnostics + Entropy */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+        {/* System Status */}
         <div className="bg-ps-darker rounded-xl p-6 border border-ps-accent/30">
           <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
             <Server className="w-5 h-5 text-ps-primary" />
@@ -108,9 +185,9 @@ function Dashboard() {
           </h3>
           <div className="space-y-4">
             <StatusRow
-              label="Sysmon Connection"
-              status={stats.sysmonConnected}
-              statusText={stats.sysmonConnected ? 'Connected' : 'Disconnected'}
+              label="ETW Connection"
+              status={stats.etwConnected}
+              statusText={stats.etwConnected ? 'Connected' : 'Disconnected'}
             />
             <StatusRow
               label="Worker Queue"
@@ -122,25 +199,77 @@ function Dashboard() {
               status={isProtecting}
               statusText={stats.protectionStatus}
             />
+            <StatusRow
+              label="High I/O Processes"
+              status={stats.highIOProcessCount === 0}
+              statusText={String(stats.highIOProcessCount)}
+            />
           </div>
         </div>
 
-        {/* Recent Alerts */}
+        {/* ETW Diagnostics */}
         <div className="bg-ps-darker rounded-xl p-6 border border-ps-accent/30">
           <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5 text-ps-primary" />
-            Recent Alerts
+            <Cpu className="w-5 h-5 text-ps-primary" />
+            ETW Diagnostics
           </h3>
-          {alerts.length === 0 ? (
-            <p className="text-gray-400 text-center py-8">No alerts yet</p>
-          ) : (
-            <div className="space-y-3 max-h-64 overflow-y-auto">
-              {alerts.slice(0, 10).map((alert) => (
-                <AlertItem key={alert.id} alert={alert} />
-              ))}
-            </div>
-          )}
+          <div className="space-y-3">
+            <DiagRow label="Events Received" value={formatNumber(stats.etwDiagnostics?.eventsReceived || 0)} />
+            <DiagRow
+              label="Events Dropped"
+              value={String(stats.etwDiagnostics?.eventsDropped || 0)}
+              warn={(stats.etwDiagnostics?.eventsDropped || 0) > 0}
+            />
+            <DiagRow
+              label="Dead PID Suppressed"
+              value={String(stats.etwDiagnostics?.eventsSuppressedDeadPID || 0)}
+            />
+            <DiagRow label="Worker Pool" value={String(stats.etwDiagnostics?.workerPoolSize || 0)} />
+            <DiagRow
+              label="Channel"
+              value={`${stats.etwDiagnostics?.channelLength || 0} / ${stats.etwDiagnostics?.channelCapacity || 0}`}
+            />
+          </div>
         </div>
+
+        {/* Entropy Monitoring */}
+        <div className="bg-ps-darker rounded-xl p-6 border border-ps-accent/30">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <BarChart3 className="w-5 h-5 text-ps-primary" />
+            Entropy Monitoring
+          </h3>
+          <div className="space-y-3">
+            <DiagRow label="Tracked Files" value={String(stats.entropyStats?.trackedFiles || 0)} />
+            <DiagRow label="Modified Files" value={String(stats.entropyStats?.modifiedFiles || 0)} />
+            <DiagRow
+              label="Entropy Increases"
+              value={String(stats.entropyStats?.significantIncreases || 0)}
+              warn={(stats.entropyStats?.significantIncreases || 0) > 0}
+            />
+          </div>
+          <div className="mt-4 pt-4 border-t border-ps-accent/20">
+            <p className="text-xs text-gray-500">
+              Tracks Shannon entropy changes in modified files. Significant increases ({'>'}+2.0 bits/byte) may indicate encryption activity.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Recent Alerts */}
+      <div className="bg-ps-darker rounded-xl p-6 border border-ps-accent/30 mb-8">
+        <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <AlertTriangle className="w-5 h-5 text-ps-primary" />
+          Recent Alerts
+        </h3>
+        {alerts.length === 0 ? (
+          <p className="text-gray-400 text-center py-8">No alerts yet</p>
+        ) : (
+          <div className="space-y-3 max-h-64 overflow-y-auto">
+            {alerts.slice(0, 10).map((alert) => (
+              <AlertItem key={alert.id} alert={alert} />
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Log Viewer */}
@@ -151,11 +280,17 @@ function Dashboard() {
   )
 }
 
+function formatNumber(num: number): string {
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
+  return String(num)
+}
+
 interface StatCardProps {
   icon: React.ReactNode
   label: string
   value: number
-  color: 'blue' | 'orange' | 'yellow' | 'purple'
+  color: 'blue' | 'orange' | 'yellow' | 'purple' | 'red' | 'green'
 }
 
 function StatCard({ icon, label, value, color }: StatCardProps) {
@@ -164,6 +299,8 @@ function StatCard({ icon, label, value, color }: StatCardProps) {
     orange: 'bg-orange-500/10',
     yellow: 'bg-yellow-500/10',
     purple: 'bg-purple-500/10',
+    red: 'bg-red-500/10',
+    green: 'bg-green-500/10',
   }
 
   return (
@@ -193,6 +330,21 @@ function StatusRow({ label, status, statusText }: StatusRowProps) {
         <span className={`w-2 h-2 rounded-full ${status ? 'bg-green-500' : 'bg-red-500'}`} />
         <span className={status ? 'text-green-400' : 'text-red-400'}>{statusText}</span>
       </div>
+    </div>
+  )
+}
+
+interface DiagRowProps {
+  label: string
+  value: string
+  warn?: boolean
+}
+
+function DiagRow({ label, value, warn }: DiagRowProps) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-gray-400 text-sm">{label}</span>
+      <span className={`text-sm font-medium ${warn ? 'text-red-400' : 'text-gray-200'}`}>{value}</span>
     </div>
   )
 }

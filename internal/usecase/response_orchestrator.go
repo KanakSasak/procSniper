@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// ProcessTerminationSink receives successful process-termination outcomes for cross-component coordination.
+type ProcessTerminationSink interface {
+	MarkProcessTerminated(pid uint32, processGuid string, image string, at time.Time, source string)
+}
+
 // ResponseOrchestrator manages automated response to detected threats
 type ResponseOrchestrator struct {
 	detectionService *DetectionService
@@ -21,13 +26,21 @@ type ResponseOrchestrator struct {
 	wg               sync.WaitGroup
 	mu               sync.RWMutex
 	running          bool
+	responseDedup    map[string]time.Time
+	responseDedupTTL time.Duration
+	recentSuspends   map[uint32]time.Time
+	recentSuspendTTL time.Duration
+	terminationSink  ProcessTerminationSink
 
 	// Statistics
 	stats struct {
-		processesTerminated int
-		filesQuarantined    int
-		alertsProcessed     int
-		autoResponsesBlocked int
+		processesTerminated     int
+		filesQuarantined        int
+		alertsProcessed         int
+		autoResponsesBlocked    int
+		relatedSuspendAttempted int
+		relatedSuspendSuccess   int
+		relatedSuspendFailed    int
 	}
 }
 
@@ -42,6 +55,10 @@ func NewResponseOrchestrator(
 		responseActions:  responseActions,
 		responseConfig:   responseConfig,
 		running:          false,
+		responseDedup:    make(map[string]time.Time),
+		responseDedupTTL: 10 * time.Second,
+		recentSuspends:   make(map[uint32]time.Time),
+		recentSuspendTTL: 30 * time.Second,
 	}
 }
 
@@ -59,6 +76,11 @@ func (ro *ResponseOrchestrator) Start(ctx context.Context) error {
 	log.Printf("[*] Auto-terminate enabled: %v\n", ro.responseConfig.ResponseSettings.AutoTerminateEnabled)
 	log.Printf("[*] Critical score threshold: %d\n", ro.responseConfig.ResponseSettings.CriticalScoreThreshold)
 	log.Printf("[*] Terminate on extension match: %v\n", ro.responseConfig.ResponseSettings.TerminateOnExtensionMatch)
+	log.Printf("[*] Suspend related on canary: %v (min score: %d, window: %ds)\n",
+		ro.responseConfig.ResponseSettings.SuspendRelatedOnCanary,
+		ro.responseConfig.ResponseSettings.RelatedSuspicionMinScore,
+		ro.responseConfig.ResponseSettings.RelatedActorWindowSeconds,
+	)
 	log.Printf("[*] Investigation mode: %v\n", ro.responseConfig.ResponseSettings.InvestigationMode)
 
 	// Enable SeDebugPrivilege for process termination
@@ -97,6 +119,9 @@ func (ro *ResponseOrchestrator) Stop() {
 	log.Printf("    - Processes terminated: %d\n", ro.stats.processesTerminated)
 	log.Printf("    - Files quarantined: %d\n", ro.stats.filesQuarantined)
 	log.Printf("    - Auto-responses blocked (whitelist/investigation): %d\n", ro.stats.autoResponsesBlocked)
+	log.Printf("    - Related suspends attempted: %d\n", ro.stats.relatedSuspendAttempted)
+	log.Printf("    - Related suspends successful: %d\n", ro.stats.relatedSuspendSuccess)
+	log.Printf("    - Related suspends failed: %d\n", ro.stats.relatedSuspendFailed)
 	ro.mu.RUnlock()
 
 	log.Println("[+] Response orchestrator stopped")
@@ -160,6 +185,14 @@ func (ro *ResponseOrchestrator) processAlert(ctx context.Context, alert *domain.
 	}
 
 	// Execute automated response
+	if ro.isDuplicateAutoResponse(alert) {
+		log.Printf("[*] Skipping duplicate auto-response for %s (PID: %d)\n", alert.ProcessGuid, alert.ProcessID)
+		ro.mu.Lock()
+		ro.stats.autoResponsesBlocked++
+		ro.mu.Unlock()
+		return
+	}
+
 	ro.executeAutomatedResponse(ctx, alert, extensionMatch)
 }
 
@@ -172,6 +205,18 @@ func (ro *ResponseOrchestrator) executeAutomatedResponse(ctx context.Context, al
 	log.Printf("[!] Threat Level: %s (Score: %d)\n", alert.Severity, alert.Score)
 	log.Printf("[!] Category: %s\n", alert.Category)
 	log.Printf("[!] Extension Match: %v\n", extensionMatch)
+
+	if ro.responseConfig.ResponseSettings.SuspendRelatedOnCanary && ro.isCanaryCompromiseAlert(alert) {
+		ro.suspendRelatedProcesses(alert)
+	}
+
+	if alert.ProcessID <= 0 {
+		log.Printf("[!] Skipping termination: invalid PID %d (Process: %s)\n", alert.ProcessID, alert.Image)
+		ro.mu.Lock()
+		ro.stats.autoResponsesBlocked++
+		ro.mu.Unlock()
+		return
+	}
 
 	// Optional: Suspend before terminate for forensics
 	if ro.responseConfig.ResponseSettings.SuspendBeforeTerminate {
@@ -189,15 +234,36 @@ func (ro *ResponseOrchestrator) executeAutomatedResponse(ctx context.Context, al
 		ro.quarantineRelatedFiles(alert)
 	}
 
-	// Terminate the process
+	// Terminate the process with verification and escalation.
 	log.Printf("[!] TERMINATING PROCESS: PID %d\n", alert.ProcessID)
-	if err := ro.responseActions.TerminateProcess(uint32(alert.ProcessID)); err != nil {
+	terminated, alreadyExited, err := ro.responseActions.TerminateProcessVerified(
+		uint32(alert.ProcessID),
+		3,
+		250*time.Millisecond,
+		true, // locked decision: retry + suspend escalation
+	)
+	if err != nil {
 		log.Printf("[!] FAILED TO TERMINATE PROCESS: %v\n", err)
-	} else {
-		log.Printf("[+] PROCESS TERMINATED SUCCESSFULLY\n")
+		if alive, checkErr := ro.responseActions.IsProcessAlive(uint32(alert.ProcessID)); checkErr == nil {
+			if alive {
+				log.Printf("[!] PROCESS STILL ALIVE AFTER VERIFIED TERMINATION ATTEMPTS: PID %d\n", alert.ProcessID)
+			} else {
+				log.Printf("[+] Process exited despite termination error state (PID: %d)\n", alert.ProcessID)
+			}
+		} else {
+			log.Printf("[!] Could not verify final process state for PID %d: %v\n", alert.ProcessID, checkErr)
+		}
+	} else if alreadyExited {
+		log.Printf("[+] PROCESS ALREADY EXITED (PID: %d)\n", alert.ProcessID)
+		ro.notifyProcessTerminated(alert, "already_exited")
+	} else if terminated {
+		log.Printf("[+] PROCESS TERMINATED AND VERIFIED\n")
 		ro.mu.Lock()
 		ro.stats.processesTerminated++
 		ro.mu.Unlock()
+		ro.notifyProcessTerminated(alert, "terminate_verified")
+	} else {
+		log.Printf("[!] Termination finished without a definitive outcome (PID: %d)\n", alert.ProcessID)
 	}
 
 	log.Printf("╔════════════════════════════════════════════════════════════╗\n")
@@ -253,6 +319,133 @@ func (ro *ResponseOrchestrator) hasRansomwareExtension(alert *domain.Alert) bool
 	return false
 }
 
+func isCanaryIndicatorTypeForResponse(indicatorType domain.IndicatorType) bool {
+	if indicatorType == domain.IndicatorCanaryCompromised {
+		return true
+	}
+	return strings.HasPrefix(strings.ToUpper(string(indicatorType)), "CANARY_")
+}
+
+func (ro *ResponseOrchestrator) isCanaryCompromiseAlert(alert *domain.Alert) bool {
+	if alert == nil {
+		return false
+	}
+
+	for _, indicator := range alert.Indicators {
+		if isCanaryIndicatorTypeForResponse(indicator.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ro *ResponseOrchestrator) cleanupRecentSuspendsLocked(now time.Time) {
+	for pid, ts := range ro.recentSuspends {
+		if now.Sub(ts) > ro.recentSuspendTTL {
+			delete(ro.recentSuspends, pid)
+		}
+	}
+}
+
+func (ro *ResponseOrchestrator) shouldSkipRecentSuspend(pid uint32, now time.Time) bool {
+	ro.mu.Lock()
+	defer ro.mu.Unlock()
+
+	ro.cleanupRecentSuspendsLocked(now)
+	if ts, exists := ro.recentSuspends[pid]; exists && now.Sub(ts) <= ro.recentSuspendTTL {
+		return true
+	}
+	return false
+}
+
+func (ro *ResponseOrchestrator) markRecentSuspend(pid uint32, now time.Time) {
+	ro.mu.Lock()
+	defer ro.mu.Unlock()
+
+	ro.cleanupRecentSuspendsLocked(now)
+	ro.recentSuspends[pid] = now
+}
+
+func (ro *ResponseOrchestrator) suspendRelatedProcesses(alert *domain.Alert) (attempted int, suspended int) {
+	if alert == nil || len(alert.RelatedProcesses) == 0 {
+		return 0, 0
+	}
+
+	now := time.Now()
+	minScore := ro.responseConfig.ResponseSettings.RelatedSuspicionMinScore
+	if minScore <= 0 {
+		minScore = 50
+	}
+	windowSec := ro.responseConfig.ResponseSettings.RelatedActorWindowSeconds
+	if windowSec <= 0 {
+		windowSec = 60
+	}
+	relatedWindow := time.Duration(windowSec) * time.Second
+
+	skippedDuplicates := 0
+	failed := 0
+	localSeen := make(map[int]struct{}, len(alert.RelatedProcesses)+1)
+	if alert.ProcessID > 0 {
+		localSeen[alert.ProcessID] = struct{}{}
+	}
+	attemptedPIDs := make([]string, 0, len(alert.RelatedProcesses))
+
+	for _, related := range alert.RelatedProcesses {
+		pid := related.ProcessID
+		if pid <= 4 {
+			continue
+		}
+		if _, exists := localSeen[pid]; exists {
+			skippedDuplicates++
+			continue
+		}
+		localSeen[pid] = struct{}{}
+
+		if related.RelationScore < minScore {
+			continue
+		}
+		if !related.LastSeen.IsZero() && now.Sub(related.LastSeen) > relatedWindow {
+			continue
+		}
+		if ro.responseConfig.IsWhitelisted(related.Image) {
+			continue
+		}
+
+		pid32 := uint32(pid)
+		if ro.shouldSkipRecentSuspend(pid32, now) {
+			skippedDuplicates++
+			continue
+		}
+
+		attempted++
+		attemptedPIDs = append(attemptedPIDs, fmt.Sprintf("%d", pid))
+		if err := ro.responseActions.SuspendProcess(pid32); err != nil {
+			failed++
+			log.Printf("[!] Failed to suspend related process PID %d (%s): %v\n", pid, related.Image, err)
+			ro.markRecentSuspend(pid32, now)
+			continue
+		}
+
+		suspended++
+		ro.markRecentSuspend(pid32, now)
+		log.Printf("[+] RELATED PROCESS SUSPENDED: %s (PID: %d, score: %d, reason: %s)\n",
+			related.Image, related.ProcessID, related.RelationScore, related.Reason)
+	}
+
+	ro.mu.Lock()
+	ro.stats.relatedSuspendAttempted += attempted
+	ro.stats.relatedSuspendSuccess += suspended
+	ro.stats.relatedSuspendFailed += failed
+	ro.mu.Unlock()
+
+	if attempted > 0 || skippedDuplicates > 0 {
+		log.Printf("[*] Related suspension summary: attempted=%d, suspended=%d, failed=%d, skipped=%d, pids=[%s]\n",
+			attempted, suspended, failed, skippedDuplicates, strings.Join(attemptedPIDs, ","))
+	}
+
+	return attempted, suspended
+}
+
 // logAlert writes alert to log file
 func (ro *ResponseOrchestrator) logAlert(alert *domain.Alert) {
 	if !ro.responseConfig.AlertSettings.VerboseLogging {
@@ -287,11 +480,14 @@ func (ro *ResponseOrchestrator) GetStats() map[string]interface{} {
 	defer ro.mu.RUnlock()
 
 	return map[string]interface{}{
-		"running":                ro.running,
-		"alerts_processed":       ro.stats.alertsProcessed,
-		"processes_terminated":   ro.stats.processesTerminated,
-		"files_quarantined":      ro.stats.filesQuarantined,
-		"auto_responses_blocked": ro.stats.autoResponsesBlocked,
+		"running":                   ro.running,
+		"alerts_processed":          ro.stats.alertsProcessed,
+		"processes_terminated":      ro.stats.processesTerminated,
+		"files_quarantined":         ro.stats.filesQuarantined,
+		"auto_responses_blocked":    ro.stats.autoResponsesBlocked,
+		"related_suspend_attempted": ro.stats.relatedSuspendAttempted,
+		"related_suspend_success":   ro.stats.relatedSuspendSuccess,
+		"related_suspend_failed":    ro.stats.relatedSuspendFailed,
 	}
 }
 
@@ -302,4 +498,74 @@ func (ro *ResponseOrchestrator) UpdateResponseConfig(newConfig *config.ResponseC
 
 	ro.responseConfig = newConfig
 	log.Println("[*] Response configuration updated")
+}
+
+// SetProcessTerminationSink wires optional process-termination notifications to external consumers.
+func (ro *ResponseOrchestrator) SetProcessTerminationSink(sink ProcessTerminationSink) {
+	ro.mu.Lock()
+	defer ro.mu.Unlock()
+
+	ro.terminationSink = sink
+}
+
+func (ro *ResponseOrchestrator) responseKey(alert *domain.Alert) string {
+	if alert == nil {
+		return ""
+	}
+
+	guid := strings.TrimSpace(alert.ProcessGuid)
+	if guid != "" && !strings.EqualFold(guid, "UNKNOWN") {
+		return "guid:" + guid
+	}
+	if alert.ProcessID > 0 {
+		return fmt.Sprintf("pid:%d", alert.ProcessID)
+	}
+	return ""
+}
+
+func (ro *ResponseOrchestrator) isDuplicateAutoResponse(alert *domain.Alert) bool {
+	key := ro.responseKey(alert)
+	if key == "" {
+		return false
+	}
+
+	now := time.Now()
+
+	ro.mu.Lock()
+	defer ro.mu.Unlock()
+
+	for existingKey, ts := range ro.responseDedup {
+		if now.Sub(ts) > ro.responseDedupTTL {
+			delete(ro.responseDedup, existingKey)
+		}
+	}
+
+	if ts, exists := ro.responseDedup[key]; exists && now.Sub(ts) <= ro.responseDedupTTL {
+		return true
+	}
+
+	ro.responseDedup[key] = now
+	return false
+}
+
+func (ro *ResponseOrchestrator) notifyProcessTerminated(alert *domain.Alert, source string) {
+	if alert == nil || alert.ProcessID <= 0 {
+		return
+	}
+
+	ro.mu.RLock()
+	sink := ro.terminationSink
+	ro.mu.RUnlock()
+
+	if sink == nil {
+		return
+	}
+
+	sink.MarkProcessTerminated(
+		uint32(alert.ProcessID),
+		alert.ProcessGuid,
+		alert.Image,
+		time.Now(),
+		source,
+	)
 }

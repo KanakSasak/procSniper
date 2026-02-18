@@ -13,10 +13,12 @@ import (
 
 // Event names for frontend subscription
 const (
-	EventAlertNew    = "alert:new"
-	EventStatsUpdate = "stats:update"
-	EventThreatLevel = "threat:level"
-	EventLogEntry    = "log:entry"
+	EventAlertNew      = "alert:new"
+	EventStatsUpdate   = "stats:update"
+	EventThreatLevel   = "threat:level"
+	EventThreatUpdate  = "threat:update"
+	EventLogEntry      = "log:entry"
+	EventMLPrediction  = "ml:prediction"
 )
 
 // Emitter handles event emission to the frontend
@@ -44,7 +46,17 @@ func (e *Emitter) EmitThreatLevelChange(level string) {
 	runtime.EventsEmit(e.ctx, EventThreatLevel, level)
 }
 
+// EmitThreatUpdate sends updated threat list to the frontend
+func (e *Emitter) EmitThreatUpdate(threats []models.ThreatViewModel) {
+	runtime.EventsEmit(e.ctx, EventThreatUpdate, threats)
+}
+
 // EmitLogEntry sends a log entry to the frontend
 func (e *Emitter) EmitLogEntry(entry logger.LogEntry) {
 	runtime.EventsEmit(e.ctx, EventLogEntry, entry)
+}
+
+// EmitMLPrediction sends an ML prediction result to the frontend
+func (e *Emitter) EmitMLPrediction(pred models.MLPredictionVM) {
+	runtime.EventsEmit(e.ctx, EventMLPrediction, pred)
 }

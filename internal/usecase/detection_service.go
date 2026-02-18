@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -79,7 +81,48 @@ type ProcessFileCounters struct {
 	CombinedEntropyAndExtCount int      // Files with BOTH high entropy AND ransomware extension
 	TxtFileCount               int      // Count of .txt files created (potential ransom notes)
 	TxtFileDirectories         []string // Directories where .txt files were created
+	RenameRansomExtHits        []time.Time
 	LastUpdated                time.Time
+
+	// ML feature tracking (additional counters for ExtractFeatureVector)
+	DeleteCount          int                 // total file deletes by this process
+	DirectorySet         map[string]struct{} // all unique directories touched
+	ExtensionCounts      map[string]int      // extension frequency distribution (for Shannon entropy)
+	ShadowCopyDeleteHit  bool                // process attempted shadow-copy deletion / recovery disable
+	BrowserCredentialHit bool                // process accessed browser credential stores
+	LSASSAccessHit       bool                // process accessed LSASS memory
+	BrowserHistoryHit    bool                // non-browser process accessed browser history paths
+	SSHKeyHit            bool                // process accessed .ssh/ key paths
+	SystemInfoHit        bool                // command line contained systeminfo/whoami/hostname/ipconfig
+}
+
+// VelocityTargetObservation tracks recent file paths touched by a high-velocity actor.
+type VelocityTargetObservation struct {
+	Path              string
+	SeenAt            time.Time
+	RenameToRansomExt bool
+}
+
+// VelocityActorState stores rolling create/modify behavior for canary-time containment.
+type VelocityActorState struct {
+	ProcessGuid    string
+	ProcessID      int
+	Image          string
+	LastSeen       time.Time
+	LastCreateSeen time.Time
+	LastModifySeen time.Time
+	CreateOps60s   int
+	ModifyOps60s   int
+	TotalOps60s    int
+	Tier           string
+	RecentTargets  []VelocityTargetObservation
+
+	createHitTimes []time.Time
+	modifyHitTimes []time.Time
+	deleteHitTimes []time.Time
+
+	CumulativeFileCount   int // total file ops since process start (for ML feature[1])
+	CumulativeCreateCount int // total create ops since process start
 }
 
 // ModifiedHighEntropyFile tracks files that were recently modified with high entropy
@@ -91,6 +134,26 @@ type ModifiedHighEntropyFile struct {
 	ProcessID   int
 	Entropy     float64
 	Timestamp   time.Time
+}
+
+// CanaryActor stores ETW-attributed actor context for recent canary touches.
+type CanaryActor struct {
+	ProcessID   int
+	ProcessGuid string
+	Image       string
+	TargetPath  string
+	EventType   string
+	SeenAt      time.Time
+}
+
+// CanaryCompromiseState tracks latched compromise state to avoid repeated periodic alerts.
+type CanaryCompromiseState struct {
+	FirstSeen             time.Time
+	LastSeen              time.Time
+	CompromiseType        string
+	RelatedPath           string
+	AttributedProcessGuid string
+	Latched               bool
 }
 
 // DetectionService orchestrates threat detection and response
@@ -106,6 +169,8 @@ type DetectionService struct {
 	analyzedMux        sync.RWMutex         // Protects analyzedProcesses map
 	highIOProcesses    map[string]time.Time // Tier 3: Critical (>=100 files/min)
 	highIOProcessesMux sync.RWMutex         // Protects highIOProcesses map
+	velocityActors     map[string]*VelocityActorState
+	velocityActorsMux  sync.RWMutex
 
 	// File counters for threshold-based detection
 	fileCounters    map[string]*ProcessFileCounters // ProcessGuid -> counters
@@ -125,17 +190,40 @@ type DetectionService struct {
 	// Canary files (honeypot detection for slow-moving ransomware)
 	canaryFiles    map[string]*domain.CanaryFile // FilePath -> canary metadata
 	canaryFilesMux sync.RWMutex                  // Protects canaryFiles map
+	// ETW-attributed recent actors that touched canaries (for periodic scan attribution).
+	recentCanaryActors map[string]CanaryActor // normalized canonical canary path -> actor
+	canaryActorsMux    sync.RWMutex
+	// Latched canary compromises (suppresses periodic repeat alerts for already-compromised canaries).
+	compromisedCanaries map[string]CanaryCompromiseState
+	compromisedMux      sync.RWMutex
 
 	// Detection thresholds from config
 	entropyFileThreshold   int
 	extensionFileThreshold int
 	combinedThreshold      int // Files with BOTH entropy AND extension before immediate termination
+	renameExtThreshold     int
 
 	// Feature flags
 	enableRansomNoteDetection bool // Enable/disable ransom note detection (default: false, focus on behavioral)
 
 	// Detection data from config
 	ransomwareExtensions []string // List of ransomware extensions to detect
+
+	// Trusted process allowlist (case-insensitive)
+	trustedProcessNames map[string]struct{} // Basename matches (e.g., "searchprotocolhost.exe")
+	trustedProcessPaths map[string]struct{} // Full path matches (e.g., "c:\\windows\\system32\\searchprotocolhost.exe")
+
+	// ML inference integration
+	mlPredictor      domain.MLPredictor                // nil when ML not loaded
+	mlEnabled        bool                              // whether ML detection is active
+	mlConfidence     float64                           // minimum confidence threshold (0.0–1.0)
+	mlMux            sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
+	onMLPrediction   func(*domain.MLInferenceActivity) // callback for GUI event emission
+	mlMinIndicators      int                               // minimum non-zero features in feature vector before ML fires
+	mlLastInference      map[string]time.Time              // per-process inference cooldown tracker
+	mlCooldown           time.Duration                     // cooldown between inferences for same process
+	detectionMode        string                            // "rules_only", "hybrid", "ml_only"
+	canaryResponseAction string                            // "terminate", "suspend", "alert_only"
 }
 
 // NewDetectionService creates a new detection service
@@ -144,35 +232,111 @@ type DetectionService struct {
 // combinedThreshold: files with BOTH high entropy AND ransomware extension for immediate termination
 // enableRansomNoteDetection: enable/disable ransom note detection (default: false, focus on behavioral)
 // ransomwareExtensions: list of ransomware file extensions to detect
-func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold int, enableRansomNoteDetection bool, ransomwareExtensions []string) *DetectionService {
-	return &DetectionService{
+func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold, renameExtThreshold int, enableRansomNoteDetection bool, ransomwareExtensions []string, trustedProcesses []string) *DetectionService {
+	if renameExtThreshold <= 0 {
+		renameExtThreshold = 3
+	}
+
+	ds := &DetectionService{
 		velocityTracker:           domain.NewFileOperationTracker(60 * time.Second),
 		threatScorer:              domain.NewThreatScorer(),
 		alertChan:                 make(chan *domain.Alert, 100),
 		monitoredProcesses:        make(map[string]time.Time), // Tier 1: Lightweight monitoring
 		analyzedProcesses:         make(map[string]time.Time), // Tier 2: Deep analysis
 		highIOProcesses:           make(map[string]time.Time), // Tier 3: Critical
+		velocityActors:            make(map[string]*VelocityActorState),
 		fileCounters:              make(map[string]*ProcessFileCounters),
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
 		modifiedHighEntropyFiles:  make(map[string]*ModifiedHighEntropyFile),  // Track modified high-entropy files
 		directoryScanInProgress:   make(map[string]bool),                      // Prevent goroutine explosion
 		canaryFiles:               make(map[string]*domain.CanaryFile),        // Honeypot files for detection
+		recentCanaryActors:        make(map[string]CanaryActor),
+		compromisedCanaries:       make(map[string]CanaryCompromiseState),
 		entropyFileThreshold:      entropyThreshold,
 		extensionFileThreshold:    extensionThreshold,
 		combinedThreshold:         combinedThreshold,
+		renameExtThreshold:        renameExtThreshold,
 		enableRansomNoteDetection: enableRansomNoteDetection,
 		ransomwareExtensions:      ransomwareExtensions,
+		trustedProcessNames:       make(map[string]struct{}),
+		trustedProcessPaths:       make(map[string]struct{}),
+		mlMinIndicators:           4,
+		mlLastInference:           make(map[string]time.Time),
+		mlCooldown:                2 * time.Second,
 	}
+
+	ds.setTrustedProcesses(trustedProcesses)
+
+	return ds
+}
+
+func (ds *DetectionService) setTrustedProcesses(processes []string) {
+	for _, proc := range processes {
+		proc = strings.TrimSpace(proc)
+		if proc == "" {
+			continue
+		}
+
+		lower := strings.ToLower(proc)
+		if strings.ContainsAny(lower, "\\/") {
+			ds.trustedProcessPaths[lower] = struct{}{}
+		} else {
+			ds.trustedProcessNames[lower] = struct{}{}
+		}
+	}
+}
+
+func (ds *DetectionService) isTrustedProcess(imageOrName string) bool {
+	if len(ds.trustedProcessNames) == 0 && len(ds.trustedProcessPaths) == 0 {
+		return false
+	}
+
+	imageOrName = strings.TrimSpace(imageOrName)
+	if imageOrName == "" {
+		return false
+	}
+
+	lower := strings.ToLower(imageOrName)
+	if _, ok := ds.trustedProcessPaths[lower]; ok {
+		return true
+	}
+
+	base := strings.ToLower(filepath.Base(imageOrName))
+	if _, ok := ds.trustedProcessNames[base]; ok {
+		return true
+	}
+
+	return false
 }
 
 // ProcessFileCreate handles file creation events with staged detection
 // Stage 1: Check I/O velocity as trigger
 // Stage 2: Only analyze files from high I/O processes (entropy + extensions)
-func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain.SysmonEvent) {
+func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
+
 	// DEBUG: Print ALL file creations to verify ransomware activity
 	ext := filepath.Ext(event.TargetFile)
-	log.Printf("[FILE_CREATED] %s (ext: %s) by %s (PID: %d)",
-		event.TargetFile, ext, filepath.Base(event.Image), event.ProcessID)
+	processImage := event.Image
+	if strings.TrimSpace(processImage) == "" {
+		processImage = "UNKNOWN"
+	}
+	log.Printf("[FILE_CREATED] %s (ext: %s) by %s (PID: %d, GUID: %s)",
+		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
+
+	// Track canary touches from ETW create/open telemetry for periodic scan attribution.
+	if _, _, canaryMatch := ds.matchCanaryPath(event.TargetFile); canaryMatch {
+		ds.recordCanaryActor(event, "FILE_CREATE")
+	}
+
+	// Canary files are frequently opened/read by legitimate indexers/AV engines.
+	// Ignore create/open-style canary events and only react on write/rename/delete paths.
+	if _, isCanary := ds.isCanaryFile(event.TargetFile); isCanary {
+		log.Printf("[CANARY] Ignoring create/open access on canary (waiting for write/rename/delete): %s", event.TargetFile)
+		return
+	}
 
 	// OPTIONAL: Check for ransom note BEFORE velocity check (configurable)
 	// Ransom notes are DEFINITIVE ransomware indicators with near-zero false positives
@@ -194,7 +358,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(
+		score := ds.addRuleIndicator(
 			event.ProcessGuid,
 			event.Image,
 			event.ProcessID,
@@ -222,6 +386,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	// STAGE 1: Multi-Tier Velocity Detection
 	// Implements graduated response based on I/O velocity
 	tier, velocity, tierName := ds.velocityTracker.DetectAnomalousActivity(event.ProcessGuid)
+	ds.trackVelocityActor(event, "create", tier, false)
 
 	// Handle each tier with appropriate response
 	switch tier {
@@ -245,7 +410,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] 🔴 TIER 3 CRITICAL: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
 		} else {
 			ds.highIOProcessesMux.Unlock()
@@ -271,7 +436,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] ⚠️  TIER 2 ANALYZE: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
 		} else {
 			ds.analyzedMux.Unlock()
@@ -297,6 +462,18 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 		return
 	}
 
+	// ML feature tracking: accumulate directory + extension stats for every file create
+	ds.fileCountersMux.Lock()
+	mlCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+	mlCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+	if ext != "" {
+		mlCounters.ExtensionCounts[strings.ToLower(ext)]++
+	}
+	ds.fileCountersMux.Unlock()
+
+	// ML feature tracking: detect browser credential / history / SSH key access
+	ds.checkBrowserAndSSHAccess(event)
+
 	// STAGE 2: Determine analysis level based on tier
 	// CRITICAL and ANALYZE tiers get deep file analysis
 	// MONITOR tier gets lightweight tracking only
@@ -306,9 +483,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	// This ensures ransom note detection happens even if ransomware creates encrypted files first
 	// Note: ext variable already declared at function start (line 168)
 
-	// TIER 2/3 ENHANCEMENT: Track .txt file creation for ransom note detection
-	// Pattern: Ransomware creates .txt files across multiple directories alongside encrypted files
-	if ext == ".txt" && (tier == domain.VelocityTierAnalyze || tier == domain.VelocityTierCritical) {
+	// Track .txt file creation for ransom note detection.
+	// Pattern: Ransomware creates .txt files across multiple directories alongside encrypted files.
+	// In ML mode, track at ALL tiers so the txt_file_count feature is populated early.
+	// In rule-based mode, only track at Tier 2/3 to avoid noise.
+	txtTrackingEnabled := ds.isMLModeEnabled() || tier == domain.VelocityTierAnalyze || tier == domain.VelocityTierCritical
+	if ext == ".txt" && txtTrackingEnabled {
 		dirPath := filepath.Dir(event.TargetFile)
 
 		ds.fileCountersMux.Lock()
@@ -356,93 +536,6 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 			// Trigger directory scan to find ENCRYPTED FILES
 			go ds.scanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, counters.TxtFileDirectories, event.Timestamp)
-		}
-	}
-
-	// REAL-TIME CANARY DETECTION: Check if created file is a honeypot
-	// This provides immediate detection with process context (unlike periodic checks)
-	if canary, isCanary := ds.isCanaryFile(event.TargetFile); isCanary {
-		log.Printf("[CANARY] 🚨 REAL-TIME DETECTION: Canary file accessed: %s", event.TargetFile)
-		log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
-
-		// Check for correlation with .txt file creation
-		ds.fileCountersMux.RLock()
-		counters, hasCounters := ds.fileCounters[event.ProcessGuid]
-		var txtFileCount int
-		var txtDirCount int
-		if hasCounters {
-			txtFileCount = counters.TxtFileCount
-			txtDirCount = len(counters.TxtFileDirectories)
-		}
-		ds.fileCountersMux.RUnlock()
-
-		// HIGH CONFIDENCE CORRELATION: Canary touched + ransom notes created
-		if txtFileCount >= 3 {
-			log.Printf("[CANARY] 🔥 CORRELATION DETECTED: Canary file + %d ransom notes across %d directories",
-				txtFileCount, txtDirCount)
-			log.Printf("[CANARY] HIGH CONFIDENCE: This is ransomware behavior!")
-
-			// Add correlated indicator with MAXIMUM severity
-			indicator := domain.Indicator{
-				Type:        domain.IndicatorCanaryCompromised,
-				Severity:    domain.ThreatCritical,
-				Points:      100, // Maximum points - definitive ransomware
-				Description: fmt.Sprintf("CORRELATED: Canary file + %d ransom notes (high confidence ransomware)", txtFileCount),
-				Timestamp:   event.Timestamp,
-				Evidence: map[string]string{
-					"canary_path":      event.TargetFile,
-					"detection_method": "REAL_TIME_CANARY_WITH_RANSOM_NOTES",
-					"txt_file_count":   fmt.Sprintf("%d", txtFileCount),
-					"txt_directories":  fmt.Sprintf("%d", txtDirCount),
-					"correlation":      "CANARY_AND_RANSOM_NOTES",
-					"confidence":       "VERY_HIGH",
-				},
-			}
-
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-			log.Printf("[CANARY] 🔴 CORRELATED INDICATOR ADDED: Score: %d (immediate termination)", score)
-
-			// Immediate evaluation - this is definitive ransomware
-			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-			return // Early return - ransomware confirmed
-		}
-
-		// Canary accessed without ransom notes (still suspicious)
-		log.Printf("[CANARY] ⚠️  Canary accessed but no ransom notes detected yet")
-		log.Printf("[CANARY] Adding canary indicator (waiting for correlation)")
-
-		// Analyze canary entropy to confirm encryption
-		canaryEntropy, err := domain.AnalyzeFileEntropy(event.TargetFile, canary.Extension)
-		if err == nil {
-			entropyDelta := canaryEntropy.Entropy - canary.OriginalEntropy
-
-			if entropyDelta >= 2.0 || canaryEntropy.IsLikelyEncrypted {
-				log.Printf("[CANARY] 🚨 Canary ENCRYPTED: entropy %.3f → %.3f (Δ +%.3f)",
-					canary.OriginalEntropy, canaryEntropy.Entropy, entropyDelta)
-
-				indicator := domain.Indicator{
-					Type:        domain.IndicatorCanaryCompromised,
-					Severity:    domain.ThreatCritical,
-					Points:      100, // Maximum - canary encryption = definitive ransomware
-					Description: "Honeypot file encrypted (canary compromise)",
-					Timestamp:   event.Timestamp,
-					Evidence: map[string]string{
-						"canary_path":         event.TargetFile,
-						"original_entropy":    fmt.Sprintf("%.3f", canary.OriginalEntropy),
-						"current_entropy":     fmt.Sprintf("%.3f", canaryEntropy.Entropy),
-						"entropy_delta":       fmt.Sprintf("%.3f", entropyDelta),
-						"detection_method":    "REAL_TIME_CANARY",
-						"false_positive_rate": "< 0.01%",
-					},
-				}
-
-				score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-				log.Printf("[CANARY] 🔴 ENCRYPTED CANARY DETECTED: Score: %d (immediate termination)", score)
-
-				// Immediate evaluation
-				ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-				return // Early return - ransomware confirmed
-			}
 		}
 	}
 
@@ -572,7 +665,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(
+		score := ds.addRuleIndicator(
 			event.ProcessGuid,
 			event.Image,
 			event.ProcessID,
@@ -601,7 +694,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(
+		score := ds.addRuleIndicator(
 			event.ProcessGuid,
 			event.Image,
 			event.ProcessID,
@@ -662,8 +755,8 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				},
 			}
 
-			ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, entropyIndicator)
-			finalScore := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, extensionIndicator)
+			ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, entropyIndicator)
+			finalScore := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, extensionIndicator)
 
 			log.Printf("[DETECTION] 🔴 IMMEDIATE TERMINATION TRIGGERED: Combined threshold reached (Score: %d)",
 				finalScore)
@@ -705,7 +798,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -745,7 +838,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -763,16 +856,204 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 }
 
+// updateVelocityTierForOperation tracks file activity and updates multi-tier velocity state.
+// This is used by non-create paths (modify/delete) so rename-heavy ransomware still escalates.
+func (ds *DetectionService) updateVelocityTierForOperation(event *domain.MonitorEvent, operation string) domain.VelocityTier {
+	op := domain.FileOperation{
+		Timestamp:   event.Timestamp,
+		ProcessGuid: event.ProcessGuid,
+		ProcessID:   event.ProcessID,
+		Operation:   operation,
+		FilePath:    event.TargetFile,
+		Image:       event.Image,
+	}
+	ds.velocityTracker.AddOperation(op)
+
+	tier, velocity, tierName := ds.velocityTracker.DetectAnomalousActivity(event.ProcessGuid)
+
+	switch tier {
+	case domain.VelocityTierCritical:
+		ds.highIOProcessesMux.Lock()
+		if _, exists := ds.highIOProcesses[event.ProcessGuid]; !exists {
+			ds.highIOProcesses[event.ProcessGuid] = time.Now()
+			ds.highIOProcessesMux.Unlock()
+
+			indicator := domain.Indicator{
+				Type:        domain.IndicatorIOVelocity,
+				Severity:    domain.ThreatCritical,
+				Points:      domain.IndicatorScores[domain.IndicatorIOVelocity],
+				Description: fmt.Sprintf("CRITICAL I/O velocity: %.2f files/min (fast ransomware)", velocity),
+				Timestamp:   event.Timestamp,
+				Evidence: map[string]string{
+					"velocity":  fmt.Sprintf("%.2f", velocity),
+					"tier":      tierName,
+					"operation": operation,
+				},
+			}
+
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			log.Printf("[DETECTION] TIER 3 CRITICAL: %.2f files/min - %s (op=%s, Score: %d)", velocity, event.Image, operation, score)
+		} else {
+			ds.highIOProcessesMux.Unlock()
+		}
+
+	case domain.VelocityTierAnalyze:
+		ds.analyzedMux.Lock()
+		if _, exists := ds.analyzedProcesses[event.ProcessGuid]; !exists {
+			ds.analyzedProcesses[event.ProcessGuid] = time.Now()
+			ds.analyzedMux.Unlock()
+
+			indicator := domain.Indicator{
+				Type:        domain.IndicatorIOVelocity,
+				Severity:    domain.ThreatHigh,
+				Points:      domain.IndicatorScores[domain.IndicatorIOVelocity] - 5,
+				Description: fmt.Sprintf("High I/O velocity: %.2f files/min (moderate ransomware)", velocity),
+				Timestamp:   event.Timestamp,
+				Evidence: map[string]string{
+					"velocity":  fmt.Sprintf("%.2f", velocity),
+					"tier":      tierName,
+					"operation": operation,
+				},
+			}
+
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			log.Printf("[DETECTION] TIER 2 ANALYZE: %.2f files/min - %s (op=%s, Score: %d)", velocity, event.Image, operation, score)
+		} else {
+			ds.analyzedMux.Unlock()
+		}
+
+	case domain.VelocityTierMonitor:
+		ds.monitoredMux.Lock()
+		if _, exists := ds.monitoredProcesses[event.ProcessGuid]; !exists {
+			ds.monitoredProcesses[event.ProcessGuid] = time.Now()
+			ds.monitoredMux.Unlock()
+			log.Printf("[MONITORING] TIER 1 MONITOR: %.2f files/min - %s (op=%s)", velocity, event.Image, operation)
+		} else {
+			ds.monitoredMux.Unlock()
+		}
+	}
+
+	renameToRansomExt := operation == "modify" &&
+		isRenameMonitorEvent(event) &&
+		domain.IsRansomwareExtension(event.TargetFile, ds.ransomwareExtensions)
+	ds.trackVelocityActor(event, operation, tier, renameToRansomExt)
+
+	return tier
+}
+
 // ProcessFileModified handles file modification events (Event ID 2)
 // This is CRITICAL for detecting in-place encryption where ransomware modifies existing files
 // without creating new files or changing extensions
-func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *domain.SysmonEvent) {
-	ext := filepath.Ext(event.TargetFile)
-	log.Printf("[FILE_MODIFIED] %s (ext: %s) by %s (PID: %d)",
-		event.TargetFile, ext, filepath.Base(event.Image), event.ProcessID)
+func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
 
-	// STAGE 1: Check if process is being monitored at ANY tier
-	tier := ds.velocityTracker.GetVelocityTier(event.ProcessGuid)
+	ext := filepath.Ext(event.TargetFile)
+	processImage := event.Image
+	if strings.TrimSpace(processImage) == "" {
+		processImage = "UNKNOWN"
+	}
+	log.Printf("[FILE_MODIFIED] %s (ext: %s) by %s (PID: %d, GUID: %s)",
+		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
+
+	// Keep recent ETW actor context for periodic canary compromise attribution.
+	ds.recordCanaryActor(event, "FILE_MODIFIED")
+
+	// Track modify operations so rename/encrypt bursts participate in velocity tiers.
+	tier := ds.updateVelocityTierForOperation(event, "modify")
+
+	// ML feature tracking: directory + extension from modify events
+	isRename := isRenameMonitorEvent(event)
+	ds.fileCountersMux.Lock()
+	modMLCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+	modMLCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+	if ext != "" {
+		modMLCounters.ExtensionCounts[strings.ToLower(ext)]++
+		// For rename events, also track the original (inner) extension so Shannon
+		// entropy is non-zero. E.g., "document.pdf.CONTI" → track both ".conti" and ".pdf".
+		if isRename {
+			base := strings.TrimSuffix(event.TargetFile, ext)
+			if innerExt := filepath.Ext(base); innerExt != "" {
+				modMLCounters.ExtensionCounts[strings.ToLower(innerExt)]++
+			}
+		}
+	}
+	// Track .txt files from rename events (ransomware may rename tmp → README.txt)
+	if isRename && strings.EqualFold(ext, ".txt") {
+		modMLCounters.TxtFileCount++
+		dirPath := filepath.Dir(event.TargetFile)
+		dirExists := false
+		for _, d := range modMLCounters.TxtFileDirectories {
+			if d == dirPath {
+				dirExists = true
+				break
+			}
+		}
+		if !dirExists {
+			modMLCounters.TxtFileDirectories = append(modMLCounters.TxtFileDirectories, dirPath)
+		}
+	}
+	ds.fileCountersMux.Unlock()
+
+	// ML feature tracking: detect browser credential / history / SSH key access
+	ds.checkBrowserAndSSHAccess(event)
+
+	// Real-time canary response is limited to destructive I/O paths (write/rename).
+	// Read/open-style accesses are intentionally ignored in ProcessFileCreate.
+	if ds.handleCanaryWriteOrRename(event) {
+		return
+	}
+
+	// Fast-kill path: rename to known ransomware extension (scope: rename-only).
+	// This preserves unknown-extension detection via high-entropy threshold (10 files).
+	if isRenameMonitorEvent(event) && domain.IsRansomwareExtension(event.TargetFile, ds.ransomwareExtensions) {
+		now := event.Timestamp
+		if now.IsZero() {
+			now = time.Now()
+		}
+
+		const renameWindow = 60 * time.Second
+
+		ds.fileCountersMux.Lock()
+		counters := ds.getOrInitMLCounters(event.ProcessGuid)
+		if counters.RenameRansomExtHits == nil {
+			counters.RenameRansomExtHits = make([]time.Time, 0, ds.renameExtThreshold+2)
+		}
+		counters.RenameRansomExtHits = trimRenameHits(counters.RenameRansomExtHits, now, renameWindow)
+		counters.RenameRansomExtHits = append(counters.RenameRansomExtHits, now)
+		// Keep ML feature counters current before triggering inference.
+		counters.RansomExtensionCount++
+		renameCount := len(counters.RenameRansomExtHits)
+		extensionCount := counters.RansomExtensionCount
+		counters.LastUpdated = now
+		ds.fileCountersMux.Unlock()
+
+		log.Printf("[DETECTION] Rename-to-ransom-extension observed: %s (%d/%d in %s, extension_count=%d)",
+			event.TargetFile, renameCount, ds.renameExtThreshold, renameWindow, extensionCount)
+
+		if renameCount >= ds.renameExtThreshold {
+			indicator := domain.Indicator{
+				Type:        domain.IndicatorRansomExtension,
+				Severity:    domain.ThreatCritical,
+				Points:      domain.IndicatorScores[domain.IndicatorRansomExtension],
+				Description: fmt.Sprintf("Rename-based ransomware extension threshold reached: %d files", renameCount),
+				Timestamp:   now,
+				Evidence: map[string]string{
+					"file":             event.TargetFile,
+					"count":            fmt.Sprintf("%d", renameCount),
+					"threshold":        fmt.Sprintf("%d", ds.renameExtThreshold),
+					"window_seconds":   "60",
+					"detection_method": "RENAME_EXTENSION_FAST_KILL",
+				},
+			}
+
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			log.Printf("[DETECTION] RENAME EXTENSION FAST-KILL THRESHOLD REACHED (Score: %d)", score)
+			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+			return
+		}
+	}
 
 	// Only analyze file modifications from monitored processes (TIER 1+)
 	// This includes MONITOR, ANALYZE, and CRITICAL tiers
@@ -814,7 +1095,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] 🔴 FILE LOCKED INDICATOR ADDED: %s (Score: %d)",
 				filepath.Base(event.TargetFile), score)
 
@@ -866,7 +1147,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] 🔴 IN-PLACE ENCRYPTION INDICATOR ADDED: %s (Score: %d)",
 				filepath.Base(event.TargetFile), score)
 
@@ -897,7 +1178,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 		log.Printf("[DETECTION] 🔴 ENTROPY INCREASE INDICATOR ADDED: %s (Score: %d)",
 			filepath.Base(event.TargetFile), score)
 
@@ -945,7 +1226,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] 🔴 HIGH ENTROPY MODIFICATION THRESHOLD REACHED: %d files (Score: %d)",
 				currentCount, score)
 
@@ -954,10 +1235,124 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 	}
 }
 
+// handleCanaryWriteOrRename handles real-time canary detection for write/overwrite/rename operations.
+// Returns true when the event targets a canary and should not continue through normal file-modified flow.
+func (ds *DetectionService) handleCanaryWriteOrRename(event *domain.MonitorEvent) bool {
+	canary, isCanary := ds.isCanaryFile(event.TargetFile)
+	if !isCanary {
+		return false
+	}
+
+	action := ds.GetCanaryResponseAction()
+	log.Printf("[CANARY] REAL-TIME DETECTION: Canary file WRITE/RENAME observed: %s (response_action=%s)", event.TargetFile, action)
+	log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
+
+	// Determine indicator points based on canary response action
+	var canaryPoints int
+	switch action {
+	case "alert_only":
+		canaryPoints = 0 // Alert only, no auto-response
+	case "suspend":
+		canaryPoints = 30 // Below auto-terminate threshold, triggers suspend
+	default: // "terminate"
+		canaryPoints = 100 // Immediate auto-terminate
+	}
+
+	// Correlate with ransom-note style .txt activity for very high confidence.
+	ds.fileCountersMux.RLock()
+	counters, hasCounters := ds.fileCounters[event.ProcessGuid]
+	var txtFileCount int
+	var txtDirCount int
+	if hasCounters {
+		txtFileCount = counters.TxtFileCount
+		txtDirCount = len(counters.TxtFileDirectories)
+	}
+	ds.fileCountersMux.RUnlock()
+
+	if txtFileCount >= 3 {
+		log.Printf("[CANARY] CORRELATION DETECTED: Canary write/rename + %d ransom-note files across %d directories",
+			txtFileCount, txtDirCount)
+
+		indicator := domain.Indicator{
+			Type:        domain.IndicatorCanaryCompromised,
+			Severity:    domain.ThreatCritical,
+			Points:      canaryPoints,
+			Description: fmt.Sprintf("CORRELATED: Canary file write/rename + %d ransom notes (high confidence ransomware)", txtFileCount),
+			Timestamp:   event.Timestamp,
+			Evidence: map[string]string{
+				"canary_path":      event.TargetFile,
+				"detection_method": "REAL_TIME_CANARY_WRITE_RENAME_WITH_RANSOM_NOTES",
+				"txt_file_count":   fmt.Sprintf("%d", txtFileCount),
+				"txt_directories":  fmt.Sprintf("%d", txtDirCount),
+				"correlation":      "CANARY_WRITE_RENAME_AND_RANSOM_NOTES",
+				"confidence":       "VERY_HIGH",
+				"response_action":  action,
+			},
+		}
+
+		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		log.Printf("[CANARY] CORRELATED INDICATOR ADDED: Score: %d (action=%s)", score, action)
+
+		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+		return true
+	}
+
+	// No strong correlation yet: verify content change on canary.
+	canaryEntropy, err := domain.AnalyzeFileEntropy(event.TargetFile, canary.Extension)
+	if err != nil {
+		log.Printf("[CANARY] Canary write/rename observed but entropy check failed: %v", err)
+		return true
+	}
+
+	entropyDelta := canaryEntropy.Entropy - canary.OriginalEntropy
+	if entropyDelta >= 2.0 || canaryEntropy.IsLikelyEncrypted {
+		log.Printf("[CANARY] Canary ENCRYPTED via write/rename: entropy %.3f -> %.3f (delta +%.3f)",
+			canary.OriginalEntropy, canaryEntropy.Entropy, entropyDelta)
+
+		indicator := domain.Indicator{
+			Type:        domain.IndicatorCanaryCompromised,
+			Severity:    domain.ThreatCritical,
+			Points:      canaryPoints,
+			Description: "Honeypot file modified/encrypted (canary compromise)",
+			Timestamp:   event.Timestamp,
+			Evidence: map[string]string{
+				"canary_path":      event.TargetFile,
+				"original_entropy": fmt.Sprintf("%.3f", canary.OriginalEntropy),
+				"current_entropy":  fmt.Sprintf("%.3f", canaryEntropy.Entropy),
+				"entropy_delta":    fmt.Sprintf("%.3f", entropyDelta),
+				"detection_method": "REAL_TIME_CANARY_WRITE_RENAME",
+				"response_action":  action,
+			},
+		}
+
+		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		log.Printf("[CANARY] ENCRYPTED CANARY DETECTED: Score: %d (action=%s)", score, action)
+
+		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+	}
+
+	return true
+}
+
 // ProcessProcessCreate handles process creation events
-func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *domain.SysmonEvent) {
+func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
+
 	cmdLine := strings.ToLower(event.CommandLine)
 	imageLower := strings.ToLower(event.Image)
+
+	// ML feature tracking: detect system info reconnaissance commands
+	isSystemInfoCmd := strings.Contains(cmdLine, "systeminfo") || strings.Contains(cmdLine, "whoami") ||
+		strings.Contains(cmdLine, "hostname") || strings.Contains(cmdLine, "ipconfig") ||
+		strings.Contains(cmdLine, "net user") || strings.Contains(cmdLine, "net localgroup")
+	if isSystemInfoCmd {
+		ds.fileCountersMux.Lock()
+		sysCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+		sysCounters.SystemInfoHit = true
+		ds.fileCountersMux.Unlock()
+	}
 
 	// CRITICAL: Detect shadow copy deletion attempts (common ransomware technique)
 	// Instant termination - this is a clear indicator of ransomware preparation
@@ -971,6 +1366,11 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 	}
 
 	if isShadowCopyDeletion {
+		ds.fileCountersMux.Lock()
+		shadowCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+		shadowCounters.ShadowCopyDeleteHit = true
+		ds.fileCountersMux.Unlock()
+
 		log.Printf("[DETECTION] 🚨 CRITICAL: Shadow copy deletion/recovery disable detected!")
 		log.Printf("[DETECTION] 🚨 Command: %s", event.CommandLine)
 		log.Printf("[DETECTION] 🚨 Process: %s (PID: %d)", event.Image, event.ProcessID)
@@ -990,7 +1390,7 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(
+		score := ds.addRuleIndicator(
 			event.ProcessGuid,
 			event.Image,
 			event.ProcessID,
@@ -998,6 +1398,9 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 		)
 
 		log.Printf("[DETECTION] 🔴 SHADOW COPY DELETION - IMMEDIATE TERMINATION TRIGGERED (Score: %d)", score)
+
+		// Propagate shadow_copy_delete to parent process (ransomware spawns vssadmin/wmic)
+		ds.propagateMLFlagToParent(event, true, false, false)
 
 		// Force immediate evaluation and alert
 		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
@@ -1017,6 +1420,16 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 				indicatorType = domain.IndicatorLSASSAccess
 			}
 
+			ds.fileCountersMux.Lock()
+			mlCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+			if indicatorType == domain.IndicatorShadowCopyDeletion {
+				mlCounters.ShadowCopyDeleteHit = true
+			}
+			if indicatorType == domain.IndicatorLSASSAccess {
+				mlCounters.LSASSAccessHit = true
+			}
+			ds.fileCountersMux.Unlock()
+
 			indicator := domain.Indicator{
 				Type:        indicatorType,
 				Severity:    domain.ThreatCritical,
@@ -1029,7 +1442,7 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -1037,17 +1450,38 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 			)
 
 			log.Printf("[DETECTION] Suspicious command: %s (Score: %d)", description, score)
+
+			// Propagate suspicious command flags to parent (ransomware spawns child for these)
+			ds.propagateMLFlagToParent(event,
+				indicatorType == domain.IndicatorShadowCopyDeletion,
+				false,
+				indicatorType == domain.IndicatorLSASSAccess,
+			)
 		}
+	}
+
+	// Propagate system_info flag to parent process (ransomware spawns cmd.exe /c systeminfo)
+	if isSystemInfoCmd {
+		ds.propagateMLFlagToParent(event, false, true, false)
 	}
 
 	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 }
 
 // ProcessLSASSAccess handles LSASS memory access events
-func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domain.SysmonEvent) {
+func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
+
 	if !strings.Contains(strings.ToLower(event.TargetImage), "lsass.exe") {
 		return
 	}
+
+	ds.fileCountersMux.Lock()
+	mlCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+	mlCounters.LSASSAccessHit = true
+	ds.fileCountersMux.Unlock()
 
 	indicator := domain.Indicator{
 		Type:        domain.IndicatorLSASSAccess,
@@ -1061,7 +1495,7 @@ func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domai
 		},
 	}
 
-	score := ds.threatScorer.AddIndicator(
+	score := ds.addRuleIndicator(
 		event.ProcessGuid,
 		event.Image,
 		event.ProcessID,
@@ -1071,11 +1505,18 @@ func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domai
 	log.Printf("[DETECTION] LSASS access: %s (Access: %s, Score: %d)",
 		event.Image, event.GrantedAccess, score)
 
+	// Propagate LSASS access to parent (ransomware may spawn child for credential dumping)
+	ds.propagateMLFlagToParent(event, false, false, true)
+
 	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 }
 
 // ProcessBrowserAccess handles browser credential file access
-func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *domain.SysmonEvent) {
+func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
+
 	// Check if non-browser process is accessing browser files
 	targetLower := strings.ToLower(event.TargetFile)
 	imageLower := strings.ToLower(event.Image)
@@ -1088,9 +1529,26 @@ func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *dom
 		}
 	}
 
+	// ML feature tracking: detect browser history and SSH key access
+	ds.fileCountersMux.Lock()
+	mlC := ds.getOrInitMLCounters(event.ProcessGuid)
+	if strings.Contains(targetLower, "\\history") || strings.Contains(targetLower, "\\places.sqlite") {
+		mlC.BrowserHistoryHit = true
+	}
+	if strings.Contains(targetLower, "\\.ssh\\") || strings.Contains(targetLower, "\\id_rsa") ||
+		strings.Contains(targetLower, "\\id_ed25519") || strings.Contains(targetLower, "\\known_hosts") {
+		mlC.SSHKeyHit = true
+	}
+	ds.fileCountersMux.Unlock()
+
 	// Check if accessing browser credential paths
 	for _, credPath := range domain.BrowserCredentialPaths {
 		if strings.Contains(targetLower, strings.ToLower(credPath)) {
+			ds.fileCountersMux.Lock()
+			credCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+			credCounters.BrowserCredentialHit = true
+			ds.fileCountersMux.Unlock()
+
 			indicator := domain.Indicator{
 				Type:        domain.IndicatorCredentialTheft,
 				Severity:    domain.ThreatCritical,
@@ -1103,7 +1561,7 @@ func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *dom
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -1119,12 +1577,227 @@ func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *dom
 	}
 }
 
-// evaluateAndAlert evaluates threat level and creates alerts
+// checkBrowserAndSSHAccess detects non-browser processes touching browser credential,
+// history, or SSH key paths and sets the corresponding ML feature flags.
+// Called from ProcessFileModified and ProcessFileCreate to wire up features 9-11.
+func (ds *DetectionService) checkBrowserAndSSHAccess(event *domain.MonitorEvent) {
+	if event == nil || strings.TrimSpace(event.TargetFile) == "" {
+		return
+	}
+	targetLower := strings.ToLower(event.TargetFile)
+	imageLower := strings.ToLower(event.Image)
+
+	// Skip legitimate browsers — they're expected to access their own files
+	for _, browser := range []string{"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"} {
+		if strings.Contains(imageLower, browser) {
+			return
+		}
+	}
+
+	var credHit, historyHit, sshHit bool
+
+	// Check browser credential paths
+	for _, credPath := range domain.BrowserCredentialPaths {
+		if strings.Contains(targetLower, strings.ToLower(credPath)) {
+			credHit = true
+			break
+		}
+	}
+	// Check browser history paths
+	if strings.Contains(targetLower, "\\history") || strings.Contains(targetLower, "\\places.sqlite") {
+		historyHit = true
+	}
+	// Check SSH key paths
+	if strings.Contains(targetLower, "\\.ssh\\") || strings.Contains(targetLower, "\\id_rsa") ||
+		strings.Contains(targetLower, "\\id_ed25519") || strings.Contains(targetLower, "\\known_hosts") {
+		sshHit = true
+	}
+
+	if !credHit && !historyHit && !sshHit {
+		return
+	}
+
+	ds.fileCountersMux.Lock()
+	counters := ds.getOrInitMLCounters(event.ProcessGuid)
+	if credHit {
+		counters.BrowserCredentialHit = true
+	}
+	if historyHit {
+		counters.BrowserHistoryHit = true
+	}
+	if sshHit {
+		counters.SSHKeyHit = true
+	}
+	ds.fileCountersMux.Unlock()
+
+	if credHit {
+		log.Printf("[DETECTION] Browser credential access: %s touching %s (PID: %d)",
+			event.Image, event.TargetFile, event.ProcessID)
+	}
+}
+
+func isCanaryIndicatorType(indicatorType domain.IndicatorType) bool {
+	if indicatorType == domain.IndicatorCanaryCompromised {
+		return true
+	}
+	return strings.HasPrefix(strings.ToUpper(string(indicatorType)), "CANARY_")
+}
+
+func extractCanaryPathFromAlert(alert *domain.Alert) string {
+	if alert == nil {
+		return ""
+	}
+
+	if path, ok := alert.Evidence["canary_path"]; ok {
+		if asText, ok := path.(string); ok {
+			return asText
+		}
+	}
+
+	for _, indicator := range alert.Indicators {
+		if !isCanaryIndicatorType(indicator.Type) {
+			continue
+		}
+		if path, ok := indicator.Evidence["canary_path"]; ok {
+			return path
+		}
+		if path, ok := indicator.Evidence["file"]; ok {
+			return path
+		}
+	}
+
+	return ""
+}
+
+func (ds *DetectionService) attachRelatedProcessesToCanaryAlert(alert *domain.Alert, canaryPathOverride string, attributedGuidOverride string) {
+	if alert == nil {
+		return
+	}
+
+	hasCanaryIndicator := false
+	for _, indicator := range alert.Indicators {
+		if isCanaryIndicatorType(indicator.Type) {
+			hasCanaryIndicator = true
+			break
+		}
+	}
+
+	if !hasCanaryIndicator && strings.TrimSpace(canaryPathOverride) == "" {
+		return
+	}
+
+	canaryPath := extractCanaryPathFromAlert(alert)
+	if strings.TrimSpace(canaryPath) == "" {
+		canaryPath = canaryPathOverride
+	}
+	if strings.TrimSpace(canaryPath) == "" {
+		return
+	}
+
+	attributedGuid := strings.TrimSpace(alert.ProcessGuid)
+	if strings.EqualFold(attributedGuid, "UNKNOWN") {
+		attributedGuid = ""
+	}
+	overrideGuid := strings.TrimSpace(attributedGuidOverride)
+	if strings.EqualFold(overrideGuid, "UNKNOWN") {
+		overrideGuid = ""
+	}
+	if attributedGuid == "" {
+		attributedGuid = overrideGuid
+	}
+
+	related := ds.collectRelatedVelocityActors(canaryPath, attributedGuid, time.Now())
+	alert.RelatedProcesses = related
+}
+
+// evaluateAndAlert evaluates threat level and creates alerts.
+// Two-stage pipeline: rule-based indicators accumulate first, then ML inference fires
+// once enough non-zero features have been gathered (mlMinIndicators threshold).
+//
+// Detection modes:
+//   - rules_only: Pure rule-based scoring. ML completely disabled.
+//   - hybrid: Both rules AND ML. Rule indicators generate alerts. ML provides additional classification.
+//   - ml_only: ML is sole decision-maker. Rule indicators feed ML features but don't generate alerts.
 func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, pid int) {
+	mode := ds.GetDetectionMode()
+
+	// Stage 1: Rule-based evaluation (always runs to accumulate indicators)
 	level, score := ds.threatScorer.EvaluateThreat(processGuid)
 
-	if level == domain.ThreatNone || level == domain.ThreatLow {
+	if level == domain.ThreatNone {
 		return
+	}
+
+	// In rules_only mode, skip ThreatLow (not suspicious enough)
+	if level == domain.ThreatLow && mode == "rules_only" {
+		return
+	}
+
+	// In ml_only or hybrid mode, ThreatLow processes still reach the ML gate for accumulation
+
+	// Stage 2: ML inference (runs in hybrid and ml_only modes when ML is loaded)
+	mlDecisionMade := false
+	if ds.isMLModeEnabled() && (mode == "ml_only" || mode == "hybrid") {
+		features := ds.ExtractFeatureVector(processGuid)
+		nonZeroCount := 0
+		for _, f := range features {
+			if f != 0 {
+				nonZeroCount++
+			}
+		}
+		if nonZeroCount < ds.mlMinIndicators {
+			log.Printf("[ML][GATE] process=%s pid=%d features=%d/%d — accumulating (mode=%s)",
+				image, pid, nonZeroCount, ds.mlMinIndicators, mode)
+			ds.logFeatureVector(image, pid, features)
+			if mode == "ml_only" {
+				return // ml_only: nothing else to do until ML gate passes
+			}
+			// hybrid: fall through to rule-based alert path below
+		} else {
+			log.Printf("[ML][GATE] process=%s pid=%d features=%d/%d — PASSED, firing inference (mode=%s)",
+				image, pid, nonZeroCount, ds.mlMinIndicators, mode)
+			ds.logFeatureVector(image, pid, features)
+
+			// Cooldown: don't re-infer too quickly on the same process
+			ds.mlMux.RLock()
+			lastTime := ds.mlLastInference[processGuid]
+			ds.mlMux.RUnlock()
+			if !lastTime.IsZero() && time.Since(lastTime) < ds.mlCooldown {
+				if mode == "ml_only" {
+					return
+				}
+				// hybrid: fall through to rule-based path
+			} else {
+				// Enough features accumulated — run ML inference
+				activity := ds.runMLInference(processGuid, image, pid, features)
+				if activity != nil && activity.Stage == "decision" && activity.Prediction != nil {
+					ds.mlMux.Lock()
+					ds.mlLastInference[processGuid] = time.Now()
+					ds.mlMux.Unlock()
+
+					ds.emitMLDecisionAlert(activity.Prediction)
+					mlDecisionMade = true
+				}
+
+				if !mlDecisionMade && mode == "ml_only" {
+					// ml_only: no fallback to rules
+					log.Printf("[ML][NO_FALLBACK] ML inference did not produce decision (level=%s score=%d) — rule-based fallback disabled",
+						level, score)
+					return
+				}
+				// hybrid: fall through to also emit rule-based alert if warranted
+			}
+		}
+	}
+
+	// Stage 3: Rule-based alert path (runs in rules_only mode, or hybrid when ML didn't decide)
+	if mode == "ml_only" {
+		return // ml_only never emits rule-based alerts
+	}
+
+	// rules_only or hybrid: emit rule-based alert for ThreatMedium+
+	if level == domain.ThreatLow {
+		return // ThreatLow not actionable for rule-based alerts
 	}
 
 	threatScore := ds.threatScorer.GetThreatScore(processGuid)
@@ -1147,16 +1820,96 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 		alert.AddIndicator(indicator)
 	}
 
+	ds.attachRelatedProcessesToCanaryAlert(alert, "", processGuid)
+
 	// Determine if auto-response is warranted
 	alert.AutoRespond = ds.threatScorer.ShouldAutoRespond(processGuid)
 
 	// Send alert
 	select {
 	case ds.alertChan <- alert:
-		log.Printf("[ALERT] %s - %s (PID: %d, Score: %d, Auto-Respond: %v)",
-			alert.Severity, alert.Description, pid, score, alert.AutoRespond)
+		log.Printf("[ALERT] %s - %s (PID: %d, Score: %d, Auto-Respond: %v, Mode: %s)",
+			alert.Severity, alert.Description, pid, score, alert.AutoRespond, mode)
 	default:
 		log.Printf("[WARNING] Alert channel full, dropping alert")
+	}
+}
+
+func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction) {
+	if prediction == nil {
+		return
+	}
+
+	var (
+		category      string
+		severity      domain.ThreatLevel
+		score         int
+		indicatorType domain.IndicatorType
+	)
+
+	switch prediction.Label {
+	case 1: // ransomware
+		category = "RANSOMWARE"
+		severity = domain.ThreatCritical
+		score = 100
+		indicatorType = domain.IndicatorMLRansomware
+	case 2: // stealer
+		category = "STEALER"
+		severity = domain.ThreatMedium
+		score = 30
+		indicatorType = domain.IndicatorMLStealer
+	default: // benign
+		return
+	}
+
+	description := fmt.Sprintf("ML decision: %s (%.1f%% confidence)", prediction.LabelName, prediction.Confidence*100)
+	maliciousProb := prediction.Probabilities[1] + prediction.Probabilities[2]
+	alert := domain.NewAlert(
+		category,
+		severity,
+		prediction.ProcessGuid,
+		prediction.ProcessID,
+		prediction.Image,
+		description,
+		score,
+	)
+
+	alert.AddIndicator(domain.Indicator{
+		Type:        indicatorType,
+		Severity:    severity,
+		Points:      score,
+		Description: description,
+		Timestamp:   prediction.Timestamp,
+		Evidence: map[string]string{
+			"decision_mode":  "ml_only",
+			"confidence":     fmt.Sprintf("%.4f", prediction.Confidence),
+			"malicious_prob": fmt.Sprintf("%.4f", maliciousProb),
+			"prob_benign":    fmt.Sprintf("%.4f", prediction.Probabilities[0]),
+			"prob_ransom":    fmt.Sprintf("%.4f", prediction.Probabilities[1]),
+			"prob_steal":     fmt.Sprintf("%.4f", prediction.Probabilities[2]),
+		},
+	})
+
+	// Policy: ransomware => terminate-eligible, stealer => alert-only
+	alert.AutoRespond = prediction.Label == 1
+	log.Printf("[ML][DECISION] process=%s pid=%d label=%s confidence=%.4f malicious_prob=%.4f prob_ransom=%.4f prob_steal=%.4f score=%d auto_respond=%v",
+		prediction.Image,
+		prediction.ProcessID,
+		prediction.LabelName,
+		prediction.Confidence,
+		maliciousProb,
+		prediction.Probabilities[1],
+		prediction.Probabilities[2],
+		score,
+		alert.AutoRespond,
+	)
+
+	select {
+	case ds.alertChan <- alert:
+		log.Printf("[ALERT][ML] %s - %s (PID: %d, Score: %d, Auto-Respond: %v)",
+			alert.Severity, alert.Description, alert.ProcessID, alert.Score, alert.AutoRespond)
+	default:
+		log.Printf("[WARNING][ML] Alert channel full, dropping ML alert")
 	}
 }
 
@@ -1175,11 +1928,350 @@ func (ds *DetectionService) GetAllThreats() []*domain.ThreatScore {
 	return ds.threatScorer.GetAllThreats()
 }
 
+// ---------------------------------------------------------------------------
+// ML Inference Integration
+// ---------------------------------------------------------------------------
+
+// SetMLPredictor sets the ML predictor for inference.
+func (ds *DetectionService) SetMLPredictor(p domain.MLPredictor) {
+	ds.mlMux.Lock()
+	defer ds.mlMux.Unlock()
+	ds.mlPredictor = p
+}
+
+// SetMLEnabled enables or disables ML detection.
+// Rule-based indicators continue accumulating and serve as the gate for ML inference.
+func (ds *DetectionService) SetMLEnabled(enabled bool) {
+	ds.mlMux.Lock()
+	defer ds.mlMux.Unlock()
+	ds.mlEnabled = enabled
+}
+
+// SetMLConfidence sets the minimum malicious probability threshold for ML decisions.
+func (ds *DetectionService) SetMLConfidence(threshold float64) {
+	ds.mlMux.Lock()
+	defer ds.mlMux.Unlock()
+	ds.mlConfidence = threshold
+}
+
+// SetMLMinIndicators sets the minimum number of non-zero features in the
+// feature vector before ML inference is triggered for a process.
+func (ds *DetectionService) SetMLMinIndicators(n int) {
+	ds.mlMux.Lock()
+	defer ds.mlMux.Unlock()
+	if n < 1 {
+		n = 1
+	}
+	ds.mlMinIndicators = n
+}
+
+// SetMLPredictionCallback sets a callback invoked on every ML inference activity.
+func (ds *DetectionService) SetMLPredictionCallback(cb func(*domain.MLInferenceActivity)) {
+	ds.mlMux.Lock()
+	defer ds.mlMux.Unlock()
+	ds.onMLPrediction = cb
+}
+
+func (ds *DetectionService) isMLModeEnabled() bool {
+	ds.mlMux.RLock()
+	defer ds.mlMux.RUnlock()
+	return ds.mlEnabled
+}
+
+// SetDetectionMode sets the detection mode: "rules_only", "hybrid", or "ml_only".
+func (ds *DetectionService) SetDetectionMode(mode string) {
+	switch mode {
+	case "rules_only", "hybrid", "ml_only":
+		ds.detectionMode = mode
+	default:
+		ds.detectionMode = "rules_only"
+	}
+	log.Printf("[CONFIG] Detection mode set to: %s", ds.detectionMode)
+}
+
+// GetDetectionMode returns the current detection mode.
+func (ds *DetectionService) GetDetectionMode() string {
+	if ds.detectionMode == "" {
+		return "rules_only"
+	}
+	return ds.detectionMode
+}
+
+// SetCanaryResponseAction sets the canary response action: "terminate", "suspend", or "alert_only".
+func (ds *DetectionService) SetCanaryResponseAction(action string) {
+	switch action {
+	case "terminate", "suspend", "alert_only":
+		ds.canaryResponseAction = action
+	default:
+		ds.canaryResponseAction = "terminate"
+	}
+	log.Printf("[CONFIG] Canary response action set to: %s", ds.canaryResponseAction)
+}
+
+// GetCanaryResponseAction returns the current canary response action.
+func (ds *DetectionService) GetCanaryResponseAction() string {
+	if ds.canaryResponseAction == "" {
+		return "terminate"
+	}
+	return ds.canaryResponseAction
+}
+
+// addRuleIndicator records a rule-based indicator. In ML mode, indicators serve as
+// the accumulation mechanism — the ML gate fires inference after enough indicators gather.
+func (ds *DetectionService) addRuleIndicator(processGuid, image string, pid int, indicator domain.Indicator) int {
+	return ds.threatScorer.AddIndicator(processGuid, image, pid, indicator)
+}
+
+// logFeatureVector logs all 14 ML feature values for debugging/observability.
+func (ds *DetectionService) logFeatureVector(image string, pid int, features [14]float64) {
+	log.Printf("[ML][FEATURES] process=%s pid=%d Features: [velocity=%.2f, file_count=%.2f, "+
+		"txt_file_count=%.2f, directory_count=%.2f, file_delete_count=%.2f, is_signed=%.2f, "+
+		"extension_match=%.2f, extension_entropy=%.2f, shadow_copy_delete=%.2f, "+
+		"browser_credential_access=%.2f, browser_history_access=%.2f, ssh_key_access=%.2f, "+
+		"lsass_access=%.2f, system_info_queries=%.2f]",
+		image, pid,
+		features[0], features[1], features[2], features[3], features[4], features[5],
+		features[6], features[7], features[8], features[9], features[10], features[11],
+		features[12], features[13])
+}
+
+// ExtractFeatureVector builds the 14-feature vector for a process from accumulated state.
+// Feature order matches MODEL_FEATURES in train_model.py exactly.
+func (ds *DetectionService) ExtractFeatureVector(processGuid string) [14]float64 {
+	var features [14]float64
+
+	// Feature 0: velocity (files/min in last 60s)
+	ds.velocityActorsMux.RLock()
+	actor, hasActor := ds.velocityActors[processGuid]
+	if hasActor {
+		features[0] = float64(actor.TotalOps60s)
+	}
+	ds.velocityActorsMux.RUnlock()
+
+	// Features 1-4 from file counters
+	ds.fileCountersMux.RLock()
+	counters, hasCounters := ds.fileCounters[processGuid]
+	if hasCounters {
+		// Feature 1: file_count (cumulative total file ops since process start)
+		if hasActor {
+			features[1] = float64(actor.CumulativeFileCount)
+		}
+		// Feature 2: txt_file_count
+		features[2] = float64(counters.TxtFileCount)
+		// Feature 3: directory_count
+		features[3] = float64(len(counters.DirectorySet))
+		// Feature 4: file_delete_count
+		features[4] = float64(counters.DeleteCount)
+	}
+	ds.fileCountersMux.RUnlock()
+
+	// Feature 5: is_signed (default 0 for v1 — PE signature check not implemented yet)
+	features[5] = 0
+
+	// Feature 6: extension_match (boolean: 1 if ransomware extensions observed, 0 otherwise)
+	if hasCounters && counters.RansomExtensionCount > 0 {
+		features[6] = 1.0
+	}
+
+	// Feature 7: extension_entropy (Shannon entropy of the extension frequency distribution)
+	if hasCounters && counters.ExtensionCounts != nil {
+		total := 0
+		for _, c := range counters.ExtensionCounts {
+			total += c
+		}
+		if total > 0 {
+			entropy := 0.0
+			for _, c := range counters.ExtensionCounts {
+				p := float64(c) / float64(total)
+				if p > 0 {
+					entropy -= p * math.Log2(p)
+				}
+			}
+			features[7] = entropy
+		}
+	}
+
+	// Features 8-13: boolean indicators (1.0 if present, 0.0 otherwise)
+	if hasCounters && counters.ShadowCopyDeleteHit {
+		features[8] = 1 // shadow_copy_delete
+	}
+	if hasCounters && counters.BrowserCredentialHit {
+		features[9] = 1 // browser_credential_access
+	}
+
+	// Feature 10: browser_history_access
+	if hasCounters && counters.BrowserHistoryHit {
+		features[10] = 1
+	}
+	// Feature 11: ssh_key_access
+	if hasCounters && counters.SSHKeyHit {
+		features[11] = 1
+	}
+	if hasCounters && counters.LSASSAccessHit {
+		features[12] = 1 // lsass_access
+	}
+	// Feature 13: system_info_queries
+	if hasCounters && counters.SystemInfoHit {
+		features[13] = 1
+	}
+
+	return features
+}
+
+// getOrInitMLCounters returns the ProcessFileCounters for a GUID, initializing ML fields if needed.
+func (ds *DetectionService) getOrInitMLCounters(processGuid string) *ProcessFileCounters {
+	counters, exists := ds.fileCounters[processGuid]
+	if !exists {
+		counters = &ProcessFileCounters{
+			TxtFileDirectories: make([]string, 0),
+			DirectorySet:       make(map[string]struct{}),
+			ExtensionCounts:    make(map[string]int),
+			LastUpdated:        time.Now(),
+		}
+		ds.fileCounters[processGuid] = counters
+	} else {
+		// Ensure ML maps are initialized (for pre-existing counters created before ML)
+		if counters.DirectorySet == nil {
+			counters.DirectorySet = make(map[string]struct{})
+		}
+		if counters.ExtensionCounts == nil {
+			counters.ExtensionCounts = make(map[string]int)
+		}
+	}
+	return counters
+}
+
+// runMLInference runs ML model inference for a process and emits an activity record
+// for every outcome (decision, benign, below-threshold, not-ready, error).
+// If precomputed features are provided, they are used instead of re-extracting.
+func (ds *DetectionService) runMLInference(processGuid, image string, pid int, precomputed ...[14]float64) *domain.MLInferenceActivity {
+	ds.mlMux.RLock()
+	predictor := ds.mlPredictor
+	enabled := ds.mlEnabled
+	threshold := ds.mlConfidence
+	callback := ds.onMLPrediction
+	ds.mlMux.RUnlock()
+
+	ready := predictor != nil && predictor.IsReady()
+	log.Printf("[ML][ATTEMPT] process=%s pid=%d threshold=%.4f mode_enabled=%v predictor_ready=%v",
+		image, pid, threshold, enabled, ready)
+
+	activity := &domain.MLInferenceActivity{
+		ProcessGuid:    processGuid,
+		ProcessID:      pid,
+		Image:          image,
+		Threshold:      threshold,
+		ModeEnabled:    enabled,
+		PredictorReady: ready,
+		Timestamp:      time.Now(),
+	}
+
+	if !enabled {
+		activity.Stage = "skipped"
+		activity.Reason = "ml_mode_disabled"
+		ds.emitMLActivity(callback, activity)
+		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s", image, pid, activity.Reason)
+		return activity
+	}
+
+	if !ready {
+		activity.Stage = "skipped"
+		activity.Reason = "predictor_not_ready"
+		ds.emitMLActivity(callback, activity)
+		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s", image, pid, activity.Reason)
+		return activity
+	}
+
+	var features [14]float64
+	if len(precomputed) > 0 {
+		features = precomputed[0]
+	} else {
+		features = ds.ExtractFeatureVector(processGuid)
+	}
+	prediction, err := predictor.Predict(features)
+	if err != nil {
+		activity.Stage = "error"
+		activity.Reason = "inference_error"
+		activity.Error = err.Error()
+		ds.emitMLActivity(callback, activity)
+		log.Printf("[ML][ERROR] process=%s pid=%d error=%v", image, pid, err)
+		return activity
+	}
+
+	prediction.ProcessGuid = processGuid
+	prediction.ProcessID = pid
+	prediction.Image = image
+	activity.Prediction = prediction
+	if !prediction.Timestamp.IsZero() {
+		activity.Timestamp = prediction.Timestamp
+	}
+
+	probRansom := prediction.Probabilities[1]
+	probStealer := prediction.Probabilities[2]
+	maliciousProb := probRansom + probStealer
+
+	if maliciousProb < threshold {
+		activity.Stage = "skipped"
+		activity.Reason = "below_threshold"
+		activity.Decision = "none"
+		activity.DecisionScore = 0
+		activity.DecisionAutoRespond = false
+		ds.emitMLActivity(callback, activity)
+		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s malicious_prob=%.4f prob_ransom=%.4f prob_steal=%.4f threshold=%.4f",
+			image, pid, activity.Reason, maliciousProb, probRansom, probStealer, threshold)
+		return activity
+	}
+
+	decisionLabel := 1
+	decisionLabelName := domain.ClassLabels[1]
+	decisionConfidence := probRansom
+	if probStealer > probRansom {
+		decisionLabel = 2
+		decisionLabelName = domain.ClassLabels[2]
+		decisionConfidence = probStealer
+	}
+	prediction.Label = decisionLabel
+	prediction.LabelName = decisionLabelName
+	prediction.Confidence = decisionConfidence
+
+	switch decisionLabel {
+	case 1:
+		activity.Decision = "terminate_eligible"
+		activity.DecisionCategory = "RANSOMWARE"
+		activity.DecisionScore = 100
+		activity.DecisionAutoRespond = true
+	case 2:
+		activity.Decision = "alert_only"
+		activity.DecisionCategory = "STEALER"
+		activity.DecisionScore = 30
+		activity.DecisionAutoRespond = false
+	}
+
+	activity.Stage = "decision"
+	activity.Reason = "model_decision"
+	ds.emitMLActivity(callback, activity)
+	return activity
+}
+
+func (ds *DetectionService) emitMLActivity(callback func(*domain.MLInferenceActivity), activity *domain.MLInferenceActivity) {
+	if activity == nil {
+		return
+	}
+	if activity.Timestamp.IsZero() {
+		activity.Timestamp = time.Now()
+	}
+	if callback != nil {
+		callback(activity)
+	}
+}
+
 // SetupCanaryFiles creates honeypot files in common ransomware target directories
 // Canary files are decoy files with known low entropy that trigger alerts if encrypted/deleted
 // This catches slow-moving ransomware that doesn't trigger velocity thresholds
 func (ds *DetectionService) SetupCanaryFiles() error {
 	log.Println("[CANARY] Setting up honeypot files for ransomware detection...")
+	// Full setup resets latch state so recreated canaries can alert again.
+	ds.resetAllCanaryLatches()
 
 	successCount := 0
 	failCount := 0
@@ -1218,6 +2310,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 				Extension:       location.Extension,
 			}
 			ds.canaryFilesMux.Unlock()
+			ds.resetCanaryLatch(filePath)
 
 			log.Printf("[CANARY] ✓ Tracked existing canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
 			successCount++
@@ -1250,6 +2343,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 			Extension:       location.Extension,
 		}
 		ds.canaryFilesMux.Unlock()
+		ds.resetCanaryLatch(filePath)
 
 		log.Printf("[CANARY] ✓ Created canary: %s (entropy: %.3f, size: %d bytes)",
 			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
@@ -1284,6 +2378,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 				Extension:       location.Extension,
 			}
 			ds.canaryFilesMux.Unlock()
+			ds.resetCanaryLatch(filePath)
 
 			log.Printf("[CANARY] ✓ Tracked existing system canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
 			successCount++
@@ -1316,6 +2411,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 			Extension:       location.Extension,
 		}
 		ds.canaryFilesMux.Unlock()
+		ds.resetCanaryLatch(filePath)
 
 		log.Printf("[CANARY] ✓ Created system canary: %s (entropy: %.3f, size: %d bytes)",
 			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
@@ -1341,6 +2437,598 @@ func (ds *DetectionService) isCanaryFile(filePath string) (*domain.CanaryFile, b
 	return canary, exists
 }
 
+func normalizeCanaryPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	return strings.ToLower(filepath.Clean(path))
+}
+
+func (ds *DetectionService) resetAllCanaryLatches() {
+	ds.compromisedMux.Lock()
+	defer ds.compromisedMux.Unlock()
+
+	clear(ds.compromisedCanaries)
+}
+
+func (ds *DetectionService) resetCanaryLatch(filePath string) {
+	key := normalizeCanaryPath(filePath)
+	if key == "" {
+		return
+	}
+
+	ds.compromisedMux.Lock()
+	delete(ds.compromisedCanaries, key)
+	ds.compromisedMux.Unlock()
+}
+
+func (ds *DetectionService) shouldEmitCanaryAlert(filePath, compromiseType, relatedPath, attributedProcessGuid string, observedAt time.Time) bool {
+	key := normalizeCanaryPath(filePath)
+	if key == "" {
+		return true
+	}
+
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	ds.compromisedMux.Lock()
+	defer ds.compromisedMux.Unlock()
+
+	if state, exists := ds.compromisedCanaries[key]; exists && state.Latched {
+		state.LastSeen = observedAt
+		if compromiseType != "" {
+			state.CompromiseType = compromiseType
+		}
+		if relatedPath != "" {
+			state.RelatedPath = relatedPath
+		}
+		if attributedProcessGuid != "" && !strings.EqualFold(attributedProcessGuid, "UNKNOWN") {
+			state.AttributedProcessGuid = attributedProcessGuid
+		}
+		ds.compromisedCanaries[key] = state
+		return false
+	}
+
+	ds.compromisedCanaries[key] = CanaryCompromiseState{
+		FirstSeen:             observedAt,
+		LastSeen:              observedAt,
+		CompromiseType:        compromiseType,
+		RelatedPath:           relatedPath,
+		AttributedProcessGuid: attributedProcessGuid,
+		Latched:               true,
+	}
+
+	return true
+}
+
+func isRenameMonitorEvent(event *domain.MonitorEvent) bool {
+	if event == nil || event.RawData == nil {
+		return false
+	}
+
+	if value, ok := event.RawData["set_info_type"]; ok {
+		if text, ok := value.(string); ok && strings.EqualFold(text, "rename") {
+			return true
+		}
+	}
+	if value, ok := event.RawData["event_source"]; ok {
+		if text, ok := value.(string); ok && strings.EqualFold(text, "rename_path") {
+			return true
+		}
+	}
+	return false
+}
+
+func trimRenameHits(hits []time.Time, now time.Time, window time.Duration) []time.Time {
+	if len(hits) == 0 {
+		return hits
+	}
+	cutoff := now.Add(-window)
+	filtered := make([]time.Time, 0, len(hits))
+	for _, ts := range hits {
+		if ts.After(cutoff) {
+			filtered = append(filtered, ts)
+		}
+	}
+	return filtered
+}
+
+const (
+	velocityActorWindow       = 60 * time.Second
+	velocityActorRetention    = 120 * time.Second
+	velocityActorTargetLimit  = 32
+	relatedVelocityMinScore   = 50
+	relatedVelocityFreshLimit = 10 * time.Second
+)
+
+func trimTimeHitsInWindow(hits []time.Time, now time.Time, window time.Duration) []time.Time {
+	if len(hits) == 0 {
+		return hits
+	}
+	cutoff := now.Add(-window)
+	filtered := make([]time.Time, 0, len(hits))
+	for _, ts := range hits {
+		if ts.After(cutoff) || ts.Equal(cutoff) {
+			filtered = append(filtered, ts)
+		}
+	}
+	return filtered
+}
+
+func trimRecentTargets(targets []VelocityTargetObservation, now time.Time, window time.Duration, limit int) []VelocityTargetObservation {
+	if len(targets) == 0 {
+		return targets
+	}
+
+	cutoff := now.Add(-window)
+	filtered := make([]VelocityTargetObservation, 0, len(targets))
+	for _, target := range targets {
+		if target.SeenAt.After(cutoff) || target.SeenAt.Equal(cutoff) {
+			filtered = append(filtered, target)
+		}
+	}
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+	return filtered
+}
+
+func isPathInDirectorySubtree(path, directory string) bool {
+	pathNorm := normalizeCanaryPath(path)
+	dirNorm := normalizeCanaryPath(directory)
+	if pathNorm == "" || dirNorm == "" {
+		return false
+	}
+	if pathNorm == dirNorm {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if strings.HasSuffix(dirNorm, sep) {
+		return strings.HasPrefix(pathNorm, dirNorm)
+	}
+	return strings.HasPrefix(pathNorm, dirNorm+sep)
+}
+
+func isVelocityTierEligible(tier string) bool {
+	return strings.EqualFold(tier, domain.VelocityTierAnalyze.String()) ||
+		strings.EqualFold(tier, domain.VelocityTierCritical.String())
+}
+
+func (ds *DetectionService) pruneVelocityActorsLocked(now time.Time, maxAge time.Duration) int {
+	if len(ds.velocityActors) == 0 {
+		return 0
+	}
+	cutoff := now.Add(-maxAge)
+	removed := 0
+	for guid, actor := range ds.velocityActors {
+		if actor == nil || actor.LastSeen.Before(cutoff) {
+			delete(ds.velocityActors, guid)
+			removed++
+		}
+	}
+	return removed
+}
+
+func (ds *DetectionService) pruneVelocityActors(maxAge time.Duration) int {
+	now := time.Now()
+	ds.velocityActorsMux.Lock()
+	defer ds.velocityActorsMux.Unlock()
+	return ds.pruneVelocityActorsLocked(now, maxAge)
+}
+
+func (ds *DetectionService) trackVelocityActor(event *domain.MonitorEvent, operation string, tier domain.VelocityTier, renameToRansomExt bool) {
+	if event == nil {
+		return
+	}
+	if operation != "create" && operation != "modify" && operation != "delete" {
+		return
+	}
+	if strings.TrimSpace(event.ProcessGuid) == "" {
+		return
+	}
+
+	now := event.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	ds.velocityActorsMux.Lock()
+	defer ds.velocityActorsMux.Unlock()
+
+	ds.pruneVelocityActorsLocked(now, velocityActorRetention)
+
+	actor, exists := ds.velocityActors[event.ProcessGuid]
+	if !exists || actor == nil {
+		actor = &VelocityActorState{
+			ProcessGuid:    event.ProcessGuid,
+			RecentTargets:  make([]VelocityTargetObservation, 0, velocityActorTargetLimit),
+			createHitTimes: make([]time.Time, 0, 16),
+			modifyHitTimes: make([]time.Time, 0, 16),
+			deleteHitTimes: make([]time.Time, 0, 16),
+		}
+		ds.velocityActors[event.ProcessGuid] = actor
+	}
+
+	actor.ProcessGuid = event.ProcessGuid
+	if event.ProcessID > 0 {
+		actor.ProcessID = event.ProcessID
+	}
+	if strings.TrimSpace(event.Image) != "" {
+		actor.Image = event.Image
+	}
+	actor.LastSeen = now
+	actor.Tier = tier.String()
+
+	// Cumulative counter — always incremented, never windowed (for ML file_count feature)
+	actor.CumulativeFileCount++
+	switch operation {
+	case "create":
+		actor.CumulativeCreateCount++
+		actor.LastCreateSeen = now
+		actor.createHitTimes = append(actor.createHitTimes, now)
+		actor.createHitTimes = trimTimeHitsInWindow(actor.createHitTimes, now, velocityActorWindow)
+	case "modify":
+		actor.LastModifySeen = now
+		actor.modifyHitTimes = append(actor.modifyHitTimes, now)
+		actor.modifyHitTimes = trimTimeHitsInWindow(actor.modifyHitTimes, now, velocityActorWindow)
+	case "delete":
+		actor.deleteHitTimes = append(actor.deleteHitTimes, now)
+		actor.deleteHitTimes = trimTimeHitsInWindow(actor.deleteHitTimes, now, velocityActorWindow)
+	}
+
+	actor.CreateOps60s = len(actor.createHitTimes)
+	actor.ModifyOps60s = len(actor.modifyHitTimes)
+	actor.TotalOps60s = actor.CreateOps60s + actor.ModifyOps60s + len(actor.deleteHitTimes)
+
+	targetPath := normalizeCanaryPath(event.TargetFile)
+	if targetPath != "" {
+		actor.RecentTargets = append(actor.RecentTargets, VelocityTargetObservation{
+			Path:              targetPath,
+			SeenAt:            now,
+			RenameToRansomExt: renameToRansomExt,
+		})
+		actor.RecentTargets = trimRecentTargets(actor.RecentTargets, now, velocityActorWindow, velocityActorTargetLimit)
+	}
+}
+
+// resolveParentGuid looks up the ProcessGuid for a given PID by scanning velocityActors.
+// Used to propagate ML feature flags from child processes to their parent (e.g., vssadmin → ransomware).
+func (ds *DetectionService) resolveParentGuid(parentPID int) string {
+	ds.velocityActorsMux.RLock()
+	defer ds.velocityActorsMux.RUnlock()
+	for guid, actor := range ds.velocityActors {
+		if actor != nil && actor.ProcessID == parentPID {
+			return guid
+		}
+	}
+	return ""
+}
+
+// propagateMLFlagToParent resolves the parent PID from the event's RawData and
+// propagates ML feature flags (shadow_copy_delete, system_info, lsass_access) to the parent process.
+func (ds *DetectionService) propagateMLFlagToParent(event *domain.MonitorEvent, shadowCopy, systemInfo, lsassAccess bool) {
+	if event == nil || event.RawData == nil {
+		return
+	}
+	parentPIDRaw, ok := event.RawData["parent_process_id"]
+	if !ok {
+		return
+	}
+	var parentPID int
+	switch v := parentPIDRaw.(type) {
+	case uint32:
+		parentPID = int(v)
+	case int:
+		parentPID = v
+	case int64:
+		parentPID = int(v)
+	case float64:
+		parentPID = int(v)
+	default:
+		return
+	}
+	if parentPID == 0 {
+		// Layer 2 safety net: PPID unknown even after Toolhelp32 fallback,
+		// broadcast to all active velocity actors (processes with recent file I/O).
+		if shadowCopy || systemInfo || lsassAccess {
+			ds.broadcastMLFlagToActiveActors(event, shadowCopy, systemInfo, lsassAccess)
+		}
+		return
+	}
+	parentGuid := ds.resolveParentGuid(parentPID)
+	if parentGuid == "" {
+		// Parent PID known but not tracked as a velocity actor — broadcast as fallback
+		if shadowCopy || systemInfo || lsassAccess {
+			ds.broadcastMLFlagToActiveActors(event, shadowCopy, systemInfo, lsassAccess)
+		}
+		return
+	}
+	ds.fileCountersMux.Lock()
+	parentCounters := ds.getOrInitMLCounters(parentGuid)
+	if shadowCopy {
+		parentCounters.ShadowCopyDeleteHit = true
+	}
+	if systemInfo {
+		parentCounters.SystemInfoHit = true
+	}
+	if lsassAccess {
+		parentCounters.LSASSAccessHit = true
+	}
+	ds.fileCountersMux.Unlock()
+	log.Printf("[ML][PARENT_PROPAGATE] child_pid=%d parent_guid=%s shadow=%v sysinfo=%v lsass=%v",
+		event.ProcessID, parentGuid, shadowCopy, systemInfo, lsassAccess)
+}
+
+// broadcastMLFlagToActiveActors sets ML feature flags on all velocity actors
+// that have been active within the velocity window. Used as a fallback when
+// parent PID resolution fails (ETW PPID=0 and Toolhelp32 also failed).
+func (ds *DetectionService) broadcastMLFlagToActiveActors(event *domain.MonitorEvent, shadowCopy, systemInfo, lsassAccess bool) {
+	now := time.Now()
+	cutoff := now.Add(-velocityActorWindow)
+
+	ds.velocityActorsMux.RLock()
+	var activeGuids []string
+	for guid, actor := range ds.velocityActors {
+		if actor != nil && actor.LastSeen.After(cutoff) && actor.TotalOps60s > 0 {
+			activeGuids = append(activeGuids, guid)
+		}
+	}
+	ds.velocityActorsMux.RUnlock()
+
+	if len(activeGuids) == 0 {
+		log.Printf("[ML][BROADCAST] No active velocity actors to propagate flags to (child_pid=%d shadow=%v sysinfo=%v lsass=%v)",
+			event.ProcessID, shadowCopy, systemInfo, lsassAccess)
+		return
+	}
+
+	ds.fileCountersMux.Lock()
+	for _, guid := range activeGuids {
+		counters := ds.getOrInitMLCounters(guid)
+		if shadowCopy {
+			counters.ShadowCopyDeleteHit = true
+		}
+		if systemInfo {
+			counters.SystemInfoHit = true
+		}
+		if lsassAccess {
+			counters.LSASSAccessHit = true
+		}
+	}
+	ds.fileCountersMux.Unlock()
+
+	log.Printf("[ML][BROADCAST] Propagated flags to %d active actors (child_pid=%d shadow=%v sysinfo=%v lsass=%v)",
+		len(activeGuids), event.ProcessID, shadowCopy, systemInfo, lsassAccess)
+}
+
+func actorHasRecentDirectoryTouch(actor *VelocityActorState, canaryDirectory string, now time.Time) bool {
+	if actor == nil || len(actor.RecentTargets) == 0 {
+		return false
+	}
+	cutoff := now.Add(-velocityActorWindow)
+	for _, target := range actor.RecentTargets {
+		if target.SeenAt.Before(cutoff) {
+			continue
+		}
+		if isPathInDirectorySubtree(target.Path, canaryDirectory) {
+			return true
+		}
+	}
+	return false
+}
+
+func actorHasRecentRenameRansomExtension(actor *VelocityActorState, now time.Time) bool {
+	if actor == nil || len(actor.RecentTargets) == 0 {
+		return false
+	}
+	cutoff := now.Add(-velocityActorWindow)
+	for _, target := range actor.RecentTargets {
+		if target.SeenAt.Before(cutoff) {
+			continue
+		}
+		if target.RenameToRansomExt {
+			return true
+		}
+	}
+	return false
+}
+
+// collectRelatedVelocityActors returns high-confidence related processes for canary containment.
+func (ds *DetectionService) collectRelatedVelocityActors(canaryPath string, attributedGuid string, now time.Time) []domain.RelatedProcess {
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	attributedGuid = strings.TrimSpace(attributedGuid)
+	if strings.EqualFold(attributedGuid, "UNKNOWN") {
+		attributedGuid = ""
+	}
+
+	canaryDirectory := filepath.Dir(canaryPath)
+	results := make([]domain.RelatedProcess, 0)
+
+	ds.velocityActorsMux.RLock()
+	defer ds.velocityActorsMux.RUnlock()
+
+	for _, actor := range ds.velocityActors {
+		if actor == nil {
+			continue
+		}
+		if actor.ProcessID <= 0 {
+			continue
+		}
+		if ds.isTrustedProcess(actor.Image) {
+			continue
+		}
+		if now.Sub(actor.LastSeen) > velocityActorWindow {
+			continue
+		}
+		if !isVelocityTierEligible(actor.Tier) {
+			continue
+		}
+		if actor.CreateOps60s <= 0 || actor.ModifyOps60s <= 0 {
+			continue
+		}
+
+		score := 0
+		reasons := make([]string, 0, 5)
+
+		if attributedGuid != "" && strings.EqualFold(actor.ProcessGuid, attributedGuid) {
+			score += 100
+			reasons = append(reasons, "exact_guid_match")
+		}
+
+		if canaryDirectory != "" && actorHasRecentDirectoryTouch(actor, canaryDirectory, now) {
+			score += 40
+			reasons = append(reasons, "same_directory_subtree")
+		}
+
+		if actorHasRecentRenameRansomExtension(actor, now) {
+			score += 20
+			reasons = append(reasons, "rename_to_ransom_ext")
+		}
+
+		if strings.EqualFold(actor.Tier, domain.VelocityTierCritical.String()) {
+			score += 20
+			reasons = append(reasons, "tier_critical")
+		} else if strings.EqualFold(actor.Tier, domain.VelocityTierAnalyze.String()) {
+			score += 10
+			reasons = append(reasons, "tier_analyze")
+		}
+
+		if now.Sub(actor.LastSeen) <= relatedVelocityFreshLimit {
+			score += 10
+			reasons = append(reasons, "recent_activity")
+		}
+
+		if score < relatedVelocityMinScore {
+			continue
+		}
+
+		results = append(results, domain.RelatedProcess{
+			ProcessGuid:   actor.ProcessGuid,
+			ProcessID:     actor.ProcessID,
+			Image:         actor.Image,
+			RelationScore: score,
+			CreateOps60s:  actor.CreateOps60s,
+			ModifyOps60s:  actor.ModifyOps60s,
+			Tier:          actor.Tier,
+			LastSeen:      actor.LastSeen,
+			Reason:        strings.Join(reasons, ","),
+		})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].RelationScore != results[j].RelationScore {
+			return results[i].RelationScore > results[j].RelationScore
+		}
+		return results[i].LastSeen.After(results[j].LastSeen)
+	})
+
+	return results
+}
+
+// matchCanaryPath resolves a target path to a tracked canonical canary path.
+// Match types: exact, renamed_prefix.
+func (ds *DetectionService) matchCanaryPath(targetPath string) (string, string, bool) {
+	targetNorm := normalizeCanaryPath(targetPath)
+	if targetNorm == "" {
+		return "", "", false
+	}
+
+	ds.canaryFilesMux.RLock()
+	defer ds.canaryFilesMux.RUnlock()
+
+	targetDir := normalizeCanaryPath(filepath.Dir(targetPath))
+	targetBase := strings.ToLower(filepath.Base(targetPath))
+
+	for canaryPath, canary := range ds.canaryFiles {
+		canonicalNorm := normalizeCanaryPath(canaryPath)
+		if targetNorm == canonicalNorm {
+			return canaryPath, "exact", true
+		}
+
+		// Rename pattern: ~canary_name.ext -> ~canary_name.ext.CONTI
+		canaryDir := normalizeCanaryPath(filepath.Dir(canaryPath))
+		if canaryDir != targetDir {
+			continue
+		}
+
+		baseName := strings.ToLower(filepath.Base(canaryPath))
+		baseNoExt := strings.TrimSuffix(baseName, strings.ToLower(canary.Extension))
+		if strings.HasPrefix(targetBase, baseNoExt) && targetBase != baseName {
+			return canaryPath, "renamed_prefix", true
+		}
+	}
+
+	return "", "", false
+}
+
+func (ds *DetectionService) recordCanaryActor(event *domain.MonitorEvent, eventType string) {
+	if event == nil {
+		return
+	}
+
+	canonicalPath, matchType, ok := ds.matchCanaryPath(event.TargetFile)
+	if !ok {
+		return
+	}
+
+	seenAt := event.Timestamp
+	if seenAt.IsZero() {
+		seenAt = time.Now()
+	}
+
+	actor := CanaryActor{
+		ProcessID:   event.ProcessID,
+		ProcessGuid: event.ProcessGuid,
+		Image:       event.Image,
+		TargetPath:  event.TargetFile,
+		EventType:   fmt.Sprintf("%s:%s", eventType, matchType),
+		SeenAt:      seenAt,
+	}
+
+	key := normalizeCanaryPath(canonicalPath)
+	ds.canaryActorsMux.Lock()
+	existing, exists := ds.recentCanaryActors[key]
+	if !exists || actor.SeenAt.After(existing.SeenAt) {
+		ds.recentCanaryActors[key] = actor
+	}
+	ds.canaryActorsMux.Unlock()
+}
+
+func (ds *DetectionService) resolveCanaryActor(canonicalCanaryPath, renamedPath string) (CanaryActor, bool) {
+	const attributionTTL = 120 * time.Second
+
+	key := normalizeCanaryPath(canonicalCanaryPath)
+	if key == "" {
+		return CanaryActor{}, false
+	}
+
+	ds.canaryActorsMux.Lock()
+	defer ds.canaryActorsMux.Unlock()
+
+	actor, ok := ds.recentCanaryActors[key]
+	if !ok {
+		return CanaryActor{}, false
+	}
+
+	if time.Since(actor.SeenAt) > attributionTTL {
+		delete(ds.recentCanaryActors, key)
+		return CanaryActor{}, false
+	}
+
+	if renamedPath != "" {
+		renamedNorm := normalizeCanaryPath(renamedPath)
+		if renamedNorm != "" && normalizeCanaryPath(actor.TargetPath) != renamedNorm {
+			// Keep attribution even if path differs, but prefer matching paths when available.
+			// No-op fallback: actor is still recent and canary-specific.
+		}
+	}
+
+	return actor, true
+}
+
 // CheckCanaryFiles periodically checks if canary files have been compromised
 // This function should be called on a timer (e.g., every 30 seconds)
 // Returns true if any canary was compromised (triggers immediate alert)
@@ -1350,13 +3038,13 @@ func (ds *DetectionService) CheckCanaryFiles() bool {
 	ds.canaryFilesMux.RUnlock()
 
 	if canaryCount == 0 {
-		// No canaries to check
 		return false
 	}
 
 	log.Printf("[CANARY] Checking %d honeypot files...", canaryCount)
 
 	compromised := false
+	suppressedCanaryAlerts := 0
 
 	ds.canaryFilesMux.Lock()
 	defer ds.canaryFilesMux.Unlock()
@@ -1364,12 +3052,9 @@ func (ds *DetectionService) CheckCanaryFiles() bool {
 	for path, canary := range ds.canaryFiles {
 		canary.LastChecked = time.Now()
 
-		// Check if canary still exists
 		fileInfo, err := os.Stat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				// File doesn't exist at original path
-				// Check if ransomware renamed it with a different extension
 				dirPath := filepath.Dir(path)
 				baseName := filepath.Base(path)
 				baseNameWithoutExt := strings.TrimSuffix(baseName, canary.Extension)
@@ -1377,43 +3062,59 @@ func (ds *DetectionService) CheckCanaryFiles() bool {
 				renamed := false
 				renamedPath := ""
 
-				// Scan directory for renamed files
-				entries, err := os.ReadDir(dirPath)
-				if err == nil {
+				entries, readErr := os.ReadDir(dirPath)
+				if readErr == nil {
 					for _, entry := range entries {
 						if entry.IsDir() {
 							continue
 						}
 
 						entryName := entry.Name()
-						// Check if this is our canary with a different extension
-						// Pattern: original_name.original_ext.new_ext or original_name.new_ext
 						if strings.HasPrefix(entryName, baseNameWithoutExt) && entryName != baseName {
-							// Found a file with same base name but different extension
 							renamedPath = filepath.Join(dirPath, entryName)
 							newExt := filepath.Ext(entryName)
 
-							log.Printf("[DETECTION] 🚨 CANARY RENAMED: %s → %s", path, renamedPath)
-							log.Printf("[DETECTION] 🚨 Extension changed from %s to %s", canary.Extension, newExt)
-							log.Printf("[DETECTION] 🚨 This is a classic ransomware behavior!")
+							log.Printf("[DETECTION] ?? CANARY RENAMED: %s -> %s", path, renamedPath)
+							log.Printf("[DETECTION] ?? Extension changed from %s to %s", canary.Extension, newExt)
+							log.Printf("[DETECTION] ?? This is a classic ransomware behavior!")
 
-							// Check entropy of renamed file
 							entropy, entropyErr := domain.AnalyzeFileEntropy(renamedPath, newExt)
 							if entropyErr == nil {
 								entropyDelta := entropy.Entropy - canary.OriginalEntropy
-								log.Printf("[DETECTION] 🚨 Renamed file entropy: %.3f (original: %.3f, Δ +%.3f)",
+								log.Printf("[DETECTION] ?? Renamed file entropy: %.3f (original: %.3f, delta +%.3f)",
 									entropy.Entropy, canary.OriginalEntropy, entropyDelta)
 
 								if entropyDelta >= 2.0 {
-									ds.alertCanaryCompromised(path, fmt.Sprintf("RENAMED_AND_ENCRYPTED (→ %s)", filepath.Base(renamedPath)),
-										entropy.Entropy, canary.OriginalEntropy)
+									if !ds.alertCanaryCompromised(
+										path,
+										fmt.Sprintf("RENAMED_AND_ENCRYPTED (-> %s)", filepath.Base(renamedPath)),
+										entropy.Entropy,
+										canary.OriginalEntropy,
+										renamedPath,
+									) {
+										suppressedCanaryAlerts++
+									}
 								} else {
-									ds.alertCanaryCompromised(path, fmt.Sprintf("RENAMED (→ %s)", filepath.Base(renamedPath)),
-										0, canary.OriginalEntropy)
+									if !ds.alertCanaryCompromised(
+										path,
+										fmt.Sprintf("RENAMED (-> %s)", filepath.Base(renamedPath)),
+										0,
+										canary.OriginalEntropy,
+										renamedPath,
+									) {
+										suppressedCanaryAlerts++
+									}
 								}
 							} else {
-								ds.alertCanaryCompromised(path, fmt.Sprintf("RENAMED (→ %s)", filepath.Base(renamedPath)),
-									0, canary.OriginalEntropy)
+								if !ds.alertCanaryCompromised(
+									path,
+									fmt.Sprintf("RENAMED (-> %s)", filepath.Base(renamedPath)),
+									0,
+									canary.OriginalEntropy,
+									renamedPath,
+								) {
+									suppressedCanaryAlerts++
+								}
 							}
 
 							renamed = true
@@ -1424,58 +3125,60 @@ func (ds *DetectionService) CheckCanaryFiles() bool {
 				}
 
 				if !renamed {
-					// CRITICAL: Canary file deleted → RANSOMWARE!
-					log.Printf("[DETECTION] 🚨 CANARY DELETED: %s", path)
-					log.Printf("[DETECTION] 🚨 This honeypot file was deleted by malicious process!")
-					ds.alertCanaryCompromised(path, "DELETED", 0, canary.OriginalEntropy)
+					log.Printf("[DETECTION] ?? CANARY DELETED: %s", path)
+					log.Printf("[DETECTION] ?? This honeypot file was deleted by malicious process!")
+					if !ds.alertCanaryCompromised(path, "DELETED", 0, canary.OriginalEntropy, "") {
+						suppressedCanaryAlerts++
+					}
 					compromised = true
 				}
 				continue
 			}
 
-			// File locked or access denied → Suspicious
-			log.Printf("[DETECTION] ⚠️  CANARY ACCESS DENIED: %s (error: %v)", path, err)
-			ds.alertCanaryCompromised(path, "ACCESS_DENIED", 0, canary.OriginalEntropy)
+			log.Printf("[DETECTION] ??  CANARY ACCESS DENIED: %s (error: %v)", path, err)
+			if !ds.alertCanaryCompromised(path, "ACCESS_DENIED", 0, canary.OriginalEntropy, "") {
+				suppressedCanaryAlerts++
+			}
 			compromised = true
 			continue
 		}
 
-		// Check if file size changed drastically
 		if fileInfo.Size() != canary.FileSize {
-			log.Printf("[DETECTION] 🚨 CANARY SIZE CHANGED: %s (was: %d bytes, now: %d bytes)",
+			log.Printf("[DETECTION] ?? CANARY SIZE CHANGED: %s (was: %d bytes, now: %d bytes)",
 				path, canary.FileSize, fileInfo.Size())
-			ds.alertCanaryCompromised(path, "SIZE_CHANGED", 0, canary.OriginalEntropy)
+			if !ds.alertCanaryCompromised(path, "SIZE_CHANGED", 0, canary.OriginalEntropy, "") {
+				suppressedCanaryAlerts++
+			}
 			compromised = true
 			continue
 		}
 
-		// Analyze current entropy
-		entropy, err := domain.AnalyzeFileEntropy(path, canary.Extension)
-		if err != nil {
-			log.Printf("[CANARY] Failed to analyze %s: %v", path, err)
+		entropy, entropyErr := domain.AnalyzeFileEntropy(path, canary.Extension)
+		if entropyErr != nil {
+			log.Printf("[CANARY] Failed to analyze %s: %v", path, entropyErr)
 			continue
 		}
 
-		// Check if entropy increased significantly (file encrypted)
 		entropyDelta := entropy.Entropy - canary.OriginalEntropy
 		if entropyDelta >= 2.0 {
-			// CRITICAL: Canary encrypted → RANSOMWARE!
-			log.Printf("[DETECTION] 🚨 CANARY ENCRYPTED: %s", path)
-			log.Printf("[DETECTION] 🚨 Entropy jumped from %.3f → %.3f (Δ +%.3f)",
+			log.Printf("[DETECTION] ?? CANARY ENCRYPTED: %s", path)
+			log.Printf("[DETECTION] ?? Entropy jumped from %.3f -> %.3f (delta +%.3f)",
 				canary.OriginalEntropy, entropy.Entropy, entropyDelta)
-			log.Printf("[DETECTION] 🚨 This honeypot file was encrypted by ransomware!")
+			log.Printf("[DETECTION] ?? This honeypot file was encrypted by ransomware!")
 
-			ds.alertCanaryCompromised(path, "ENCRYPTED", entropy.Entropy, canary.OriginalEntropy)
+			if !ds.alertCanaryCompromised(path, "ENCRYPTED", entropy.Entropy, canary.OriginalEntropy, "") {
+				suppressedCanaryAlerts++
+			}
 			compromised = true
 			continue
 		}
-
-		// Canary is intact
-		// log.Printf("[CANARY] ✓ %s intact (entropy: %.3f)", filepath.Base(path), entropy.Entropy)
 	}
 
 	if !compromised {
-		log.Printf("[CANARY] ✓ All %d honeypot files intact", canaryCount)
+		log.Printf("[CANARY] ? All %d honeypot files intact", canaryCount)
+	}
+	if suppressedCanaryAlerts > 0 {
+		log.Printf("[CANARY] Suppressed %d repeated canary compromise alerts (latched)", suppressedCanaryAlerts)
 	}
 
 	return compromised
@@ -1483,28 +3186,46 @@ func (ds *DetectionService) CheckCanaryFiles() bool {
 
 // alertCanaryCompromised creates a CRITICAL alert when a canary file is compromised
 // This is a definitive ransomware indicator with near-zero false positives
-func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseType string, currentEntropy, originalEntropy float64) {
-	log.Printf("[DETECTION] 🚨🚨🚨 CRITICAL: CANARY FILE COMPROMISED 🚨🚨🚨")
+func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseType string, currentEntropy, originalEntropy float64, relatedPath string) bool {
+	log.Printf("[DETECTION] CRITICAL: CANARY FILE COMPROMISED")
 	log.Printf("[DETECTION] File: %s", filePath)
 	log.Printf("[DETECTION] Type: %s", compromiseType)
 
-	// Create CRITICAL alert
-	// Note: We don't have processGuid here, so create a general system alert
+	processGuid := "UNKNOWN"
+	processID := 0
+	image := "UNKNOWN"
+	attributionMethod := "CANARY_HONEYPOT_PERIODIC"
+
+	// Periodic canary scan does not have direct actor context by itself.
+	// Correlate with recent ETW activity when available.
+	if actor, ok := ds.resolveCanaryActor(filePath, relatedPath); ok {
+		processGuid = actor.ProcessGuid
+		processID = actor.ProcessID
+		image = actor.Image
+		attributionMethod = "CANARY_HONEYPOT_ETW_CORRELATED"
+		log.Printf("[CANARY] ETW attribution resolved: %s (PID: %d, GUID: %s, Event: %s)",
+			image, processID, processGuid, actor.EventType)
+	}
+
+	if !ds.shouldEmitCanaryAlert(filePath, compromiseType, relatedPath, processGuid, time.Now()) {
+		return false
+	}
+
 	alert := &domain.Alert{
 		ID:          fmt.Sprintf("CANARY_%d", time.Now().Unix()),
 		Timestamp:   time.Now(),
 		Severity:    domain.ThreatCritical,
 		Category:    "RANSOMWARE",
-		ProcessGuid: "UNKNOWN", // Canary doesn't track specific process
-		ProcessID:   0,
-		Image:       "UNKNOWN",
+		ProcessGuid: processGuid,
+		ProcessID:   processID,
+		Image:       image,
 		Description: fmt.Sprintf("CANARY FILE COMPROMISED: %s (%s)", filepath.Base(filePath), compromiseType),
-		Score:       100, // Maximum score
+		Score:       100,
 		Indicators: []domain.Indicator{
 			{
 				Type:        domain.IndicatorType(fmt.Sprintf("CANARY_%s", compromiseType)),
 				Severity:    domain.ThreatCritical,
-				Points:      100, // Maximum points - this is definitive ransomware
+				Points:      100,
 				Description: fmt.Sprintf("Honeypot file compromised: %s", compromiseType),
 				Timestamp:   time.Now(),
 				Evidence: map[string]string{
@@ -1513,26 +3234,32 @@ func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseTy
 					"original_entropy":    fmt.Sprintf("%.3f", originalEntropy),
 					"current_entropy":     fmt.Sprintf("%.3f", currentEntropy),
 					"entropy_delta":       fmt.Sprintf("%.3f", currentEntropy-originalEntropy),
-					"detection_method":    "CANARY_HONEYPOT",
+					"detection_method":    attributionMethod,
 					"false_positive_rate": "< 0.01%",
+					"related_path":        relatedPath,
 				},
 			},
 		},
 		Evidence: map[string]interface{}{
 			"canary_path":      filePath,
 			"compromise_type":  compromiseType,
-			"detection_method": "HONEYPOT",
+			"detection_method": attributionMethod,
+			"attributed_pid":   fmt.Sprintf("%d", processID),
+			"attributed_image": image,
+			"related_path":     relatedPath,
 		},
-		AutoRespond: true, // Canary compromise = definitive ransomware = auto-respond
+		AutoRespond: true,
 	}
+	ds.attachRelatedProcessesToCanaryAlert(alert, filePath, processGuid)
 
-	// Send alert
 	select {
 	case ds.alertChan <- alert:
-		log.Printf("[ALERT] Canary compromise alert sent: %s", filePath)
+		log.Printf("[ALERT] Canary compromise alert sent: %s (related suspects: %d)", filePath, len(alert.RelatedProcesses))
 	default:
 		log.Printf("[ALERT] Alert channel full, canary alert dropped")
 	}
+
+	return true
 }
 
 // StartCanaryMonitoring starts periodic canary file checking
@@ -1569,6 +3296,9 @@ func (ds *DetectionService) CleanupCanaryFiles() {
 		}
 	}
 
+	clear(ds.canaryFiles)
+	ds.resetAllCanaryLatches()
+
 	log.Println("[CANARY] Cleanup complete")
 }
 
@@ -1598,11 +3328,13 @@ func (ds *DetectionService) CleanupOldHighIOFlags(maxAge time.Duration) int {
 		}
 	}
 
-	if removed > 0 {
-		log.Printf("[CLEANUP] Removed %d old high I/O flags", removed)
+	removedVelocityActors := ds.pruneVelocityActors(velocityActorRetention)
+
+	if removed > 0 || removedVelocityActors > 0 {
+		log.Printf("[CLEANUP] Removed %d old high I/O flags, %d stale velocity actors", removed, removedVelocityActors)
 	}
 
-	return removed
+	return removed + removedVelocityActors
 }
 
 // GetHighIOProcessCount returns the number of processes currently flagged for deep monitoring
@@ -1610,6 +3342,18 @@ func (ds *DetectionService) GetHighIOProcessCount() int {
 	ds.highIOProcessesMux.RLock()
 	defer ds.highIOProcessesMux.RUnlock()
 	return len(ds.highIOProcesses)
+}
+
+// GetEntropyStats returns entropy tracker statistics
+func (ds *DetectionService) GetEntropyStats() map[string]interface{} {
+	if ds.entropyTracker == nil {
+		return map[string]interface{}{
+			"tracked_files":         0,
+			"modified_files":        0,
+			"significant_increases": 0,
+		}
+	}
+	return ds.entropyTracker.GetStats()
 }
 
 // IsProcessFlagged checks if a process is currently flagged for deep monitoring
@@ -1658,7 +3402,7 @@ func (ds *DetectionService) scanDirectoryForRansomware(dirPath string) ([]string
 
 // processDirectoryScanResult processes the results of a directory scan and adds indicators
 // This helper function centralizes the scan result processing for progressive scans
-func (ds *DetectionService) processDirectoryScanResult(event *domain.SysmonEvent, dirPath string, ransomFiles []string, totalFiles int, scanType string) {
+func (ds *DetectionService) processDirectoryScanResult(event *domain.MonitorEvent, dirPath string, ransomFiles []string, totalFiles int, scanType string) {
 	if len(ransomFiles) == 0 {
 		return
 	}
@@ -1730,7 +3474,7 @@ func (ds *DetectionService) processDirectoryScanResult(event *domain.SysmonEvent
 		},
 	}
 
-	score := ds.threatScorer.AddIndicator(
+	score := ds.addRuleIndicator(
 		event.ProcessGuid,
 		event.Image,
 		event.ProcessID,
@@ -1747,11 +3491,31 @@ func (ds *DetectionService) processDirectoryScanResult(event *domain.SysmonEvent
 // ProcessFileDelete handles file deletion events
 // This is critical for detecting ransomware that renames files (e.g., file.txt -> file.txt.omega)
 // Windows file renames appear as: delete original + create new (but create event may not fire for renames)
-func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain.SysmonEvent) {
+func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain.MonitorEvent) {
+	if ds.isTrustedProcess(event.Image) {
+		return
+	}
+
 	// DEBUG: Print ALL file deletions to verify ransomware activity
 	ext := filepath.Ext(event.TargetFile)
 	log.Printf("[FILE_DELETED] %s (ext: %s) by %s (PID: %d)",
 		event.TargetFile, ext, filepath.Base(event.Image), event.ProcessID)
+
+	// Keep recent ETW actor context for periodic canary compromise attribution.
+	ds.recordCanaryActor(event, "FILE_DELETE")
+
+	// Track delete operations so delete+rename ransomware patterns raise velocity tiers.
+	tier := ds.updateVelocityTierForOperation(event, "delete")
+
+	// ML feature tracking: increment delete counter, track directory + extension
+	ds.fileCountersMux.Lock()
+	delCounters := ds.getOrInitMLCounters(event.ProcessGuid)
+	delCounters.DeleteCount++
+	delCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+	if ext != "" {
+		delCounters.ExtensionCounts[strings.ToLower(ext)]++
+	}
+	ds.fileCountersMux.Unlock()
 
 	// REAL-TIME CANARY DETECTION: Check if deleted file is a honeypot
 	// This catches ransomware that deletes original canary files before/during encryption
@@ -1791,7 +3555,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[CANARY] ⚠️  THREAT SCORE: %d (Indicator: +100 points)", score)
 
 			// Immediate termination evaluation
@@ -1819,7 +3583,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 		log.Printf("[CANARY] ⚠️  THREAT SCORE: %d (Indicator: +50 points)", score)
 
 		// Evaluate for potential termination
@@ -1830,7 +3594,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 	// CRITICAL: Check for ransomware rename IMMEDIATELY on ALL deletions
 	// This catches ransomware in early stages before I/O velocity threshold is reached
 	// When Conti renames document.docx → document.docx.conti:
-	//   - Sysmon fires Event ID 23 (FileDelete) for "document.docx"
+	//   - ETW fires Event ID 23 (FileDelete) for "document.docx"
 	//   - But NO Event ID 11 (FileCreate) for "document.docx.conti"
 	// Solution: When file deleted, check if .conti/.encrypted/etc version exists
 	log.Printf("[SPECIFIC FILE CHECK] Checking if %s was renamed to malicious extension...", filepath.Base(event.TargetFile))
@@ -1865,7 +3629,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -1888,7 +3652,6 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 
 	// PERFORMANCE OPTIMIZATION: Only analyze deletions from ANALYZE or CRITICAL tier processes
 	// This prevents unnecessary directory scans for normal file operations (browser cache, temp files, etc.)
-	tier := ds.velocityTracker.GetVelocityTier(event.ProcessGuid)
 
 	shouldDeepAnalyze := (tier == domain.VelocityTierCritical || tier == domain.VelocityTierAnalyze)
 
@@ -2004,7 +3767,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -2041,7 +3804,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 				},
 			}
 
-			score := ds.threatScorer.AddIndicator(
+			score := ds.addRuleIndicator(
 				event.ProcessGuid,
 				event.Image,
 				event.ProcessID,
@@ -2068,7 +3831,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 					},
 				}
 
-				score = ds.threatScorer.AddIndicator(
+				score = ds.addRuleIndicator(
 					event.ProcessGuid,
 					event.Image,
 					event.ProcessID,
@@ -2102,17 +3865,23 @@ func (ds *DetectionService) CleanupOldModifiedFiles(maxAge time.Duration) int {
 		}
 	}
 
-	if removed > 0 {
-		log.Printf("[CLEANUP] Removed %d old modified file entries (older than %v)", removed, maxAge)
+	removedVelocityActors := ds.pruneVelocityActors(velocityActorRetention)
+
+	if removed > 0 || removedVelocityActors > 0 {
+		log.Printf("[CLEANUP] Removed %d old modified file entries, %d stale velocity actors", removed, removedVelocityActors)
 	}
 
-	return removed
+	return removed + removedVelocityActors
 }
 
 // ProcessBackupPrivilege handles Windows Security events related to BackupRead/BackupWrite API usage
 // This method processes events from the Security Event Log (Event IDs 4672, 4703, 4674)
 // that indicate a process has enabled or is using SeBackupPrivilege/SeRestorePrivilege
 func (ds *DetectionService) ProcessBackupPrivilege(ctx context.Context, event *domain.SecurityEvent) {
+	if ds.isTrustedProcess(event.ProcessName) {
+		return
+	}
+
 	log.Printf("[SECURITY] Processing backup privilege event: ID %d, Process: %s (PID: %s)",
 		event.EventID, event.ProcessName, event.ProcessID)
 
@@ -2177,7 +3946,7 @@ func (ds *DetectionService) ProcessBackupPrivilege(ctx context.Context, event *d
 	var pid int
 	fmt.Sscanf(event.ProcessID, "%d", &pid)
 
-	score := ds.threatScorer.AddIndicator(
+	score := ds.addRuleIndicator(
 		pseudoGuid,
 		event.ProcessName,
 		pid,
@@ -2299,7 +4068,7 @@ func (ds *DetectionService) scanDirectoriesForEncryptedFiles(processGuid string,
 			},
 		}
 
-		score := ds.threatScorer.AddIndicator(
+		score := ds.addRuleIndicator(
 			processGuid,
 			processImage,
 			processID,

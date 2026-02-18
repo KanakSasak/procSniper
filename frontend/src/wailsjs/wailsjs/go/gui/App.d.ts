@@ -5,15 +5,29 @@ import {logger} from '../models';
 
 export function ClearLogs():Promise<void>;
 
+export function GetActiveThreats():Promise<Array<models.ThreatViewModel>>;
+
 export function GetConfiguration():Promise<models.ConfigViewModel>;
 
 export function GetDashboardStats():Promise<models.DashboardStats>;
 
+export function GetEntropyStats():Promise<models.EntropyStatsVM>;
+
 export function GetLogs(arg1:number):Promise<Array<logger.LogEntry>>;
+
+export function GetMLModelStatus():Promise<models.MLModelStatus>;
 
 export function IsProtecting():Promise<boolean>;
 
+export function LoadMLModel(arg1:string):Promise<models.OperationResult>;
+
 export function SaveConfiguration(arg1:models.ConfigViewModel):Promise<models.OperationResult>;
+
+export function SelectMLModelFile():Promise<string>;
+
+export function SetMLConfidenceThreshold(arg1:number):Promise<models.OperationResult>;
+
+export function SetMLDetectionEnabled(arg1:boolean):Promise<models.OperationResult>;
 
 export function StartLogStream():Promise<void>;
 
@@ -22,3 +36,5 @@ export function StartProtection():Promise<models.OperationResult>;
 export function StopLogStream():Promise<void>;
 
 export function StopProtection():Promise<models.OperationResult>;
+
+export function UnloadMLModel():Promise<models.OperationResult>;

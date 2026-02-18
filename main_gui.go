@@ -1,4 +1,4 @@
-//go:build gui && windows
+//go:build gui
 
 package main
 
@@ -15,20 +15,20 @@ import (
 	"procSniper/internal/delivery/gui"
 )
 
-// Embed the frontend dist folder
-// Run 'npm run build' in frontend/ directory to generate this
+// Embed the frontend dist folder built by vite into cmd/gui/dist
+//
 //go:embed all:cmd/gui/dist
 var assets embed.FS
 
 func main() {
-	// Create application instance
-	app := gui.NewApp()
-
-	// Get the subdirectory as the root for serving
+	// Get the dist subdirectory from the embedded FS
 	distFS, err := fs.Sub(assets, "cmd/gui/dist")
 	if err != nil {
-		log.Fatal("Failed to get embedded assets:", err)
+		log.Fatal("Failed to locate embedded frontend assets:", err)
 	}
+
+	// Create application instance
+	app := gui.NewApp()
 
 	// Create Wails application
 	err = wails.Run(&options.App{

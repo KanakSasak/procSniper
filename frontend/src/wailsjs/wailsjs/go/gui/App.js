@@ -6,6 +6,10 @@ export function ClearLogs() {
   return window['go']['gui']['App']['ClearLogs']();
 }
 
+export function GetActiveThreats() {
+  return window['go']['gui']['App']['GetActiveThreats']();
+}
+
 export function GetConfiguration() {
   return window['go']['gui']['App']['GetConfiguration']();
 }
@@ -14,16 +18,40 @@ export function GetDashboardStats() {
   return window['go']['gui']['App']['GetDashboardStats']();
 }
 
+export function GetEntropyStats() {
+  return window['go']['gui']['App']['GetEntropyStats']();
+}
+
 export function GetLogs(arg1) {
   return window['go']['gui']['App']['GetLogs'](arg1);
+}
+
+export function GetMLModelStatus() {
+  return window['go']['gui']['App']['GetMLModelStatus']();
 }
 
 export function IsProtecting() {
   return window['go']['gui']['App']['IsProtecting']();
 }
 
+export function LoadMLModel(arg1) {
+  return window['go']['gui']['App']['LoadMLModel'](arg1);
+}
+
 export function SaveConfiguration(arg1) {
   return window['go']['gui']['App']['SaveConfiguration'](arg1);
+}
+
+export function SelectMLModelFile() {
+  return window['go']['gui']['App']['SelectMLModelFile']();
+}
+
+export function SetMLConfidenceThreshold(arg1) {
+  return window['go']['gui']['App']['SetMLConfidenceThreshold'](arg1);
+}
+
+export function SetMLDetectionEnabled(arg1) {
+  return window['go']['gui']['App']['SetMLDetectionEnabled'](arg1);
 }
 
 export function StartLogStream() {
@@ -40,4 +68,8 @@ export function StopLogStream() {
 
 export function StopProtection() {
   return window['go']['gui']['App']['StopProtection']();
+}
+
+export function UnloadMLModel() {
+  return window['go']['gui']['App']['UnloadMLModel']();
 }

@@ -1,0 +1,35 @@
+# IDE / editor
+.idea/
+.vscode/
+
+# OS clutter
+Thumbs.db
+.DS_Store
+NUL
+
+# Build artifacts / binaries
+build/
+*.exe
+*.test
+*.out
+
+# Runtime logs
+/logs/
+procsniper_*.log
+
+
+# ML workspace directories
+/ml/
+/ml-2/
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Frontend build dependencies
+frontend/node_modules/
+
+# Wails/Vite generated asset hashes
+cmd/gui/dist/assets/
+

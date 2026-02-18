@@ -14,16 +14,69 @@ type OperationResult struct {
 	Message string `json:"message"`
 }
 
+// ETWDiagnosticsVM represents ETW diagnostic stats for the frontend
+type ETWDiagnosticsVM struct {
+	EventsReceived          uint64 `json:"eventsReceived"`
+	EventsDropped           uint64 `json:"eventsDropped"`
+	EventsSuppressedDeadPID uint64 `json:"eventsSuppressedDeadPID"`
+	WorkerPoolSize          int    `json:"workerPoolSize"`
+	ChannelCapacity         int    `json:"channelCapacity"`
+	ChannelLength           int    `json:"channelLength"`
+}
+
+// EntropyStatsVM represents entropy tracker statistics for the frontend
+type EntropyStatsVM struct {
+	TrackedFiles         int `json:"trackedFiles"`
+	ModifiedFiles        int `json:"modifiedFiles"`
+	SignificantIncreases int `json:"significantIncreases"`
+}
+
+// MLModelStatus represents ML model state for the frontend
+type MLModelStatus struct {
+	Loaded              bool    `json:"loaded"`
+	FilePath            string  `json:"filePath"`
+	ModelName           string  `json:"modelName"`
+	ModelType           string  `json:"modelType"`
+	LoadedAt            string  `json:"loadedAt"`
+	Enabled             bool    `json:"enabled"`
+	FeatureCount        int     `json:"featureCount"`
+	ConfidenceThreshold float64 `json:"confidenceThreshold"`
+}
+
+// MLPredictionVM represents a single ML prediction for the frontend
+type MLPredictionVM struct {
+	ProcessName         string     `json:"processName"`
+	ProcessID           int        `json:"processId"`
+	Label               string     `json:"label"`         // "benign", "ransomware", "stealer"
+	Confidence          float64    `json:"confidence"`    // 0.0-1.0
+	Probabilities       [3]float64 `json:"probabilities"` // [benign, ransomware, stealer]
+	Stage               string     `json:"stage"`         // skipped, predicted, decision, error
+	Reason              string     `json:"reason"`        // predictor_not_ready, below_threshold, benign_label, inference_error
+	Decision            string     `json:"decision"`      // terminate_eligible, alert_only, none
+	DecisionCategory    string     `json:"decisionCategory"`
+	DecisionScore       int        `json:"decisionScore"`
+	DecisionAutoRespond bool       `json:"decisionAutoRespond"`
+	Threshold           float64    `json:"threshold"`
+	ModeEnabled         bool       `json:"modeEnabled"`
+	PredictorReady      bool       `json:"predictorReady"`
+	Error               string     `json:"error"`
+	Timestamp           string     `json:"timestamp"`
+}
+
 // DashboardStats represents statistics for the dashboard
 type DashboardStats struct {
-	ProtectionStatus    string `json:"protectionStatus"`
-	SysmonConnected     bool   `json:"sysmonConnected"`
-	WorkerQueueDepth    int    `json:"workerQueueDepth"`
-	AlertsProcessed     int    `json:"alertsProcessed"`
-	ProcessesTerminated int    `json:"processesTerminated"`
-	FilesQuarantined    int    `json:"filesQuarantined"`
-	CanaryFilesCount    int    `json:"canaryFilesCount"`
-	ActiveThreatsCount  int    `json:"activeThreatsCount"`
+	ProtectionStatus     string           `json:"protectionStatus"`
+	ETWConnected         bool             `json:"etwConnected"`
+	WorkerQueueDepth     int              `json:"workerQueueDepth"`
+	AlertsProcessed      int              `json:"alertsProcessed"`
+	ProcessesTerminated  int              `json:"processesTerminated"`
+	FilesQuarantined     int              `json:"filesQuarantined"`
+	CanaryFilesCount     int              `json:"canaryFilesCount"`
+	ActiveThreatsCount   int              `json:"activeThreatsCount"`
+	AutoResponsesBlocked int              `json:"autoResponsesBlocked"`
+	HighIOProcessCount   int              `json:"highIOProcessCount"`
+	ETWDiagnostics       ETWDiagnosticsVM `json:"etwDiagnostics"`
+	EntropyStats         EntropyStatsVM   `json:"entropyStats"`
 }
 
 // AlertViewModel represents an alert for the frontend
@@ -69,34 +122,42 @@ type ThreatViewModel struct {
 
 // ConfigViewModel represents configuration for the frontend
 type ConfigViewModel struct {
-	Version              string               `json:"version"`
-	LastUpdated          string               `json:"lastUpdated"`
+	Version              string                `json:"version"`
+	LastUpdated          string                `json:"lastUpdated"`
 	DetectionThresholds  DetectionThresholdsVM `json:"detectionThresholds"`
-	ResponseSettings     ResponseSettingsVM   `json:"responseSettings"`
-	Whitelist            WhitelistVM          `json:"whitelist"`
-	RansomwareExtensions []string             `json:"ransomwareExtensions"`
+	ResponseSettings     ResponseSettingsVM    `json:"responseSettings"`
+	Whitelist            WhitelistVM           `json:"whitelist"`
+	RansomwareExtensions []string              `json:"ransomwareExtensions"`
 }
 
 // DetectionThresholdsVM represents detection thresholds
 type DetectionThresholdsVM struct {
 	HighEntropyFileThreshold             int `json:"highEntropyFileThreshold"`
 	RansomwareExtensionFileThreshold     int `json:"ransomwareExtensionFileThreshold"`
+	RansomwareExtensionRenameThreshold   int `json:"ransomwareExtensionRenameThreshold"`
 	CombinedEntropyAndExtensionThreshold int `json:"combinedEntropyAndExtensionThreshold"`
+	IOVelocityThresholdPerMinute         int `json:"ioVelocityThresholdPerMinute"`
 }
 
 // ResponseSettingsVM represents response settings
 type ResponseSettingsVM struct {
-	AutoTerminateEnabled   bool   `json:"autoTerminateEnabled"`
-	CriticalScoreThreshold int    `json:"criticalScoreThreshold"`
-	InvestigationMode      bool   `json:"investigationMode"`
-	QuarantineFiles        bool   `json:"quarantineFiles"`
-	QuarantineDirectory    string `json:"quarantineDirectory"`
+	AutoTerminateEnabled      bool   `json:"autoTerminateEnabled"`
+	CriticalScoreThreshold    int    `json:"criticalScoreThreshold"`
+	InvestigationMode         bool   `json:"investigationMode"`
+	QuarantineFiles           bool   `json:"quarantineFiles"`
+	QuarantineDirectory       string `json:"quarantineDirectory"`
+	ImmediateResponse         bool   `json:"immediateResponse"`
+	TerminateOnExtensionMatch bool   `json:"terminateOnExtensionMatch"`
+	SuspendBeforeTerminate    bool   `json:"suspendBeforeTerminate"`
+	DetectionMode             string `json:"detectionMode"`        // "rules_only", "hybrid", "ml_only"
+	CanaryResponseAction      string `json:"canaryResponseAction"` // "terminate", "suspend", "alert_only"
 }
 
 // WhitelistVM represents whitelist configuration
 type WhitelistVM struct {
-	Enabled bool     `json:"enabled"`
-	Paths   []string `json:"paths"`
+	Enabled   bool     `json:"enabled"`
+	Paths     []string `json:"paths"`
+	Processes []string `json:"processes"`
 }
 
 // AlertFromDomain converts a domain Alert to AlertViewModel
@@ -134,6 +195,55 @@ func AlertFromDomain(alert *domain.Alert) AlertViewModel {
 		Indicators:      indicators,
 		AutoResponded:   alert.AutoRespond,
 		ResponseActions: alert.ResponseActions,
+	}
+}
+
+// ThreatFromDomain converts a domain ThreatScore to ThreatViewModel
+func ThreatFromDomain(score *domain.ThreatScore) ThreatViewModel {
+	if score == nil {
+		return ThreatViewModel{}
+	}
+
+	level := evaluateThreatLevel(score.Score)
+
+	indicators := make([]IndicatorVM, 0, len(score.Indicators))
+	for _, ind := range score.Indicators {
+		indicators = append(indicators, IndicatorVM{
+			Type:        string(ind.Type),
+			Severity:    string(ind.Severity),
+			Points:      ind.Points,
+			Description: ind.Description,
+			Timestamp:   ind.Timestamp.Format(time.RFC3339),
+			Evidence:    ind.Evidence,
+		})
+	}
+
+	return ThreatViewModel{
+		ProcessGuid: score.ProcessGuid,
+		ProcessName: score.Image,
+		ProcessID:   score.ProcessID,
+		Score:       score.Score,
+		ThreatLevel: string(level),
+		Category:    score.Category,
+		FirstSeen:   score.FirstSeen.Format(time.RFC3339),
+		LastSeen:    score.LastSeen.Format(time.RFC3339),
+		Indicators:  indicators,
+	}
+}
+
+// evaluateThreatLevel maps a score to a ThreatLevel
+func evaluateThreatLevel(score int) domain.ThreatLevel {
+	switch {
+	case score >= 86:
+		return domain.ThreatCritical
+	case score >= 61:
+		return domain.ThreatHigh
+	case score >= 31:
+		return domain.ThreatMedium
+	case score >= 1:
+		return domain.ThreatLow
+	default:
+		return domain.ThreatNone
 	}
 }
 

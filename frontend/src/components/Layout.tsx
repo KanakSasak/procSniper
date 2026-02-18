@@ -1,6 +1,6 @@
 import { ReactNode } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { Shield, Settings, History, Activity } from 'lucide-react'
+import { Shield, Settings, History, Activity, Target, Brain } from 'lucide-react'
 
 interface LayoutProps {
   children: ReactNode
@@ -11,6 +11,8 @@ function Layout({ children }: LayoutProps) {
 
   const navItems = [
     { path: '/', icon: Activity, label: 'Dashboard' },
+    { path: '/threats', icon: Target, label: 'Threats' },
+    { path: '/ml', icon: Brain, label: 'ML Detection' },
     { path: '/config', icon: Settings, label: 'Configuration' },
     { path: '/history', icon: History, label: 'History' },
   ]

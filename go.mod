@@ -3,7 +3,9 @@ module procSniper
 go 1.22
 
 require (
+	github.com/bi-zone/etw v0.0.0-20210519083747-fe9042eb0ea8
 	github.com/wailsapp/wails/v2 v2.9.2
+	github.com/yalue/onnxruntime_go v1.25.0
 	golang.org/x/sys v0.20.0
 )
 

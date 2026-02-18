@@ -1,8 +1,10 @@
+//go:build windows
 // +build windows
 
 package infrastructure
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +16,16 @@ import (
 // ResponseActions implements automated threat response
 type ResponseActions struct {
 	privilegesEnabled bool
+}
+
+func isProcessGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, windows.ERROR_INVALID_PARAMETER) ||
+		errors.Is(err, windows.ERROR_INVALID_HANDLE) ||
+		errors.Is(err, windows.ERROR_NOT_FOUND)
 }
 
 // NewResponseActions creates a new response actions handler
@@ -80,6 +92,112 @@ func (ra *ResponseActions) TerminateProcess(pid uint32) error {
 	return nil
 }
 
+// IsProcessAlive checks whether a process is still active.
+// A missing process is treated as "not alive" without returning an error.
+func (ra *ResponseActions) IsProcessAlive(pid uint32) (bool, error) {
+	if pid == 0 {
+		return false, fmt.Errorf("invalid PID 0")
+	}
+
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE,
+		false,
+		pid,
+	)
+	if err != nil {
+		if isProcessGoneError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("OpenProcess failed for PID %d: %w", pid, err)
+	}
+	defer windows.CloseHandle(handle)
+
+	var exitCode uint32
+	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return false, fmt.Errorf("GetExitCodeProcess failed for PID %d: %w", pid, err)
+	}
+
+	const stillActive = 259
+	return exitCode == stillActive, nil
+}
+
+// TerminateProcessVerified terminates a process and verifies it exited.
+// It retries termination and can escalate with suspend+terminate when requested.
+func (ra *ResponseActions) TerminateProcessVerified(pid uint32, attempts int, wait time.Duration, escalateSuspend bool) (bool, bool, error) {
+	if pid == 0 {
+		return false, false, fmt.Errorf("invalid PID 0")
+	}
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if wait <= 0 {
+		wait = 200 * time.Millisecond
+	}
+
+	alive, err := ra.IsProcessAlive(pid)
+	if err != nil {
+		return false, false, err
+	}
+	if !alive {
+		return false, true, nil
+	}
+
+	var lastErr error
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		termErr := ra.TerminateProcess(pid)
+		if termErr != nil && !isProcessGoneError(termErr) {
+			lastErr = termErr
+		}
+
+		time.Sleep(wait)
+
+		alive, aliveErr := ra.IsProcessAlive(pid)
+		if aliveErr != nil {
+			lastErr = aliveErr
+		} else if !alive {
+			if isProcessGoneError(termErr) {
+				return false, true, nil
+			}
+			return true, false, nil
+		}
+
+		if !escalateSuspend {
+			continue
+		}
+
+		if suspendErr := ra.SuspendProcess(pid); suspendErr != nil && !isProcessGoneError(suspendErr) {
+			lastErr = fmt.Errorf("suspend failed for PID %d: %w", pid, suspendErr)
+			continue
+		}
+
+		termErr = ra.TerminateProcess(pid)
+		if termErr != nil && !isProcessGoneError(termErr) {
+			lastErr = termErr
+		}
+
+		time.Sleep(wait)
+
+		alive, aliveErr = ra.IsProcessAlive(pid)
+		if aliveErr != nil {
+			lastErr = aliveErr
+			continue
+		}
+		if !alive {
+			if isProcessGoneError(termErr) {
+				return false, true, nil
+			}
+			return true, false, nil
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("process %d is still alive after %d termination attempts", pid, attempts)
+	}
+
+	return false, false, lastErr
+}
+
 // SuspendProcess suspends a process by PID
 func (ra *ResponseActions) SuspendProcess(pid uint32) error {
 	var (
@@ -104,8 +222,8 @@ func (ra *ResponseActions) SuspendProcess(pid uint32) error {
 // ResumeProcess resumes a suspended process by PID
 func (ra *ResponseActions) ResumeProcess(pid uint32) error {
 	var (
-		modntdll             = windows.NewLazySystemDLL("ntdll.dll")
-		procNtResumeProcess  = modntdll.NewProc("NtResumeProcess")
+		modntdll            = windows.NewLazySystemDLL("ntdll.dll")
+		procNtResumeProcess = modntdll.NewProc("NtResumeProcess")
 	)
 
 	handle, err := windows.OpenProcess(windows.PROCESS_SUSPEND_RESUME, false, pid)

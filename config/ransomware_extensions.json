@@ -1,5 +1,5 @@
 {
-  "version": "1.0",
+  "version": "2.0",
   "last_updated": "2025-10-26",
   "description": "Ransomware file extensions database for procSniper detection",
 
@@ -70,9 +70,10 @@
   "detection_thresholds": {
     "high_entropy_file_threshold": 10,
     "ransomware_extension_file_threshold": 5,
+    "ransomware_extension_rename_threshold": 3,
     "combined_entropy_and_extension_threshold": 5,
     "io_velocity_threshold_per_minute": 100,
-    "note": "Number of files required before triggering indicators. Combined threshold (high entropy + ransomware extension) triggers immediate termination."
+    "note": "High entropy threshold stays at 10 for unknown extensions. Rename to known ransomware extension triggers fast-kill at 3 events in 60s."
   },
 
   "response_settings": {
@@ -80,22 +81,33 @@
     "immediate_response": true,
     "terminate_on_extension_match": true,
     "terminate_on_critical_score": true,
-    "critical_score_threshold": 50,
+    "critical_score_threshold": 49,
     "quarantine_files": true,
     "quarantine_directory": "C:\\ProgramData\\procSniper\\quarantine",
     "suspend_before_terminate": false,
-    "investigation_mode": false
+    "suspend_related_on_canary": true,
+    "related_suspicion_min_score": 50,
+    "related_actor_window_seconds": 60,
+    "investigation_mode": false,
+    "detection_mode": "rules_only",
+    "canary_response_action": "terminate"
   },
 
   "whitelist": {
     "enabled": false,
-    "processes": [],
+    "processes": [
+      "SearchProtocolHost.exe",
+      "SearchIndexer.exe",
+      "SearchFilterHost.exe",
+      "MsMpEng.exe",
+      "procSniper.exe"
+    ],
     "paths": [
       "C:\\Windows\\System32",
       "C:\\Windows\\SysWOW64",
       "C:\\Program Files\\Windows Defender"
     ],
-    "note": "Whitelisted paths will not trigger auto-response even if extensions match"
+    "note": "Whitelisted processes are ignored by detection scoring. Whitelisted paths block auto-response when whitelist.enabled is true."
   },
 
   "alert_settings": {

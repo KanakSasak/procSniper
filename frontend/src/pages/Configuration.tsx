@@ -8,6 +8,7 @@ function Configuration() {
   const [editedConfig, setEditedConfig] = useState<Config | null>(null)
   const [activeTab, setActiveTab] = useState<'thresholds' | 'response' | 'whitelist' | 'extensions'>('thresholds')
   const [newPath, setNewPath] = useState('')
+  const [newProcess, setNewProcess] = useState('')
   const [newExtension, setNewExtension] = useState('')
   const [saveMessage, setSaveMessage] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
@@ -54,6 +55,29 @@ function Configuration() {
       whitelist: {
         ...editedConfig.whitelist,
         paths: editedConfig.whitelist.paths.filter((_, i) => i !== index),
+      },
+    })
+  }
+
+  const addProcess = () => {
+    if (!editedConfig || !newProcess.trim()) return
+    setEditedConfig({
+      ...editedConfig,
+      whitelist: {
+        ...editedConfig.whitelist,
+        processes: [...(editedConfig.whitelist.processes || []), newProcess.trim()],
+      },
+    })
+    setNewProcess('')
+  }
+
+  const removeProcess = (index: number) => {
+    if (!editedConfig) return
+    setEditedConfig({
+      ...editedConfig,
+      whitelist: {
+        ...editedConfig.whitelist,
+        processes: (editedConfig.whitelist.processes || []).filter((_, i) => i !== index),
       },
     })
   }
@@ -196,6 +220,20 @@ function Configuration() {
             />
 
             <SliderInput
+              label="Rename to Ransomware Extension Threshold"
+              description="Number of renames to ransomware extensions in 60s before immediate termination"
+              value={editedConfig.detectionThresholds.ransomwareExtensionRenameThreshold}
+              min={1}
+              max={20}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  detectionThresholds: { ...editedConfig.detectionThresholds, ransomwareExtensionRenameThreshold: value },
+                })
+              }
+            />
+
+            <SliderInput
               label="Combined Threshold (Immediate Termination)"
               description="Files with BOTH high entropy AND ransomware extension before immediate termination"
               value={editedConfig.detectionThresholds.combinedEntropyAndExtensionThreshold}
@@ -205,6 +243,20 @@ function Configuration() {
                 setEditedConfig({
                   ...editedConfig,
                   detectionThresholds: { ...editedConfig.detectionThresholds, combinedEntropyAndExtensionThreshold: value },
+                })
+              }
+            />
+
+            <SliderInput
+              label="I/O Velocity Threshold (files/min)"
+              description="File operations per minute that trigger critical velocity detection tier"
+              value={editedConfig.detectionThresholds.ioVelocityThresholdPerMinute}
+              min={10}
+              max={500}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  detectionThresholds: { ...editedConfig.detectionThresholds, ioVelocityThresholdPerMinute: value },
                 })
               }
             />
@@ -237,6 +289,42 @@ function Configuration() {
                 setEditedConfig({
                   ...editedConfig,
                   responseSettings: { ...editedConfig.responseSettings, criticalScoreThreshold: value },
+                })
+              }
+            />
+
+            <ToggleInput
+              label="Immediate Response"
+              description="Respond immediately upon detection without waiting for further indicators"
+              value={editedConfig.responseSettings.immediateResponse}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  responseSettings: { ...editedConfig.responseSettings, immediateResponse: value },
+                })
+              }
+            />
+
+            <ToggleInput
+              label="Terminate on Extension Match"
+              description="Kill process immediately when ransomware file extension is detected"
+              value={editedConfig.responseSettings.terminateOnExtensionMatch}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  responseSettings: { ...editedConfig.responseSettings, terminateOnExtensionMatch: value },
+                })
+              }
+            />
+
+            <ToggleInput
+              label="Suspend Before Terminate"
+              description="Suspend process threads before termination for forensic preservation"
+              value={editedConfig.responseSettings.suspendBeforeTerminate}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  responseSettings: { ...editedConfig.responseSettings, suspendBeforeTerminate: value },
                 })
               }
             />
@@ -275,6 +363,40 @@ function Configuration() {
                 })
               }
             />
+
+            <SelectInput
+              label="Detection Mode"
+              description="How threats are detected: rules only, ML only, or both combined"
+              value={editedConfig.responseSettings.detectionMode || 'rules_only'}
+              options={[
+                { value: 'rules_only', label: 'Rules Only' },
+                { value: 'hybrid', label: 'Hybrid (Rules + ML)' },
+                { value: 'ml_only', label: 'ML Only' },
+              ]}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  responseSettings: { ...editedConfig.responseSettings, detectionMode: value },
+                })
+              }
+            />
+
+            <SelectInput
+              label="Canary Response Action"
+              description="Action taken when a canary (honeypot) file is compromised"
+              value={editedConfig.responseSettings.canaryResponseAction || 'terminate'}
+              options={[
+                { value: 'terminate', label: 'Terminate (Default)' },
+                { value: 'suspend', label: 'Suspend Only' },
+                { value: 'alert_only', label: 'Alert Only' },
+              ]}
+              onChange={(value) =>
+                setEditedConfig({
+                  ...editedConfig,
+                  responseSettings: { ...editedConfig.responseSettings, canaryResponseAction: value },
+                })
+              }
+            />
           </div>
         )}
 
@@ -294,6 +416,7 @@ function Configuration() {
               }
             />
 
+            {/* Path Whitelist */}
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">Whitelisted Paths</label>
               <div className="flex gap-2 mb-4">
@@ -303,6 +426,7 @@ function Configuration() {
                   onChange={(e) => setNewPath(e.target.value)}
                   placeholder="Enter path to whitelist..."
                   className="flex-1 px-4 py-2 bg-ps-accent/30 border border-ps-accent/50 rounded-lg focus:outline-none focus:border-ps-primary"
+                  onKeyDown={(e) => e.key === 'Enter' && addPath()}
                 />
                 <button
                   onClick={addPath}
@@ -312,7 +436,7 @@ function Configuration() {
                   Add
                 </button>
               </div>
-              <div className="space-y-2 max-h-64 overflow-y-auto">
+              <div className="space-y-2 max-h-48 overflow-y-auto">
                 {editedConfig.whitelist.paths.map((path, index) => (
                   <div key={index} className="flex items-center justify-between bg-ps-accent/20 px-4 py-2 rounded-lg">
                     <span className="text-sm font-mono">{path}</span>
@@ -326,6 +450,47 @@ function Configuration() {
                 ))}
                 {editedConfig.whitelist.paths.length === 0 && (
                   <p className="text-gray-500 text-center py-4">No whitelisted paths</p>
+                )}
+              </div>
+            </div>
+
+            {/* Process Whitelist */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Whitelisted Processes</label>
+              <p className="text-xs text-gray-500 mb-3">
+                Processes in this list are always excluded from auto-termination, regardless of path whitelist setting.
+              </p>
+              <div className="flex gap-2 mb-4">
+                <input
+                  type="text"
+                  value={newProcess}
+                  onChange={(e) => setNewProcess(e.target.value)}
+                  placeholder="Enter process name (e.g., SearchProtocolHost.exe)"
+                  className="flex-1 px-4 py-2 bg-ps-accent/30 border border-ps-accent/50 rounded-lg focus:outline-none focus:border-ps-primary"
+                  onKeyDown={(e) => e.key === 'Enter' && addProcess()}
+                />
+                <button
+                  onClick={addProcess}
+                  className="flex items-center gap-2 px-4 py-2 bg-ps-primary rounded-lg hover:bg-ps-primary/80 transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add
+                </button>
+              </div>
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {(editedConfig.whitelist.processes || []).map((proc, index) => (
+                  <div key={index} className="flex items-center justify-between bg-ps-accent/20 px-4 py-2 rounded-lg">
+                    <span className="text-sm font-mono">{proc}</span>
+                    <button
+                      onClick={() => removeProcess(index)}
+                      className="text-red-400 hover:text-red-300"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+                {(!editedConfig.whitelist.processes || editedConfig.whitelist.processes.length === 0) && (
+                  <p className="text-gray-500 text-center py-4">No whitelisted processes</p>
                 )}
               </div>
             </div>
@@ -345,6 +510,7 @@ function Configuration() {
                 onChange={(e) => setNewExtension(e.target.value)}
                 placeholder="Enter extension (e.g., .locked)"
                 className="flex-1 px-4 py-2 bg-ps-accent/30 border border-ps-accent/50 rounded-lg focus:outline-none focus:border-ps-primary"
+                onKeyDown={(e) => e.key === 'Enter' && addExtension()}
               />
               <button
                 onClick={addExtension}
@@ -457,6 +623,39 @@ function TextInput({ label, value, onChange }: TextInputProps) {
         onChange={(e) => onChange(e.target.value)}
         className="w-full px-4 py-2 bg-ps-accent/30 border border-ps-accent/50 rounded-lg focus:outline-none focus:border-ps-primary"
       />
+    </div>
+  )
+}
+
+interface SelectOption {
+  value: string
+  label: string
+}
+
+interface SelectInputProps {
+  label: string
+  description: string
+  value: string
+  options: SelectOption[]
+  onChange: (value: string) => void
+}
+
+function SelectInput({ label, description, value, options, onChange }: SelectInputProps) {
+  return (
+    <div>
+      <label className="block text-sm font-medium text-gray-300 mb-1">{label}</label>
+      <p className="text-xs text-gray-500 mb-2">{description}</p>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-4 py-2 bg-ps-accent/30 border border-ps-accent/50 rounded-lg focus:outline-none focus:border-ps-primary text-white"
+      >
+        {options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
     </div>
   )
 }

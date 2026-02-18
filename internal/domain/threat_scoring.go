@@ -34,8 +34,10 @@ const (
 	IndicatorModifyDeletePattern IndicatorType = "MODIFY_DELETE_PATTERN" // File modified with high entropy then deleted (classic ransomware)
 	IndicatorRansomNote          IndicatorType = "RANSOM_NOTE"           // Ransom note file created (README.txt, DECRYPT.txt, etc.)
 	IndicatorBackupPrivilege     IndicatorType = "BACKUP_PRIVILEGE"      // SeBackupPrivilege/SeRestorePrivilege enabled (BackupWrite evasion)
-	IndicatorBackupAPIUsage      IndicatorType = "BACKUP_API_USAGE"      // BackupRead/BackupWrite API calls detected (Sysmon Event ID 11 bypass)
+	IndicatorBackupAPIUsage      IndicatorType = "BACKUP_API_USAGE"      // BackupRead/BackupWrite API calls detected (file creation detection bypass)
 	IndicatorCanaryCompromised   IndicatorType = "CANARY_COMPROMISED"    // Honeypot canary file encrypted/deleted (very high confidence ransomware)
+	IndicatorMLRansomware        IndicatorType = "ML_RANSOMWARE"         // ML model predicts ransomware behavior
+	IndicatorMLStealer           IndicatorType = "ML_STEALER"            // ML model predicts stealer behavior
 )
 
 // Indicator represents a single threat indicator
@@ -55,7 +57,7 @@ var IndicatorScores = map[IndicatorType]int{
 	IndicatorShadowCopyDeletion:  25,
 	IndicatorLSASSAccess:         35,
 	IndicatorCredentialTheft:     40,
-	IndicatorRansomExtension:     20,
+	IndicatorRansomExtension:     50, // CRITICAL - definitive ransomware indicator
 	IndicatorRecoveryDisable:     25,
 	IndicatorBulkEncryption:      30,
 	IndicatorFakeFile:            35, // High score - clear evasion attempt
@@ -63,9 +65,11 @@ var IndicatorScores = map[IndicatorType]int{
 	IndicatorInPlaceEncryption:   45, // Very high score - direct detection of in-place encryption via Event ID 2
 	IndicatorModifyDeletePattern: 40, // Very high score - classic ransomware behavior, low false positive rate
 	IndicatorRansomNote:          50, // CRITICAL - ransom note creation is definitive ransomware indicator
-	IndicatorBackupPrivilege:     40, // CRITICAL - enables BackupWrite evasion (bypasses Sysmon Event ID 11)
+	IndicatorBackupPrivilege:     40, // CRITICAL - enables BackupWrite evasion (bypasses file creation monitoring)
 	IndicatorBackupAPIUsage:      45, // CRITICAL - direct detection of BackupRead/BackupWrite usage (advanced evasion)
 	IndicatorCanaryCompromised:   50, // CRITICAL - honeypot canary file compromised (very high confidence ransomware)
+	IndicatorMLRansomware:        40, // ML model prediction - ransomware behavior pattern
+	IndicatorMLStealer:           30, // ML model prediction - stealer behavior pattern
 }
 
 // ThreatScore tracks accumulated threat indicators for a process
@@ -260,4 +264,11 @@ func (ts *ThreatScorer) CleanupOldScores(maxAge time.Duration) int {
 func (ts *ThreatScorer) ShouldAutoRespond(processGuid string) bool {
 	level, _ := ts.EvaluateThreat(processGuid)
 	return level == ThreatCritical
+}
+
+// Reset clears all tracked threat scores.
+func (ts *ThreatScorer) Reset() {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.scores = make(map[string]*ThreatScore)
 }

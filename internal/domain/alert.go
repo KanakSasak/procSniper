@@ -7,39 +7,54 @@ import (
 
 // Alert represents a threat detection alert
 type Alert struct {
-	ID              string
-	Timestamp       time.Time
-	Severity        ThreatLevel
-	Category        string // "RANSOMWARE", "STEALER", "CREDENTIAL_THEFT"
-	ProcessGuid     string
-	ProcessID       int
-	Image           string
-	Description     string
-	Score           int
-	Indicators      []Indicator
-	Evidence        map[string]interface{}
-	AutoRespond     bool
-	Responded       bool
-	ResponseActions []string
+	ID               string
+	Timestamp        time.Time
+	Severity         ThreatLevel
+	Category         string // "RANSOMWARE", "STEALER", "CREDENTIAL_THEFT"
+	ProcessGuid      string
+	ProcessID        int
+	Image            string
+	Description      string
+	Score            int
+	Indicators       []Indicator
+	RelatedProcesses []RelatedProcess
+	Evidence         map[string]interface{}
+	AutoRespond      bool
+	Responded        bool
+	ResponseActions  []string
+}
+
+// RelatedProcess captures a process related to a canary compromise alert.
+type RelatedProcess struct {
+	ProcessGuid   string
+	ProcessID     int
+	Image         string
+	RelationScore int
+	CreateOps60s  int
+	ModifyOps60s  int
+	Tier          string
+	LastSeen      time.Time
+	Reason        string
 }
 
 // NewAlert creates a new detection alert
 func NewAlert(category string, severity ThreatLevel, processGuid string, pid int, image string, description string, score int) *Alert {
 	return &Alert{
-		ID:              generateAlertID(),
-		Timestamp:       time.Now(),
-		Severity:        severity,
-		Category:        category,
-		ProcessGuid:     processGuid,
-		ProcessID:       pid,
-		Image:           image,
-		Description:     description,
-		Score:           score,
-		Indicators:      make([]Indicator, 0),
-		Evidence:        make(map[string]interface{}),
-		AutoRespond:     false,
-		Responded:       false,
-		ResponseActions: make([]string, 0),
+		ID:               generateAlertID(),
+		Timestamp:        time.Now(),
+		Severity:         severity,
+		Category:         category,
+		ProcessGuid:      processGuid,
+		ProcessID:        pid,
+		Image:            image,
+		Description:      description,
+		Score:            score,
+		Indicators:       make([]Indicator, 0),
+		RelatedProcesses: make([]RelatedProcess, 0),
+		Evidence:         make(map[string]interface{}),
+		AutoRespond:      false,
+		Responded:        false,
+		ResponseActions:  make([]string, 0),
 	}
 }
 
@@ -91,8 +106,8 @@ type DetectionContext struct {
 	User              string
 }
 
-// SysmonEvent represents a parsed Sysmon event
-type SysmonEvent struct {
+// MonitorEvent represents a parsed monitoring event from kernel ETW providers
+type MonitorEvent struct {
 	EventID       int
 	Timestamp     time.Time
 	Computer      string
@@ -103,7 +118,7 @@ type SysmonEvent struct {
 	TargetFile    string
 	TargetImage   string
 	GrantedAccess string
-	RawXML        string
+	RawData       map[string]interface{}
 }
 
 // IsRansomwareExtension checks if file extension matches known ransomware patterns (case-insensitively)

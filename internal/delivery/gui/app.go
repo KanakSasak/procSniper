@@ -4,7 +4,11 @@ package gui
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"procSniper/internal/delivery/gui/events"
 	"procSniper/internal/delivery/gui/logger"
 	"procSniper/internal/delivery/gui/models"
+	"procSniper/internal/domain"
 	"procSniper/internal/infrastructure"
 	"procSniper/internal/usecase"
 )
@@ -25,7 +30,7 @@ type App struct {
 	// Services
 	detectionService     *usecase.DetectionService
 	responseOrchestrator *usecase.ResponseOrchestrator
-	sysmonConsumer       *infrastructure.SysmonConsumer
+	etwConsumer          *infrastructure.KernelETWConsumer
 	securityLogConsumer  *infrastructure.SecurityLogConsumer
 	responseActions      *infrastructure.ResponseActions
 
@@ -46,6 +51,11 @@ type App struct {
 	// Background goroutine control
 	stopStats chan struct{}
 	stopLogs  chan struct{}
+
+	// ML Model state
+	mlModelStatus models.MLModelStatus
+	mlPredictor   domain.MLPredictor
+	mlMux         sync.RWMutex
 }
 
 // NewApp creates a new App instance
@@ -110,9 +120,26 @@ func (a *App) StartProtection() models.OperationResult {
 		a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
 		a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
 		a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+		a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
 		a.cfg.EnableRansomNoteDetection,
 		a.cfg.RansomwareExtensions,
+		a.responseCfg.Whitelist.Processes,
 	)
+
+	// Wire ML settings/callback into the fresh DetectionService.
+	a.mlMux.RLock()
+	a.applyMLSettingsToDetectionServiceLocked()
+	a.mlMux.RUnlock()
+
+	// Apply detection mode and canary response from config
+	if a.responseCfg != nil {
+		if a.responseCfg.ResponseSettings.DetectionMode != "" {
+			a.detectionService.SetDetectionMode(a.responseCfg.ResponseSettings.DetectionMode)
+		}
+		if a.responseCfg.ResponseSettings.CanaryResponseAction != "" {
+			a.detectionService.SetCanaryResponseAction(a.responseCfg.ResponseSettings.CanaryResponseAction)
+		}
+	}
 
 	// Setup canary files
 	if err := a.detectionService.SetupCanaryFiles(); err != nil {
@@ -132,12 +159,27 @@ func (a *App) StartProtection() models.OperationResult {
 		}
 	}
 
+	// Enable process self-protection (DACL hardening)
+	if err := infrastructure.ProtectCurrentProcess(); err != nil {
+		log.Printf("[GUI] WARNING: Failed to enable self-protection: %v", err)
+	}
+
 	// Initialize response orchestrator
 	a.responseOrchestrator = usecase.NewResponseOrchestrator(
 		a.detectionService,
 		a.responseActions,
 		a.responseCfg,
 	)
+
+	// Initialize Kernel ETW consumer
+	a.etwConsumer = infrastructure.NewKernelETWConsumer(
+		a.detectionService,
+		a.cfg.WorkerPoolSize,
+	)
+
+	// Route successful termination outcomes into ETW dead-PID suppression.
+	a.responseOrchestrator.SetProcessTerminationSink(a.etwConsumer)
+
 	if err := a.responseOrchestrator.Start(ctx); err != nil {
 		cancel()
 		return models.OperationResult{
@@ -145,18 +187,12 @@ func (a *App) StartProtection() models.OperationResult {
 			Message: "Failed to start response orchestrator: " + err.Error(),
 		}
 	}
-
-	// Initialize Sysmon consumer
-	a.sysmonConsumer = infrastructure.NewSysmonConsumer(
-		a.detectionService,
-		a.cfg.WorkerPoolSize,
-	)
-	if err := a.sysmonConsumer.Start(ctx); err != nil {
+	if err := a.etwConsumer.Start(ctx); err != nil {
 		cancel()
 		a.responseOrchestrator.Stop()
 		return models.OperationResult{
 			Success: false,
-			Message: "Failed to start Sysmon consumer: " + err.Error(),
+			Message: "Failed to start ETW consumer: " + err.Error(),
 		}
 	}
 
@@ -203,8 +239,8 @@ func (a *App) StopProtection() models.OperationResult {
 		a.securityLogConsumer.Stop()
 	}
 
-	if a.sysmonConsumer != nil {
-		a.sysmonConsumer.Stop()
+	if a.etwConsumer != nil {
+		a.etwConsumer.Stop()
 	}
 
 	if a.responseOrchestrator != nil {
@@ -249,14 +285,33 @@ func (a *App) GetDashboardStats() models.DashboardStats {
 
 	stats.ProtectionStatus = "Active"
 
-	// Get Sysmon stats
-	if a.sysmonConsumer != nil {
-		sysmonStats := a.sysmonConsumer.GetStats()
-		if running, ok := sysmonStats["running"].(bool); ok {
-			stats.SysmonConnected = running
+	// Get ETW stats
+	if a.etwConsumer != nil {
+		etwStats := a.etwConsumer.GetStats()
+		if running, ok := etwStats["running"].(bool); ok {
+			stats.ETWConnected = running
 		}
-		if queueLen, ok := sysmonStats["channel_length"].(int); ok {
+		if queueLen, ok := etwStats["channel_length"].(int); ok {
 			stats.WorkerQueueDepth = queueLen
+		}
+		// ETW diagnostics
+		if v, ok := etwStats["events_received"].(uint64); ok {
+			stats.ETWDiagnostics.EventsReceived = v
+		}
+		if v, ok := etwStats["events_dropped"].(uint64); ok {
+			stats.ETWDiagnostics.EventsDropped = v
+		}
+		if v, ok := etwStats["events_suppressed_dead_pid"].(uint64); ok {
+			stats.ETWDiagnostics.EventsSuppressedDeadPID = v
+		}
+		if v, ok := etwStats["worker_pool_size"].(int); ok {
+			stats.ETWDiagnostics.WorkerPoolSize = v
+		}
+		if v, ok := etwStats["channel_capacity"].(int); ok {
+			stats.ETWDiagnostics.ChannelCapacity = v
+		}
+		if v, ok := etwStats["channel_length"].(int); ok {
+			stats.ETWDiagnostics.ChannelLength = v
 		}
 	}
 
@@ -272,13 +327,35 @@ func (a *App) GetDashboardStats() models.DashboardStats {
 		if quarantined, ok := orchStats["files_quarantined"].(int); ok {
 			stats.FilesQuarantined = quarantined
 		}
+		if blocked, ok := orchStats["auto_responses_blocked"].(int); ok {
+			stats.AutoResponsesBlocked = blocked
+		}
 	}
 
-	// Get canary stats
+	// Get canary stats and detection service stats
 	if a.detectionService != nil {
 		canaryStats := a.detectionService.GetCanaryStats()
 		if total, ok := canaryStats["total_canaries"].(int); ok {
 			stats.CanaryFilesCount = total
+		}
+
+		// Active threats count
+		threats := a.detectionService.GetAllThreats()
+		stats.ActiveThreatsCount = len(threats)
+
+		// High I/O process count
+		stats.HighIOProcessCount = a.detectionService.GetHighIOProcessCount()
+
+		// Entropy stats
+		entropyStats := a.detectionService.GetEntropyStats()
+		if v, ok := entropyStats["tracked_files"].(int); ok {
+			stats.EntropyStats.TrackedFiles = v
+		}
+		if v, ok := entropyStats["modified_files"].(int); ok {
+			stats.EntropyStats.ModifiedFiles = v
+		}
+		if v, ok := entropyStats["significant_increases"].(int); ok {
+			stats.EntropyStats.SignificantIncreases = v
 		}
 	}
 
@@ -297,18 +374,26 @@ func (a *App) GetConfiguration() models.ConfigViewModel {
 		DetectionThresholds: models.DetectionThresholdsVM{
 			HighEntropyFileThreshold:             a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
 			RansomwareExtensionFileThreshold:     a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
+			RansomwareExtensionRenameThreshold:   a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
 			CombinedEntropyAndExtensionThreshold: a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+			IOVelocityThresholdPerMinute:         a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute,
 		},
 		ResponseSettings: models.ResponseSettingsVM{
-			AutoTerminateEnabled:   a.responseCfg.ResponseSettings.AutoTerminateEnabled,
-			CriticalScoreThreshold: a.responseCfg.ResponseSettings.CriticalScoreThreshold,
-			InvestigationMode:      a.responseCfg.ResponseSettings.InvestigationMode,
-			QuarantineFiles:        a.responseCfg.ResponseSettings.QuarantineFiles,
-			QuarantineDirectory:    a.responseCfg.ResponseSettings.QuarantineDirectory,
+			AutoTerminateEnabled:      a.responseCfg.ResponseSettings.AutoTerminateEnabled,
+			CriticalScoreThreshold:    a.responseCfg.ResponseSettings.CriticalScoreThreshold,
+			InvestigationMode:         a.responseCfg.ResponseSettings.InvestigationMode,
+			QuarantineFiles:           a.responseCfg.ResponseSettings.QuarantineFiles,
+			QuarantineDirectory:       a.responseCfg.ResponseSettings.QuarantineDirectory,
+			ImmediateResponse:         a.responseCfg.ResponseSettings.ImmediateResponse,
+			TerminateOnExtensionMatch: a.responseCfg.ResponseSettings.TerminateOnExtensionMatch,
+			SuspendBeforeTerminate:    a.responseCfg.ResponseSettings.SuspendBeforeTerminate,
+			DetectionMode:             a.responseCfg.ResponseSettings.DetectionMode,
+			CanaryResponseAction:      a.responseCfg.ResponseSettings.CanaryResponseAction,
 		},
 		Whitelist: models.WhitelistVM{
-			Enabled: a.responseCfg.Whitelist.Enabled,
-			Paths:   a.responseCfg.Whitelist.Paths,
+			Enabled:   a.responseCfg.Whitelist.Enabled,
+			Paths:     a.responseCfg.Whitelist.Paths,
+			Processes: a.responseCfg.Whitelist.Processes,
 		},
 		RansomwareExtensions: a.responseCfg.RansomwareExtensions,
 	}
@@ -326,16 +411,24 @@ func (a *App) SaveConfiguration(cfg models.ConfigViewModel) models.OperationResu
 	// Update config values
 	a.responseCfg.DetectionThresholds.HighEntropyFileThreshold = cfg.DetectionThresholds.HighEntropyFileThreshold
 	a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold = cfg.DetectionThresholds.RansomwareExtensionFileThreshold
+	a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold = cfg.DetectionThresholds.RansomwareExtensionRenameThreshold
 	a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold = cfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold
+	a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute = cfg.DetectionThresholds.IOVelocityThresholdPerMinute
 
 	a.responseCfg.ResponseSettings.AutoTerminateEnabled = cfg.ResponseSettings.AutoTerminateEnabled
 	a.responseCfg.ResponseSettings.CriticalScoreThreshold = cfg.ResponseSettings.CriticalScoreThreshold
 	a.responseCfg.ResponseSettings.InvestigationMode = cfg.ResponseSettings.InvestigationMode
 	a.responseCfg.ResponseSettings.QuarantineFiles = cfg.ResponseSettings.QuarantineFiles
 	a.responseCfg.ResponseSettings.QuarantineDirectory = cfg.ResponseSettings.QuarantineDirectory
+	a.responseCfg.ResponseSettings.ImmediateResponse = cfg.ResponseSettings.ImmediateResponse
+	a.responseCfg.ResponseSettings.TerminateOnExtensionMatch = cfg.ResponseSettings.TerminateOnExtensionMatch
+	a.responseCfg.ResponseSettings.SuspendBeforeTerminate = cfg.ResponseSettings.SuspendBeforeTerminate
+	a.responseCfg.ResponseSettings.DetectionMode = cfg.ResponseSettings.DetectionMode
+	a.responseCfg.ResponseSettings.CanaryResponseAction = cfg.ResponseSettings.CanaryResponseAction
 
 	a.responseCfg.Whitelist.Enabled = cfg.Whitelist.Enabled
 	a.responseCfg.Whitelist.Paths = cfg.Whitelist.Paths
+	a.responseCfg.Whitelist.Processes = cfg.Whitelist.Processes
 
 	a.responseCfg.RansomwareExtensions = cfg.RansomwareExtensions
 
@@ -353,6 +446,364 @@ func (a *App) SaveConfiguration(cfg models.ConfigViewModel) models.OperationResu
 	}
 }
 
+// GetActiveThreats returns all processes with threat scores > 0
+func (a *App) GetActiveThreats() []models.ThreatViewModel {
+	a.protectMux.RLock()
+	isProtecting := a.isProtecting
+	a.protectMux.RUnlock()
+
+	if !isProtecting || a.detectionService == nil {
+		return []models.ThreatViewModel{}
+	}
+
+	domainThreats := a.detectionService.GetAllThreats()
+	threats := make([]models.ThreatViewModel, 0, len(domainThreats))
+	for _, t := range domainThreats {
+		threats = append(threats, models.ThreatFromDomain(t))
+	}
+	return threats
+}
+
+// GetEntropyStats returns entropy tracker statistics
+func (a *App) GetEntropyStats() models.EntropyStatsVM {
+	a.protectMux.RLock()
+	isProtecting := a.isProtecting
+	a.protectMux.RUnlock()
+
+	if !isProtecting || a.detectionService == nil {
+		return models.EntropyStatsVM{}
+	}
+
+	stats := a.detectionService.GetEntropyStats()
+	result := models.EntropyStatsVM{}
+	if v, ok := stats["tracked_files"].(int); ok {
+		result.TrackedFiles = v
+	}
+	if v, ok := stats["modified_files"].(int); ok {
+		result.ModifiedFiles = v
+	}
+	if v, ok := stats["significant_increases"].(int); ok {
+		result.SignificantIncreases = v
+	}
+	return result
+}
+
+// LoadMLModel loads an ONNX model file and initializes the inference session.
+func (a *App) LoadMLModel(filePath string) models.OperationResult {
+	a.mlMux.Lock()
+	defer a.mlMux.Unlock()
+
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return models.OperationResult{
+			Success: false,
+			Message: "Model file not found: " + filePath,
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext != ".onnx" {
+		return models.OperationResult{
+			Success: false,
+			Message: "Only ONNX models are supported. Got: " + ext,
+		}
+	}
+
+	// Close any previously loaded model
+	if a.mlPredictor != nil {
+		a.mlPredictor.Close()
+		a.mlPredictor = nil
+	}
+
+	// Create ONNX predictor (looks for onnxruntime.dll next to exe, model dir, or PATH)
+	predictor, err := infrastructure.NewONNXPredictor(filePath, "")
+	if err != nil {
+		log.Printf("[GUI] Failed to load ONNX model: %v", err)
+		return models.OperationResult{
+			Success: false,
+			Message: "Failed to load ONNX model: " + err.Error(),
+		}
+	}
+
+	a.mlPredictor = predictor
+	modelName := filepath.Base(filePath)
+
+	a.mlModelStatus = models.MLModelStatus{
+		Loaded:              true,
+		FilePath:            filePath,
+		ModelName:           modelName,
+		ModelType:           "ONNX Runtime",
+		LoadedAt:            time.Now().Format(time.RFC3339),
+		Enabled:             false,
+		FeatureCount:        14,
+		ConfidenceThreshold: 0.75,
+	}
+
+	// Wire predictor + callback into detection service if protection is running.
+	a.applyMLSettingsToDetectionServiceLocked()
+
+	log.Printf("[GUI] ML model loaded: %s (ONNX, 14 features)", modelName)
+
+	return models.OperationResult{
+		Success: true,
+		Message: "Model loaded: " + modelName,
+	}
+}
+
+// UnloadMLModel closes the ONNX session and clears the loaded model.
+func (a *App) UnloadMLModel() models.OperationResult {
+	a.mlMux.Lock()
+	defer a.mlMux.Unlock()
+
+	if a.mlPredictor != nil {
+		a.mlPredictor.Close()
+		a.mlPredictor = nil
+	}
+
+	// Disconnect from detection service
+	if a.detectionService != nil {
+		a.detectionService.SetMLPredictor(nil)
+		a.detectionService.SetMLEnabled(false)
+	}
+
+	a.mlModelStatus = models.MLModelStatus{}
+
+	log.Println("[GUI] ML model unloaded")
+
+	return models.OperationResult{
+		Success: true,
+		Message: "Model unloaded successfully",
+	}
+}
+
+// applyMLSettingsToDetectionServiceLocked forwards ML predictor/settings/callback into the running detection service.
+// Caller must hold a.mlMux (read or write).
+func (a *App) applyMLSettingsToDetectionServiceLocked() {
+	if a.detectionService == nil {
+		return
+	}
+
+	a.detectionService.SetMLPredictor(a.mlPredictor)
+	a.detectionService.SetMLEnabled(a.mlModelStatus.Enabled)
+	a.detectionService.SetMLConfidence(a.mlModelStatus.ConfidenceThreshold)
+	a.detectionService.SetMLPredictionCallback(func(activity *domain.MLInferenceActivity) {
+		if activity == nil || a.eventEmitter == nil {
+			return
+		}
+		a.eventEmitter.EmitMLPrediction(a.mlPredictionVMFromActivity(activity))
+	})
+}
+
+func (a *App) mlPredictionVMFromActivity(activity *domain.MLInferenceActivity) models.MLPredictionVM {
+	processName := "UNKNOWN"
+	processID := activity.ProcessID
+	label := "unknown"
+	confidence := 0.0
+	probabilities := [3]float64{}
+	timestamp := activity.Timestamp
+
+	if strings.TrimSpace(activity.Image) != "" {
+		processName = filepath.Base(activity.Image)
+	}
+
+	if pred := activity.Prediction; pred != nil {
+		if strings.TrimSpace(pred.Image) != "" {
+			processName = filepath.Base(pred.Image)
+		}
+		processID = pred.ProcessID
+		if strings.TrimSpace(pred.LabelName) != "" {
+			label = pred.LabelName
+		}
+		confidence = pred.Confidence
+		probabilities = pred.Probabilities
+		if timestamp.IsZero() {
+			timestamp = pred.Timestamp
+		}
+	}
+
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	return models.MLPredictionVM{
+		ProcessName:         processName,
+		ProcessID:           processID,
+		Label:               label,
+		Confidence:          confidence,
+		Probabilities:       probabilities,
+		Stage:               activity.Stage,
+		Reason:              activity.Reason,
+		Decision:            activity.Decision,
+		DecisionCategory:    activity.DecisionCategory,
+		DecisionScore:       activity.DecisionScore,
+		DecisionAutoRespond: activity.DecisionAutoRespond,
+		Threshold:           activity.Threshold,
+		ModeEnabled:         activity.ModeEnabled,
+		PredictorReady:      activity.PredictorReady,
+		Error:               activity.Error,
+		Timestamp:           timestamp.Format(time.RFC3339),
+	}
+}
+
+// GetMLModelStatus returns current ML model info
+func (a *App) GetMLModelStatus() models.MLModelStatus {
+	a.mlMux.RLock()
+	defer a.mlMux.RUnlock()
+	return a.mlModelStatus
+}
+
+// SetMLDetectionEnabled toggles ML-based detection
+func (a *App) SetMLDetectionEnabled(enabled bool) models.OperationResult {
+	a.mlMux.Lock()
+	defer a.mlMux.Unlock()
+
+	if !a.mlModelStatus.Loaded && enabled {
+		return models.OperationResult{
+			Success: false,
+			Message: "Cannot enable ML detection: no model loaded",
+		}
+	}
+
+	a.mlModelStatus.Enabled = enabled
+
+	// Forward to detection service
+	if a.detectionService != nil {
+		a.detectionService.SetMLEnabled(enabled)
+	}
+
+	log.Printf("[GUI] ML detection enabled: %v", enabled)
+
+	status := "disabled"
+	if enabled {
+		status = "enabled"
+	}
+	return models.OperationResult{
+		Success: true,
+		Message: fmt.Sprintf("ML detection %s", status),
+	}
+}
+
+// SetMLConfidenceThreshold sets the ML confidence threshold
+func (a *App) SetMLConfidenceThreshold(threshold float64) models.OperationResult {
+	a.mlMux.Lock()
+	defer a.mlMux.Unlock()
+
+	if threshold < 0.0 || threshold > 1.0 {
+		return models.OperationResult{
+			Success: false,
+			Message: "Threshold must be between 0.0 and 1.0",
+		}
+	}
+
+	a.mlModelStatus.ConfidenceThreshold = threshold
+
+	// Forward to detection service
+	if a.detectionService != nil {
+		a.detectionService.SetMLConfidence(threshold)
+	}
+
+	return models.OperationResult{
+		Success: true,
+		Message: fmt.Sprintf("Confidence threshold set to %.2f", threshold),
+	}
+}
+
+// SetDetectionMode sets the detection mode: rules_only, hybrid, or ml_only.
+func (a *App) SetDetectionMode(mode string) models.OperationResult {
+	if mode != "rules_only" && mode != "hybrid" && mode != "ml_only" {
+		return models.OperationResult{
+			Success: false,
+			Message: "Invalid detection mode. Must be rules_only, hybrid, or ml_only",
+		}
+	}
+
+	// hybrid and ml_only require an ML model
+	a.mlMux.RLock()
+	mlLoaded := a.mlModelStatus.Loaded
+	a.mlMux.RUnlock()
+	if (mode == "hybrid" || mode == "ml_only") && !mlLoaded {
+		return models.OperationResult{
+			Success: false,
+			Message: fmt.Sprintf("Cannot set %s mode: no ML model loaded", mode),
+		}
+	}
+
+	if a.detectionService != nil {
+		a.detectionService.SetDetectionMode(mode)
+	}
+
+	// Persist to config
+	if a.responseCfg != nil {
+		a.responseCfg.ResponseSettings.DetectionMode = mode
+	}
+
+	return models.OperationResult{
+		Success: true,
+		Message: fmt.Sprintf("Detection mode set to %s", mode),
+	}
+}
+
+// GetDetectionMode returns the current detection mode.
+func (a *App) GetDetectionMode() string {
+	if a.detectionService != nil {
+		return a.detectionService.GetDetectionMode()
+	}
+	if a.responseCfg != nil && a.responseCfg.ResponseSettings.DetectionMode != "" {
+		return a.responseCfg.ResponseSettings.DetectionMode
+	}
+	return "rules_only"
+}
+
+// SetCanaryResponseAction sets the canary response action: terminate, suspend, or alert_only.
+func (a *App) SetCanaryResponseAction(action string) models.OperationResult {
+	if action != "terminate" && action != "suspend" && action != "alert_only" {
+		return models.OperationResult{
+			Success: false,
+			Message: "Invalid canary response action. Must be terminate, suspend, or alert_only",
+		}
+	}
+
+	if a.detectionService != nil {
+		a.detectionService.SetCanaryResponseAction(action)
+	}
+
+	// Persist to config
+	if a.responseCfg != nil {
+		a.responseCfg.ResponseSettings.CanaryResponseAction = action
+	}
+
+	return models.OperationResult{
+		Success: true,
+		Message: fmt.Sprintf("Canary response action set to %s", action),
+	}
+}
+
+// GetCanaryResponseAction returns the current canary response action.
+func (a *App) GetCanaryResponseAction() string {
+	if a.detectionService != nil {
+		return a.detectionService.GetCanaryResponseAction()
+	}
+	if a.responseCfg != nil && a.responseCfg.ResponseSettings.CanaryResponseAction != "" {
+		return a.responseCfg.ResponseSettings.CanaryResponseAction
+	}
+	return "terminate"
+}
+
+// SelectMLModelFile opens a file dialog to select an ML model file
+func (a *App) SelectMLModelFile() string {
+	selection, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select ML Model File",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "ML Models", Pattern: "*.onnx;*.pkl;*.joblib;*.pt;*.pth;*.h5"},
+			{DisplayName: "All Files", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		log.Printf("[GUI] File dialog error: %v", err)
+		return ""
+	}
+	return selection
+}
+
 // reportStatistics periodically emits statistics to the frontend
 func (a *App) reportStatistics(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
@@ -367,6 +818,10 @@ func (a *App) reportStatistics(ctx context.Context) {
 		case <-ticker.C:
 			stats := a.GetDashboardStats()
 			a.eventEmitter.EmitStatsUpdate(stats)
+
+			// Emit threat updates
+			threats := a.GetActiveThreats()
+			a.eventEmitter.EmitThreatUpdate(threats)
 		}
 	}
 }
