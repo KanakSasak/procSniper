@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,9 @@ type KernelETWConsumer struct {
 	imageCache map[uint32]string
 	imageMux   sync.RWMutex
 
+	// Self-monitoring: our own PID for detecting termination attempts
+	ownPID uint32
+
 	// Stats
 	eventsReceived          uint64
 	eventsDropped           uint64
@@ -161,6 +165,7 @@ func NewKernelETWConsumer(eventProcessor domain.EventProcessor, workerPoolSize i
 		writeDebounce:   make(map[writeDebounceKey]time.Time),
 		imageCache:      make(map[uint32]string),
 		deadProcesses:   make(map[uint32]DeadProcessRecord),
+		ownPID:          uint32(os.Getpid()),
 	}
 }
 
@@ -882,6 +887,56 @@ func (kc *KernelETWConsumer) handleAuditEvent(ctx context.Context, e *etw.Event)
 
 	targetPID := getUint32Prop(props, "TargetProcessId")
 	desiredAccess := getUint32Prop(props, "DesiredAccess")
+
+	// Self-defense: detect when another process tries to open us with dangerous access
+	if targetPID == kc.ownPID {
+		const selfDefenseMask = 0x0001 | // PROCESS_TERMINATE
+			0x0008 | // PROCESS_VM_OPERATION
+			0x0020 | // PROCESS_VM_WRITE
+			0x0800 // PROCESS_SUSPEND_RESUME
+
+		if (desiredAccess & selfDefenseMask) != 0 {
+			sourcePID := e.Header.ProcessID
+			sourceImage := kc.lookupProcessImage(sourcePID)
+
+			// Skip known system processes that legitimately access us
+			skipSelf := false
+			if sourceImage != "" {
+				lower := strings.ToLower(sourceImage)
+				skipSelf = strings.Contains(lower, "csrss.exe") ||
+					strings.Contains(lower, "svchost.exe") ||
+					strings.Contains(lower, "services.exe") ||
+					strings.Contains(lower, "wininit.exe") ||
+					strings.Contains(lower, "smss.exe")
+			}
+
+			if !skipSelf {
+				log.Printf("[SELF-DEFENSE] Termination attempt detected! Source PID: %d, Image: %s, Access: 0x%X",
+					sourcePID, sourceImage, desiredAccess)
+
+				processGuid := kc.lookupProcessGuid(sourcePID)
+				parentPID := resolveParentPID(sourcePID)
+				ownImage := kc.lookupProcessImage(kc.ownPID)
+
+				event := &domain.MonitorEvent{
+					EventID:       10,
+					Timestamp:     e.Header.TimeStamp,
+					Computer:      getHostname(),
+					ProcessGuid:   processGuid,
+					ProcessID:     int(sourcePID),
+					Image:         sourceImage,
+					TargetImage:   ownImage,
+					GrantedAccess: fmt.Sprintf("0x%X", desiredAccess),
+					RawData: map[string]interface{}{
+						"parent_process_id": parentPID,
+						"self_defense":      true,
+					},
+				}
+				kc.enqueueEvent(ctx, event)
+			}
+		}
+		return // Our PID is not LSASS, no need to check further
+	}
 
 	// Filter: only care about LSASS access
 	kc.lsassMux.RLock()

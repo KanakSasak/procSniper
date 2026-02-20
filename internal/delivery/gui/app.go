@@ -212,6 +212,12 @@ func (a *App) StartProtection() models.OperationResult {
 	// Start alert streaming to frontend
 	go a.streamAlerts(ctx)
 
+	// Harden all current OS threads (must run after goroutines are started)
+	if err := infrastructure.ProtectCurrentThreads(); err != nil {
+		log.Printf("[GUI] WARNING: Failed to enable thread protection: %v", err)
+	}
+	go infrastructure.StartPeriodicThreadProtection(ctx)
+
 	log.Println("[GUI] Protection started successfully")
 
 	return models.OperationResult{

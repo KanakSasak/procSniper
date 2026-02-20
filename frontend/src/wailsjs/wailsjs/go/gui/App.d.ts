@@ -7,9 +7,13 @@ export function ClearLogs():Promise<void>;
 
 export function GetActiveThreats():Promise<Array<models.ThreatViewModel>>;
 
+export function GetCanaryResponseAction():Promise<string>;
+
 export function GetConfiguration():Promise<models.ConfigViewModel>;
 
 export function GetDashboardStats():Promise<models.DashboardStats>;
+
+export function GetDetectionMode():Promise<string>;
 
 export function GetEntropyStats():Promise<models.EntropyStatsVM>;
 
@@ -24,6 +28,10 @@ export function LoadMLModel(arg1:string):Promise<models.OperationResult>;
 export function SaveConfiguration(arg1:models.ConfigViewModel):Promise<models.OperationResult>;
 
 export function SelectMLModelFile():Promise<string>;
+
+export function SetCanaryResponseAction(arg1:string):Promise<models.OperationResult>;
+
+export function SetDetectionMode(arg1:string):Promise<models.OperationResult>;
 
 export function SetMLConfidenceThreshold(arg1:number):Promise<models.OperationResult>;
 

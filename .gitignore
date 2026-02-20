@@ -17,6 +17,7 @@ build/
 /logs/
 procsniper_*.log
 
+/docs
 
 # ML workspace directories
 /ml/

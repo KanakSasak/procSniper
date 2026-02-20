@@ -308,6 +308,12 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	stopStats := make(chan struct{})
 	go reportStatistics(ctx, etwConsumer, responseOrchestrator, detectionService, stopStats)
 
+	// Harden all current OS threads (must run after goroutines are started)
+	if err := infrastructure.ProtectCurrentThreads(); err != nil {
+		log.Printf("[!] WARNING: Failed to enable thread protection: %v", err)
+	}
+	go infrastructure.StartPeriodicThreadProtection(ctx)
+
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)

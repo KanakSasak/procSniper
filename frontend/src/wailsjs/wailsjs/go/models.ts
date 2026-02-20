@@ -46,6 +46,8 @@ export namespace models {
 	    immediateResponse: boolean;
 	    terminateOnExtensionMatch: boolean;
 	    suspendBeforeTerminate: boolean;
+	    detectionMode: string;
+	    canaryResponseAction: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ResponseSettingsVM(source);
@@ -61,6 +63,8 @@ export namespace models {
 	        this.immediateResponse = source["immediateResponse"];
 	        this.terminateOnExtensionMatch = source["terminateOnExtensionMatch"];
 	        this.suspendBeforeTerminate = source["suspendBeforeTerminate"];
+	        this.detectionMode = source["detectionMode"];
+	        this.canaryResponseAction = source["canaryResponseAction"];
 	    }
 	}
 	export class DetectionThresholdsVM {
@@ -222,7 +226,7 @@ export namespace models {
 	    points: number;
 	    description: string;
 	    timestamp: string;
-	    evidence: {[key: string]: string};
+	    evidence: Record<string, string>;
 	
 	    static createFrom(source: any = {}) {
 	        return new IndicatorVM(source);

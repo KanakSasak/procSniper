@@ -10,12 +10,20 @@ export function GetActiveThreats() {
   return window['go']['gui']['App']['GetActiveThreats']();
 }
 
+export function GetCanaryResponseAction() {
+  return window['go']['gui']['App']['GetCanaryResponseAction']();
+}
+
 export function GetConfiguration() {
   return window['go']['gui']['App']['GetConfiguration']();
 }
 
 export function GetDashboardStats() {
   return window['go']['gui']['App']['GetDashboardStats']();
+}
+
+export function GetDetectionMode() {
+  return window['go']['gui']['App']['GetDetectionMode']();
 }
 
 export function GetEntropyStats() {
@@ -44,6 +52,14 @@ export function SaveConfiguration(arg1) {
 
 export function SelectMLModelFile() {
   return window['go']['gui']['App']['SelectMLModelFile']();
+}
+
+export function SetCanaryResponseAction(arg1) {
+  return window['go']['gui']['App']['SetCanaryResponseAction'](arg1);
+}
+
+export function SetDetectionMode(arg1) {
+  return window['go']['gui']['App']['SetDetectionMode'](arg1);
 }
 
 export function SetMLConfidenceThreshold(arg1) {
