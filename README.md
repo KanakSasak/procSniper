@@ -93,6 +93,13 @@ Recommended model for current ops examples:
 | `stealer` | `STEALER` | 30 | alert-only |
 | `benign` | none | 0 | no ML decision alert |
 
+### Tested ransomware results
+
+| Family | `ml_only` | `hybrid` |
+|---|---|---|
+| `conti` | detected but not terminated | terminated |
+| `lockbit` | terminated | terminated |
+
 Canary response policy controls:
 - `terminate`
 - `suspend`
