@@ -2,6 +2,9 @@
 
 Windows real-time behavioral ransomware detection and response for defenders who need deterministic, low-latency decisions on high-volume endpoint telemetry.
 
+![ProcSniper Dashboard Protection](screenshots/dashboard-gui.png)
+![ProcSniper Dashboard Protection](screenshots/dashboard-gui-config.png)
+
 ## Abstract
 
 Ransomware defense is not only a classification problem. It is a timing problem where detection quality and response latency must hold under noisy, bursty endpoint telemetry, because delayed confidence often means delayed containment.
@@ -14,7 +17,10 @@ The current recommended model line (v2) is a 2-class ONNX model (`benign`, `rans
 
 For defenders, this translates into practical host-level disruption capability with explicit tradeoff controls: real-time behavioral monitoring, configurable `rules_only`/`hybrid`/`ml_only` operation, canary-backed response actions, and clear operational boundaries around low-and-slow campaigns, network-only visibility gaps, and kernel- or firmware-level threats outside current userland scope.
 
+
 ## Why ML + Hybrid Mode
+
+![ProcSniper Machine Learning](screenshots/procSniper-gui-ml.png)
 
 `hybrid` mode exists for teams that want ML augmentation without giving up deterministic rule-path alerts.
 
