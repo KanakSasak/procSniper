@@ -40,7 +40,7 @@ func main() {
 	}
 
 	log.Println("╔════════════════════════════════════════════════════════════╗")
-	log.Println("║                    procSniper v1.0                         ║")
+	log.Println("║                    procSniper v2.0                         ║")
 	log.Println("║         Real-Time Ransomware & Stealer Detection           ║")
 	log.Println("╚════════════════════════════════════════════════════════════╝")
 	log.Println()
@@ -463,7 +463,7 @@ func showConfiguration(responseCfg *config.ResponseConfig) {
 
 // showVersion displays version information
 func showVersion() {
-	fmt.Println("procSniper v1.0")
+	fmt.Println("procSniper v2.0")
 	fmt.Println("Real-Time Ransomware & Information Stealer Detection")
 	fmt.Println()
 	fmt.Println("Features:")

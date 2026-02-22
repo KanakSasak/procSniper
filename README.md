@@ -37,6 +37,9 @@ Important behavior:
 
 ## Detection and Decision Pipeline
 
+![ProcSniper Dashboard Protection](screenshots/dashboard-gui-detect-ransom.png)
+![ProcSniper Dashboard Protection](screenshots/dashboard-gui-threat.png)
+
 Pipeline stages:
 1. Kernel ETW stream captures process and file activity in near real time.
 2. Security log consumer correlates suspicious privilege/API patterns (for example backup API abuse workflows).
@@ -105,6 +108,7 @@ Recommended model for current ops examples:
 |---|---|---|
 | `conti` | detected but not terminated | terminated |
 | `lockbit` | terminated | terminated |
+| `lockbit 5` | detected but not terminated | terminated |
 
 Canary response policy controls:
 - `terminate`
