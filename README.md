@@ -5,6 +5,10 @@ Windows real-time behavioral ransomware detection and response for defenders who
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui.png)
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui-config.png)
 
+
+## Lockbit 5 Process Termination
+[![ProcSniper Demo](https://img.youtube.com/vi/psglMKYYdm0/0.jpg)](https://youtu.be/psglMKYYdm0)
+
 ## Abstract
 
 Ransomware defense is not only a classification problem. It is a timing problem where detection quality and response latency must hold under noisy, bursty endpoint telemetry, because delayed confidence often means delayed containment.
