@@ -231,6 +231,66 @@ Threshold note:
 
 
 
+## Wazuh SIEM Integration
+
+![ProcSniper Wazuh Integration](screenshots/procSniper-Wazuh-integration.png)
+
+procSniper forwards all alerts to a remote syslog server in RFC 5424 format, enabling native integration with Wazuh and other SIEMs.
+
+### Syslog Configuration
+
+Enable syslog forwarding in `config/ransomware_extensions.json`:
+
+```json
+"alert_settings": {
+    "send_syslog": true,
+    "syslog_server": "192.168.1.100",
+    "syslog_port": 514,
+    "syslog_protocol": "udp",
+    "syslog_facility": 20,
+    "syslog_tag": "procSniper",
+    "verbose_logging": true
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `send_syslog` | `false` | Enable/disable syslog forwarding |
+| `syslog_server` | `""` | Syslog server IP or hostname |
+| `syslog_port` | `514` | Syslog destination port |
+| `syslog_protocol` | `"udp"` | Transport protocol (`udp` or `tcp`) |
+| `syslog_facility` | `20` | RFC 5424 facility code (20 = Local4) |
+| `syslog_tag` | `"procSniper"` | APP-NAME in syslog header |
+
+### Wazuh Decoder
+
+Add the following decoder to `/var/ossec/etc/decoders/procsniper_decoder.xml`:
+
+
+### Wazuh Rules
+
+Add custom rules to `/var/ossec/etc/rules/procsniper_rules.xml`:
+
+### Wazuh Agent Configuration
+
+On the Windows agent running procSniper, add the syslog listener to `/var/ossec/etc/ossec.conf` (or configure Wazuh manager to receive syslog directly):
+
+```xml
+<ossec_config>
+  <remote>
+    <connection>syslog</connection>
+    <port>514</port>
+    <protocol>udp</protocol>
+  </remote>
+</ossec_config>
+```
+
+Restart the Wazuh manager after adding decoders and rules:
+
+```bash
+systemctl restart wazuh-manager
+```
+
 ## Limitations
 
 - Low-and-slow campaigns can delay signal accumulation and ML gate readiness.

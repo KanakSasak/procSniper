@@ -1,0 +1,23 @@
+<!-- Modify it at your will. -->
+<group name="procsniper, ransomware,">
+    
+    <rule id="100010" level="3">
+      <decoded_as>procsniper</decoded_as>
+      <description>procSniper: Security event detected.</description>
+    </rule>
+
+    <rule id="100011" level="8">
+      <if_sid>100010</if_sid>
+      <field name="category">RANSOMWARE</field>
+      <field name="severity">MEDIUM</field>
+      <description>procSniper: Medium severity ransomware behavior - $(message)</description>
+    </rule>
+
+    <rule id="100012" level="12">
+      <if_sid>100010</if_sid>
+      <field name="category">RANSOMWARE</field>
+      <field name="severity">CRITICAL</field>
+      <description>procSniper: CRITICAL ransomware behavior detected - $(image)</description>
+    </rule>
+
+</group>

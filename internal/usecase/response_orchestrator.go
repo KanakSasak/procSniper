@@ -31,6 +31,7 @@ type ResponseOrchestrator struct {
 	recentSuspends   map[uint32]time.Time
 	recentSuspendTTL time.Duration
 	terminationSink  ProcessTerminationSink
+	syslogClient     *infrastructure.SyslogClient
 
 	// Statistics
 	stats struct {
@@ -50,7 +51,7 @@ func NewResponseOrchestrator(
 	responseActions *infrastructure.ResponseActions,
 	responseConfig *config.ResponseConfig,
 ) *ResponseOrchestrator {
-	return &ResponseOrchestrator{
+	ro := &ResponseOrchestrator{
 		detectionService: detectionService,
 		responseActions:  responseActions,
 		responseConfig:   responseConfig,
@@ -60,6 +61,28 @@ func NewResponseOrchestrator(
 		recentSuspends:   make(map[uint32]time.Time),
 		recentSuspendTTL: 30 * time.Second,
 	}
+
+	// Initialize syslog client if enabled
+	if responseConfig.AlertSettings.SendSyslog && responseConfig.AlertSettings.SyslogServer != "" {
+		syslogCfg := infrastructure.SyslogConfig{
+			Server:   responseConfig.AlertSettings.SyslogServer,
+			Port:     responseConfig.AlertSettings.SyslogPort,
+			Protocol: responseConfig.AlertSettings.SyslogProtocol,
+			Facility: infrastructure.SyslogFacility(responseConfig.AlertSettings.SyslogFacility),
+			Tag:      responseConfig.AlertSettings.SyslogTag,
+		}
+		client, err := infrastructure.NewSyslogClient(syslogCfg)
+		if err != nil {
+			log.Printf("[!] WARNING: Failed to initialize syslog client: %v", err)
+			log.Println("[!] Syslog forwarding will be disabled")
+		} else {
+			ro.syslogClient = client
+			log.Printf("[+] Syslog client initialized: %s:%d (%s)",
+				syslogCfg.Server, syslogCfg.Port, syslogCfg.Protocol)
+		}
+	}
+
+	return ro
 }
 
 // Start begins processing alerts and executing automated responses
@@ -124,6 +147,12 @@ func (ro *ResponseOrchestrator) Stop() {
 	log.Printf("    - Related suspends failed: %d\n", ro.stats.relatedSuspendFailed)
 	ro.mu.RUnlock()
 
+	// Close syslog connection
+	if ro.syslogClient != nil {
+		ro.syslogClient.Close()
+		log.Println("[*] Syslog client closed")
+	}
+
 	log.Println("[+] Response orchestrator stopped")
 }
 
@@ -160,6 +189,9 @@ func (ro *ResponseOrchestrator) processAlert(ctx context.Context, alert *domain.
 
 	// Log alert
 	ro.logAlert(alert)
+
+	// Forward to syslog if configured
+	ro.sendSyslogAlert(alert)
 
 	// Check if auto-response should be triggered
 	extensionMatch := ro.hasRansomwareExtension(alert)
@@ -472,6 +504,23 @@ func (ro *ResponseOrchestrator) logAlert(alert *domain.Alert) {
 		}
 	}
 	log.Println()
+}
+
+// sendSyslogAlert forwards an alert to the remote syslog server.
+// Failures are logged but never block alert processing.
+func (ro *ResponseOrchestrator) sendSyslogAlert(alert *domain.Alert) {
+	if ro.syslogClient == nil {
+		return
+	}
+	if err := ro.syslogClient.SendAlert(alert); err != nil {
+		log.Printf("[!] Syslog send failed: %v", err)
+	}
+}
+
+// ForwardAlertToSyslog sends an alert to syslog without processing it for response.
+// Used by GUI mode where alerts are split between orchestrator and frontend stream.
+func (ro *ResponseOrchestrator) ForwardAlertToSyslog(alert *domain.Alert) {
+	ro.sendSyslogAlert(alert)
 }
 
 // GetStats returns orchestrator statistics

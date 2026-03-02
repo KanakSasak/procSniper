@@ -1,0 +1,9 @@
+<decoder name="procsniper">
+    <prematch>procSniper</prematch>
+</decoder>
+
+<decoder name="procsniper_fields">
+    <parent>procsniper</parent>
+    <regex type="pcre2">category="([^"]+)" severity="([^"]+)" score="([^"]+)" pid="([^"]+)" processGuid="([^"]+)" image="([^"]+)".*?\]\s+(.*)</regex>
+    <order>category, severity, score, pid, processGuid, image, message</order>
+</decoder>

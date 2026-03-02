@@ -115,6 +115,10 @@
     "send_email_alerts": false,
     "send_syslog": false,
     "syslog_server": "",
+    "syslog_port": 514,
+    "syslog_protocol": "udp",
+    "syslog_facility": 20,
+    "syslog_tag": "procSniper",
     "verbose_logging": true
   },
 

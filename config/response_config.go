@@ -65,6 +65,10 @@ type AlertConfig struct {
 	SendEmailAlerts bool   `json:"send_email_alerts"`
 	SendSyslog      bool   `json:"send_syslog"`
 	SyslogServer    string `json:"syslog_server"`
+	SyslogPort      int    `json:"syslog_port"`
+	SyslogProtocol  string `json:"syslog_protocol"`
+	SyslogFacility  int    `json:"syslog_facility"`
+	SyslogTag       string `json:"syslog_tag"`
 	VerboseLogging  bool   `json:"verbose_logging"`
 }
 
@@ -116,6 +120,20 @@ func LoadResponseConfig(configPath string) (*ResponseConfig, error) {
 	}
 	if config.ResponseSettings.RelatedActorWindowSeconds <= 0 {
 		config.ResponseSettings.RelatedActorWindowSeconds = 60
+	}
+
+	// Syslog defaults
+	if config.AlertSettings.SyslogPort <= 0 {
+		config.AlertSettings.SyslogPort = 514
+	}
+	if config.AlertSettings.SyslogProtocol == "" {
+		config.AlertSettings.SyslogProtocol = "udp"
+	}
+	if config.AlertSettings.SyslogFacility <= 0 {
+		config.AlertSettings.SyslogFacility = 20 // Local4
+	}
+	if config.AlertSettings.SyslogTag == "" {
+		config.AlertSettings.SyslogTag = "procSniper"
 	}
 
 	return &config, nil

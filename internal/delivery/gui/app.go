@@ -854,6 +854,10 @@ func (a *App) streamAlerts(ctx context.Context) {
 				return
 			}
 			a.eventEmitter.EmitAlert(models.AlertFromDomain(alert))
+			// Forward to syslog (alerts are split between orchestrator and GUI stream)
+			if a.responseOrchestrator != nil {
+				a.responseOrchestrator.ForwardAlertToSyslog(alert)
+			}
 		}
 	}
 }
