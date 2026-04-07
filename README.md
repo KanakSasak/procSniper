@@ -1,62 +1,63 @@
 # procSniper
 
-Windows real-time behavioral ransomware detection and response for defenders who need deterministic, low-latency decisions on high-volume endpoint telemetry.
+Windows real-time ransomware prevention powered by local ML inference. Deterministic, low-latency behavioral analysis and autonomous response — all on-host, no cloud dependency.
 
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui.png)
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui-config.png)
 
 
-## Lockbit 5 Process Termination
+## Lockbit 5 Prevention Demo
 [![ProcSniper Demo](https://img.youtube.com/vi/psglMKYYdm0/0.jpg)](https://youtu.be/psglMKYYdm0)
 
 ## Abstract
 
-Ransomware defense is not only a classification problem. It is a timing problem where detection quality and response latency must hold under noisy, bursty endpoint telemetry, because delayed confidence often means delayed containment.
+Ransomware prevention is a timing problem. Once encryption begins, every millisecond of delayed response means more files lost. Effective prevention requires real-time behavioral analysis with autonomous response — not post-incident detection.
 
-procSniper is a Go-based Windows defensive system that combines rule correlation and compact machine learning for inline decisioning. The runtime ingests kernel ETW process and file activity, correlates Windows Security log signals for privilege and API abuse patterns, and continuously accumulates per-process behavioral state. Instead of relying on heavyweight generative pipelines for first-line response, procSniper uses a fixed 14-feature vector and ONNX inference to keep decision paths predictable, auditable, and operationally bounded.
+procSniper is a Go-based Windows prevention system that runs local ML inference to stop ransomware before it completes its encryption cycle. The runtime ingests kernel ETW process and file activity, correlates Windows Security log signals for privilege and API abuse patterns, and continuously accumulates per-process behavioral state. A compact ONNX model running entirely on-host evaluates a fixed 14-feature vector to make sub-second prevention decisions — no cloud round-trips, no data leaving the endpoint, no latency from external inference pipelines.
 
-The detection architecture is mode-aware. In `rules_only`, threat scoring and rule indicators drive alerts and response policy. In `hybrid`, rule-path alerts remain active while ML inference is added after feature-gate conditions are met. In `ml_only`, rule indicators continue to accumulate as ML features, but rule-based fallback alerts are intentionally disabled, making ML the sole decision path once gate and threshold requirements are satisfied.
+The prevention architecture is mode-aware. In `rules_only`, threat scoring and rule indicators drive alerts and response policy. In `hybrid`, rule-path alerts remain active while ML inference is added after feature-gate conditions are met. In `ml_only`, rule indicators continue to accumulate as ML features, but rule-based fallback alerts are intentionally disabled, making ML the sole decision path once gate and threshold requirements are satisfied.
 
 The current recommended model line (v2) is a 2-class ONNX model (`benign`, `ransomware`) with repository-tracked threshold guidance (`0.08`) and quality artifacts in `ml-2/models/model_metadata.json` and `ml-2/models/procsniper_rf_ml2_v2_quality_report.md`. Reported validation and test results show high ransomware recall with bounded benign false-positive rate under the project evaluation setup, but these numbers are evaluation-context results rather than universal guarantees; deployment outcomes still depend on dataset representativeness, threshold calibration, and attacker adaptation.
 
-For defenders, this translates into practical host-level disruption capability with explicit tradeoff controls: real-time behavioral monitoring, configurable `rules_only`/`hybrid`/`ml_only` operation, canary-backed response actions, and clear operational boundaries around low-and-slow campaigns, network-only visibility gaps, and kernel- or firmware-level threats outside current userland scope.
+For defenders, this translates into practical host-level prevention capability with explicit tradeoff controls: real-time behavioral monitoring, local ML inference for autonomous process termination and suspension, configurable `rules_only`/`hybrid`/`ml_only` operation, canary-backed response actions, and clear operational boundaries around low-and-slow campaigns, network-only visibility gaps, and kernel- or firmware-level threats outside current userland scope.
 
 
-## Why ML + Hybrid Mode
+## Why Local ML Inference + Hybrid Mode
 
 ![ProcSniper Machine Learning](screenshots/procSniper-gui-ml.png)
 
-`hybrid` mode exists for teams that want ML augmentation without giving up deterministic rule-path alerts.
+Local ML inference is the core of procSniper's prevention capability. The ONNX model runs entirely on-host with zero cloud dependency, enabling sub-second autonomous response. `hybrid` mode exists for teams that want ML-driven prevention without giving up deterministic rule-path alerts.
 
 | Mode | Primary decision path | Rule fallback behavior | Typical use |
 |---|---|---|---|
-| `rules_only` | Rule indicators and threat scoring | Not applicable | Baseline deterministic deployment |
-| `hybrid` | Rules plus ML inference after gate passes | Rule alerts still emit when ML does not decide | Balanced rollout and analyst visibility |
-| `ml_only` | ML is sole decision-maker after gate passes | No rule-based fallback alerts | Research-tuned ML-first operation |
+| `rules_only` | Rule indicators and threat scoring | Not applicable | Baseline deterministic prevention |
+| `hybrid` | Rules plus local ML inference after gate passes | Rule alerts still emit when ML does not decide | Balanced prevention with analyst visibility |
+| `ml_only` | ML is sole decision-maker after gate passes | No rule-based fallback alerts | ML-first autonomous prevention |
 
 Important behavior:
 - With `--ml` and no explicit mode, CLI defaults to `ml_only`.
 - Without `--ml`, mode falls back to configured mode, otherwise `rules_only`.
 - `hybrid` and `ml_only` require `--ml <model_path>`.
 
-## Detection and Decision Pipeline
+## Prevention Pipeline
 
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui-detect-ransom.png)
 ![ProcSniper Dashboard Protection](screenshots/dashboard-gui-threat.png)
 
-Pipeline stages:
-1. Kernel ETW stream captures process and file activity in near real time.
-2. Security log consumer correlates suspicious privilege/API patterns (for example backup API abuse workflows).
-3. Rule indicators accumulate threat context (velocity, entropy, extension behavior, privilege abuse, canary compromise).
-4. Feature extraction builds a fixed 14-dimensional vector per process.
-5. ML gate checks minimum non-zero feature count (`--ml-min-indicators`) before inference.
-6. ONNX inference evaluates malicious probability and class label.
-7. Mode-aware decisioning emits alerts and response actions (`terminate`, `suspend`, `alert_only`) based on category and policy.
+The prevention pipeline is designed to stop ransomware before it completes its encryption cycle:
+
+1. **Kernel ETW stream** captures process and file activity in near real time.
+2. **Security log consumer** correlates suspicious privilege/API patterns (for example backup API abuse workflows).
+3. **Rule indicators** accumulate threat context (velocity, entropy, extension behavior, privilege abuse, canary compromise).
+4. **Feature extraction** builds a fixed 14-dimensional vector per process.
+5. **ML gate** checks minimum non-zero feature count (`--ml-min-indicators`) before inference.
+6. **Local ONNX inference** evaluates malicious probability and class label entirely on-host.
+7. **Autonomous response** terminates or suspends malicious processes based on category and policy — preventing further damage.
 
 Canary role:
-- Canary compromise remains a high-confidence signal and can trigger immediate response depending on `--canary-response` or config settings.
+- Canary compromise remains a high-confidence prevention signal and can trigger immediate autonomous response (terminate/suspend) depending on `--canary-response` or config settings.
 
-## Machine Learning Approach
+## Local ML Inference Engine
 
 Feature contract:
 - Runtime and model use a fixed 14-feature vector.
@@ -88,15 +89,15 @@ Recommended model for current ops examples:
 - `models/procsniper_rf_ml2_v2.onnx`
 
 
-## Detection Modes and Response Semantics
+## Prevention Modes and Response Semantics
 
 ### Mode semantics
 
-| Mode | Rule indicator accumulation | ML inference | Rule alert emission |
+| Mode | Rule indicator accumulation | Local ML inference | Prevention behavior |
 |---|---|---|---|
-| `rules_only` | Yes | No | Yes (ThreatMedium and above) |
-| `hybrid` | Yes | Yes, after gate passes | Yes, including fallback when ML does not decide |
-| `ml_only` | Yes (as ML feature source) | Yes, after gate passes | No rule-based fallback alerts |
+| `rules_only` | Yes | No | Rule-driven alerts and response (ThreatMedium and above) |
+| `hybrid` | Yes | Yes, after gate passes | ML prevention + rule fallback when ML does not decide |
+| `ml_only` | Yes (as ML feature source) | Yes, after gate passes | ML-only autonomous prevention |
 
 ### ML decision mapping
 
@@ -106,13 +107,13 @@ Recommended model for current ops examples:
 | `stealer` | `STEALER` | 30 | alert-only |
 | `benign` | none | 0 | no ML decision alert |
 
-### Tested ransomware results
+### Tested ransomware prevention results
 
 | Family | `ml_only` | `hybrid` |
 |---|---|---|
-| `conti` | detected but not terminated | terminated |
-| `lockbit` | terminated | terminated |
-| `lockbit 5` | detected but not terminated | terminated |
+| `conti` | flagged | prevented (terminated) |
+| `lockbit` | prevented (terminated) | prevented (terminated) |
+| `lockbit 5` | flagged | prevented (terminated) |
 
 Canary response policy controls:
 - `terminate`
@@ -235,7 +236,7 @@ Threshold note:
 
 ![ProcSniper Wazuh Integration](screenshots/procSniper-Wazuh-integration.png)
 
-procSniper forwards all alerts to a remote syslog server in RFC 5424 format, enabling native integration with Wazuh and other SIEMs.
+procSniper forwards all prevention alerts to a remote syslog server in RFC 5424 format, enabling native integration with Wazuh and other SIEMs for centralized visibility into prevention actions across endpoints.
 
 ### Syslog Configuration
 
@@ -293,23 +294,23 @@ systemctl restart wazuh-manager
 
 ## Limitations
 
-- Low-and-slow campaigns can delay signal accumulation and ML gate readiness.
-- This architecture focuses on host behavior and does not provide dedicated network IDS coverage.
-- Kernel-mode, boot-level, and firmware-resident threats are outside current userland scope.
-- Model quality depends on dataset representativeness, environment drift, and threshold maintenance.
+- Low-and-slow campaigns can delay signal accumulation and ML gate readiness, potentially delaying prevention response.
+- This architecture focuses on host-level behavioral prevention and does not provide dedicated network IDS coverage.
+- Kernel-mode, boot-level, and firmware-resident threats are outside current userland prevention scope.
+- Local ML model quality depends on dataset representativeness, environment drift, and threshold maintenance.
 - Some optional integration-quality workflows rely on datasets that are not bundled in this repository by default.
 
 ## Responsible Use
 
-procSniper is a defensive security tool intended for authorized systems, research labs, and controlled exercises.
+procSniper is a defensive ransomware prevention tool intended for authorized systems, research labs, and controlled exercises.
 
 Do not use this project for unauthorized monitoring, unauthorized response actions, or illegal activity.
 
 ## Contributing
 
 High-impact contribution areas:
-- ML quality validation and reproducibility hardening
-- False-positive reduction and threshold calibration
-- Hybrid-mode explainability and observability improvements
-- Runtime performance and telemetry pipeline efficiency
+- ML model quality validation and reproducibility hardening
+- False-positive reduction and prevention threshold calibration
+- Hybrid-mode explainability and prevention observability improvements
+- Local inference performance and telemetry pipeline efficiency
 - Additional safe testing and replay tooling for defender workflows
