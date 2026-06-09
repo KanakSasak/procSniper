@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"procSniper/internal/domain"
+	"procSniper/internal/usecase/canary"
 )
 
 // DetectionService orchestrates threat detection and response
@@ -147,16 +148,6 @@ type CanaryActor struct {
 	SeenAt      time.Time
 }
 
-// CanaryCompromiseState tracks latched compromise state to avoid repeated periodic alerts.
-type CanaryCompromiseState struct {
-	FirstSeen             time.Time
-	LastSeen              time.Time
-	CompromiseType        string
-	RelatedPath           string
-	AttributedProcessGuid string
-	Latched               bool
-}
-
 // DetectionService orchestrates threat detection and response
 type DetectionService struct {
 	velocityTracker *domain.FileOperationTracker
@@ -194,9 +185,9 @@ type DetectionService struct {
 	// ETW-attributed recent actors that touched canaries (for periodic scan attribution).
 	recentCanaryActors map[string]CanaryActor // normalized canonical canary path -> actor
 	canaryActorsMux    sync.RWMutex
-	// Latched canary compromises (suppresses periodic repeat alerts for already-compromised canaries).
-	compromisedCanaries map[string]CanaryCompromiseState
-	compromisedMux      sync.RWMutex
+	// Latched canary compromises (suppresses periodic repeat alerts for already-compromised
+	// canaries). Extracted to the canary package (Phase 6 slice 1).
+	canaryLatches *canary.LatchSet
 
 	// Detection thresholds from config
 	entropyFileThreshold   int
@@ -273,7 +264,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		directoryScanInProgress:   make(map[string]bool),                      // Prevent goroutine explosion
 		canaryFiles:               make(map[string]*domain.CanaryFile),        // Honeypot files for detection
 		recentCanaryActors:        make(map[string]CanaryActor),
-		compromisedCanaries:       make(map[string]CanaryCompromiseState),
+		canaryLatches:             canary.NewLatchSet(),
 		entropyFileThreshold:      cfg.EntropyFileThreshold,
 		extensionFileThreshold:    cfg.ExtensionFileThreshold,
 		combinedThreshold:         cfg.CombinedThreshold,
@@ -2259,7 +2250,7 @@ func (ds *DetectionService) emitMLActivity(callback func(*domain.MLInferenceActi
 func (ds *DetectionService) SetupCanaryFiles() error {
 	log.Println("[CANARY] Setting up honeypot files for ransomware detection...")
 	// Full setup resets latch state so recreated canaries can alert again.
-	ds.resetAllCanaryLatches()
+	ds.canaryLatches.ResetAll()
 
 	successCount := 0
 	failCount := 0
@@ -2298,7 +2289,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 				Extension:       location.Extension,
 			}
 			ds.canaryFilesMux.Unlock()
-			ds.resetCanaryLatch(filePath)
+			ds.canaryLatches.Reset(filePath)
 
 			log.Printf("[CANARY] ✓ Tracked existing canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
 			successCount++
@@ -2331,7 +2322,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 			Extension:       location.Extension,
 		}
 		ds.canaryFilesMux.Unlock()
-		ds.resetCanaryLatch(filePath)
+		ds.canaryLatches.Reset(filePath)
 
 		log.Printf("[CANARY] ✓ Created canary: %s (entropy: %.3f, size: %d bytes)",
 			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
@@ -2366,7 +2357,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 				Extension:       location.Extension,
 			}
 			ds.canaryFilesMux.Unlock()
-			ds.resetCanaryLatch(filePath)
+			ds.canaryLatches.Reset(filePath)
 
 			log.Printf("[CANARY] ✓ Tracked existing system canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
 			successCount++
@@ -2399,7 +2390,7 @@ func (ds *DetectionService) SetupCanaryFiles() error {
 			Extension:       location.Extension,
 		}
 		ds.canaryFilesMux.Unlock()
-		ds.resetCanaryLatch(filePath)
+		ds.canaryLatches.Reset(filePath)
 
 		log.Printf("[CANARY] ✓ Created system canary: %s (entropy: %.3f, size: %d bytes)",
 			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
@@ -2425,69 +2416,10 @@ func (ds *DetectionService) isCanaryFile(filePath string) (*domain.CanaryFile, b
 	return canary, exists
 }
 
+// normalizeCanaryPath delegates to the canary package; kept as a thin wrapper so the
+// many in-package callers (matchCanaryPath, recordCanaryActor, ...) stay untouched.
 func normalizeCanaryPath(path string) string {
-	if path == "" {
-		return ""
-	}
-	return strings.ToLower(filepath.Clean(path))
-}
-
-func (ds *DetectionService) resetAllCanaryLatches() {
-	ds.compromisedMux.Lock()
-	defer ds.compromisedMux.Unlock()
-
-	clear(ds.compromisedCanaries)
-}
-
-func (ds *DetectionService) resetCanaryLatch(filePath string) {
-	key := normalizeCanaryPath(filePath)
-	if key == "" {
-		return
-	}
-
-	ds.compromisedMux.Lock()
-	delete(ds.compromisedCanaries, key)
-	ds.compromisedMux.Unlock()
-}
-
-func (ds *DetectionService) shouldEmitCanaryAlert(filePath, compromiseType, relatedPath, attributedProcessGuid string, observedAt time.Time) bool {
-	key := normalizeCanaryPath(filePath)
-	if key == "" {
-		return true
-	}
-
-	if observedAt.IsZero() {
-		observedAt = time.Now()
-	}
-
-	ds.compromisedMux.Lock()
-	defer ds.compromisedMux.Unlock()
-
-	if state, exists := ds.compromisedCanaries[key]; exists && state.Latched {
-		state.LastSeen = observedAt
-		if compromiseType != "" {
-			state.CompromiseType = compromiseType
-		}
-		if relatedPath != "" {
-			state.RelatedPath = relatedPath
-		}
-		if attributedProcessGuid != "" && !strings.EqualFold(attributedProcessGuid, "UNKNOWN") {
-			state.AttributedProcessGuid = attributedProcessGuid
-		}
-		ds.compromisedCanaries[key] = state
-		return false
-	}
-
-	ds.compromisedCanaries[key] = CanaryCompromiseState{
-		FirstSeen:             observedAt,
-		LastSeen:              observedAt,
-		CompromiseType:        compromiseType,
-		RelatedPath:           relatedPath,
-		AttributedProcessGuid: attributedProcessGuid,
-		Latched:               true,
-	}
-
-	return true
+	return canary.NormalizePath(path)
 }
 
 func isRenameMonitorEvent(event *domain.MonitorEvent) bool {
@@ -3195,7 +3127,7 @@ func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseTy
 			image, processID, processGuid, actor.EventType)
 	}
 
-	if !ds.shouldEmitCanaryAlert(filePath, compromiseType, relatedPath, processGuid, time.Now()) {
+	if !ds.canaryLatches.ShouldEmit(filePath, compromiseType, relatedPath, processGuid, time.Now()) {
 		return false
 	}
 
@@ -3287,7 +3219,7 @@ func (ds *DetectionService) CleanupCanaryFiles() {
 	}
 
 	clear(ds.canaryFiles)
-	ds.resetAllCanaryLatches()
+	ds.canaryLatches.ResetAll()
 
 	log.Println("[CANARY] Cleanup complete")
 }
