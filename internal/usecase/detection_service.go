@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"procSniper/internal/domain"
@@ -224,6 +225,12 @@ type DetectionService struct {
 	mlCooldown           time.Duration                     // cooldown between inferences for same process
 	detectionMode        string                            // "rules_only", "hybrid", "ml_only"
 	canaryResponseAction string                            // "terminate", "suspend", "alert_only"
+
+	// Alert-drop accounting (atomic). Dropped alerts were previously log-only and invisible.
+	alertsDropped         uint64 // total alerts dropped because alertChan was full
+	alertsDroppedCritical uint64
+	alertsDroppedHigh     uint64
+	alertsDroppedOther    uint64
 }
 
 // NewDetectionService creates a new detection service
@@ -1831,7 +1838,9 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 		log.Printf("[ALERT] %s - %s (PID: %d, Score: %d, Auto-Respond: %v, Mode: %s)",
 			alert.Severity, alert.Description, pid, score, alert.AutoRespond, mode)
 	default:
-		log.Printf("[WARNING] Alert channel full, dropping alert")
+		ds.recordDroppedAlert(alert.Severity)
+		log.Printf("[WARNING] Alert channel full, dropping alert (severity=%s, total dropped=%d)",
+			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
 }
 
@@ -1909,7 +1918,9 @@ func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction)
 		log.Printf("[ALERT][ML] %s - %s (PID: %d, Score: %d, Auto-Respond: %v)",
 			alert.Severity, alert.Description, alert.ProcessID, alert.Score, alert.AutoRespond)
 	default:
-		log.Printf("[WARNING][ML] Alert channel full, dropping ML alert")
+		ds.recordDroppedAlert(alert.Severity)
+		log.Printf("[WARNING][ML] Alert channel full, dropping ML alert (severity=%s, total dropped=%d)",
+			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
 }
 
@@ -3256,7 +3267,9 @@ func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseTy
 	case ds.alertChan <- alert:
 		log.Printf("[ALERT] Canary compromise alert sent: %s (related suspects: %d)", filePath, len(alert.RelatedProcesses))
 	default:
-		log.Printf("[ALERT] Alert channel full, canary alert dropped")
+		ds.recordDroppedAlert(alert.Severity)
+		log.Printf("[ALERT] Alert channel full, canary alert dropped (severity=%s, total dropped=%d)",
+			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
 
 	return true
@@ -3872,6 +3885,108 @@ func (ds *DetectionService) CleanupOldModifiedFiles(maxAge time.Duration) int {
 	}
 
 	return removed + removedVelocityActors
+}
+
+// recordDroppedAlert increments the total and per-severity alert-drop counters.
+// Alert drops were previously log-only; this makes detection-integrity loss observable.
+func (ds *DetectionService) recordDroppedAlert(sev domain.ThreatLevel) {
+	atomic.AddUint64(&ds.alertsDropped, 1)
+	switch sev {
+	case domain.ThreatCritical:
+		atomic.AddUint64(&ds.alertsDroppedCritical, 1)
+	case domain.ThreatHigh:
+		atomic.AddUint64(&ds.alertsDroppedHigh, 1)
+	default:
+		atomic.AddUint64(&ds.alertsDroppedOther, 1)
+	}
+}
+
+// GetDropStats returns a snapshot of alert-drop counters for statistics reporting.
+func (ds *DetectionService) GetDropStats() map[string]uint64 {
+	return map[string]uint64{
+		"alerts_dropped_total":    atomic.LoadUint64(&ds.alertsDropped),
+		"alerts_dropped_critical": atomic.LoadUint64(&ds.alertsDroppedCritical),
+		"alerts_dropped_high":     atomic.LoadUint64(&ds.alertsDroppedHigh),
+		"alerts_dropped_other":    atomic.LoadUint64(&ds.alertsDroppedOther),
+	}
+}
+
+// StartMaintenance runs periodic eviction of stale per-process detection state to bound
+// memory on long-running agents. Mirrors KernelETWConsumer.cleanupCaches; ctx-cancellable.
+// Without this, fileCounters / monitoredProcesses / analyzedProcesses / mlLastInference /
+// threat scores grow unbounded (one entry per unique ProcessGuid, forever).
+func (ds *DetectionService) StartMaintenance(ctx context.Context) {
+	const (
+		interval = 5 * time.Minute
+		maxAge   = 10 * time.Minute
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("[MAINTENANCE] Started (interval=%s, per-process state TTL=%s)", interval, maxAge)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[MAINTENANCE] Stopped (context cancelled)")
+			return
+		case <-ticker.C:
+			highIO := ds.CleanupOldHighIOFlags(maxAge)
+			modified := ds.CleanupOldModifiedFiles(maxAge)
+			scores := ds.threatScorer.CleanupOldScores(maxAge)
+			procState := ds.cleanupStaleProcessState(maxAge)
+			if highIO+modified+scores+procState > 0 {
+				log.Printf("[MAINTENANCE] Evicted: highIO=%d modified=%d scores=%d procState=%d (alerts dropped lifetime=%d)",
+					highIO, modified, scores, procState, atomic.LoadUint64(&ds.alertsDropped))
+			}
+		}
+	}
+}
+
+// cleanupStaleProcessState evicts the per-process maps that have no other eviction path:
+// monitoredProcesses, analyzedProcesses, fileCounters, mlLastInference. Each is keyed by a
+// per-process-unique ProcessGuid, so without this they leak permanently.
+func (ds *DetectionService) cleanupStaleProcessState(maxAge time.Duration) int {
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+
+	ds.monitoredMux.Lock()
+	for guid, ts := range ds.monitoredProcesses {
+		if ts.Before(cutoff) {
+			delete(ds.monitoredProcesses, guid)
+			removed++
+		}
+	}
+	ds.monitoredMux.Unlock()
+
+	ds.analyzedMux.Lock()
+	for guid, ts := range ds.analyzedProcesses {
+		if ts.Before(cutoff) {
+			delete(ds.analyzedProcesses, guid)
+			removed++
+		}
+	}
+	ds.analyzedMux.Unlock()
+
+	ds.fileCountersMux.Lock()
+	for guid, counters := range ds.fileCounters {
+		if counters != nil && counters.LastUpdated.Before(cutoff) {
+			delete(ds.fileCounters, guid)
+			removed++
+		}
+	}
+	ds.fileCountersMux.Unlock()
+
+	ds.mlMux.Lock()
+	for guid, ts := range ds.mlLastInference {
+		if ts.Before(cutoff) {
+			delete(ds.mlLastInference, guid)
+			removed++
+		}
+	}
+	ds.mlMux.Unlock()
+
+	return removed
 }
 
 // ProcessBackupPrivilege handles Windows Security events related to BackupRead/BackupWrite API usage

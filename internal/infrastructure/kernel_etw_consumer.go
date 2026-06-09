@@ -149,6 +149,8 @@ type KernelETWConsumer struct {
 	eventsReceived          uint64
 	eventsDropped           uint64
 	eventsSuppressedDeadPID uint64
+	// Per-EventID drop accounting (indexed by MonitorEvent.EventID; see droppedEventLabels).
+	eventsDroppedByID [32]uint64
 
 	// Context cancellation
 	cancelFunc context.CancelFunc
@@ -272,8 +274,29 @@ func (kc *KernelETWConsumer) GetStats() map[string]interface{} {
 		"channel_capacity":           cap(kc.eventChannel),
 		"events_received":            atomic.LoadUint64(&kc.eventsReceived),
 		"events_dropped":             atomic.LoadUint64(&kc.eventsDropped),
+		"events_dropped_by_id":       kc.dropsByEventID(),
 		"events_suppressed_dead_pid": atomic.LoadUint64(&kc.eventsSuppressedDeadPID),
 	}
+}
+
+// droppedEventLabels maps the internal MonitorEvent EventIDs to human labels for drop stats.
+var droppedEventLabels = map[int]string{
+	1:  "process_create",
+	2:  "file_modified",
+	10: "lsass_access",
+	11: "file_create",
+	23: "file_delete",
+}
+
+// dropsByEventID returns a labeled snapshot of per-EventID drop counts.
+func (kc *KernelETWConsumer) dropsByEventID() map[string]uint64 {
+	out := make(map[string]uint64, len(droppedEventLabels))
+	for id, label := range droppedEventLabels {
+		if id >= 0 && id < len(kc.eventsDroppedByID) {
+			out[label] = atomic.LoadUint64(&kc.eventsDroppedByID[id])
+		}
+	}
+	return out
 }
 
 // createSessions creates the 3 kernel ETW sessions.
@@ -1013,6 +1036,11 @@ func (kc *KernelETWConsumer) enqueueEvent(ctx context.Context, event *domain.Mon
 		return
 	default:
 		atomic.AddUint64(&kc.eventsDropped, 1)
+		// Differentiated drop accounting: a benign FileModified (2) flood must not hide
+		// dropped ProcessCreate (1) / LSASS-access (10) events of much higher signal.
+		if id := event.EventID; id >= 0 && id < len(kc.eventsDroppedByID) {
+			atomic.AddUint64(&kc.eventsDroppedByID[id], 1)
+		}
 	}
 }
 

@@ -49,8 +49,9 @@ type App struct {
 	protectMux   sync.RWMutex
 
 	// Background goroutine control
-	stopStats chan struct{}
-	stopLogs  chan struct{}
+	stopStats     chan struct{}
+	stopLogs      chan struct{}
+	protectCancel context.CancelFunc // cancels the per-run protection context on Stop
 
 	// ML Model state
 	mlModelStatus models.MLModelStatus
@@ -148,6 +149,9 @@ func (a *App) StartProtection() models.OperationResult {
 		go a.detectionService.StartCanaryMonitoring(ctx)
 	}
 
+	// Start periodic maintenance: evicts stale per-process detection state to bound memory.
+	go a.detectionService.StartMaintenance(ctx)
+
 	// Initialize response actions
 	var err error
 	a.responseActions, err = infrastructure.NewResponseActions()
@@ -204,6 +208,7 @@ func (a *App) StartProtection() models.OperationResult {
 	}
 
 	a.isProtecting = true
+	a.protectCancel = cancel // stored so StopProtection can cancel ctx-bound goroutines
 	a.stopStats = make(chan struct{})
 
 	// Start statistics reporter
@@ -239,6 +244,14 @@ func (a *App) StopProtection() models.OperationResult {
 	}
 
 	close(a.stopStats)
+
+	// Cancel the per-run context so ctx-bound goroutines (canary monitor, maintenance,
+	// stats reporter, alert streamer, periodic thread protection) actually exit. Previously
+	// cancel was never stored, so these leaked and accumulated on every Stop/Start cycle.
+	if a.protectCancel != nil {
+		a.protectCancel()
+		a.protectCancel = nil
+	}
 
 	// Stop components in reverse order
 	if a.securityLogConsumer != nil {

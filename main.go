@@ -227,6 +227,9 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 		go detectionService.StartCanaryMonitoring(ctx)
 	}
 
+	// Start periodic maintenance: evicts stale per-process detection state to bound memory.
+	go detectionService.StartMaintenance(ctx)
+
 	// Initialize response actions
 	log.Println("[*] Initializing response actions...")
 	responseActions, err := infrastructure.NewResponseActions()
@@ -379,6 +382,7 @@ func reportStatistics(
 			etwStats := etwConsumer.GetStats()
 			orchestratorStats := responseOrchestrator.GetStats()
 			canaryStats := detectionService.GetCanaryStats()
+			dropStats := detectionService.GetDropStats()
 
 			log.Println()
 			log.Println("═══════════════════ STATISTICS ═══════════════════")
@@ -387,6 +391,16 @@ func reportStatistics(
 				etwStats["channel_length"],
 				etwStats["channel_capacity"],
 				etwStats["worker_pool_size"],
+			)
+			log.Printf("[ETW] Events dropped: total=%v by_id=%v\n",
+				etwStats["events_dropped"],
+				etwStats["events_dropped_by_id"],
+			)
+			log.Printf("[Detect] Alerts dropped: total=%d critical=%d high=%d other=%d\n",
+				dropStats["alerts_dropped_total"],
+				dropStats["alerts_dropped_critical"],
+				dropStats["alerts_dropped_high"],
+				dropStats["alerts_dropped_other"],
 			)
 			log.Printf("[Response] Alerts: %d, Terminated: %d, Quarantined: %d, Blocked: %d\n",
 				orchestratorStats["alerts_processed"],
