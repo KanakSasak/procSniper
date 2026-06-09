@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,10 +80,14 @@ func LoadResponseConfig(configPath string) (*ResponseConfig, error) {
 		configPath = "config/ransomware_extensions.json"
 	}
 
-	// Read configuration file
+	// Prefer the on-disk file so operators can override, but fall back to the compiled-in
+	// copy when it is unreadable (e.g. a wrong working directory or a missing file) so
+	// detection never silently degrades or hard-fails. A malformed on-disk file is still
+	// surfaced as a parse error below rather than masked.
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response config: %w", err)
+		log.Printf("[!] response config %q unreadable (%v); using embedded default", configPath, err)
+		data = embeddedResponseConfigJSON
 	}
 
 	var config ResponseConfig

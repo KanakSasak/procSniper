@@ -87,6 +87,11 @@ func (a *App) Startup(ctx context.Context) {
 		})
 	}
 
+	if a.responseCfg != nil {
+		// Single source of truth: extensions come from the parsed ResponseConfig.
+		a.cfg.RansomwareExtensions = a.responseCfg.RansomwareExtensions
+	}
+
 	log.Println("[GUI] procSniper GUI started")
 }
 

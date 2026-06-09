@@ -39,6 +39,10 @@ func main() {
 		log.Fatalf("[!] Failed to load response configuration: %v\n", err)
 	}
 
+	// Single source of truth: detection consumes the same extension list parsed into
+	// ResponseConfig (was previously a second, drift-prone loader on Config).
+	cfg.RansomwareExtensions = responseCfg.RansomwareExtensions
+
 	log.Println("╔════════════════════════════════════════════════════════════╗")
 	log.Println("║                    procSniper v2.0                         ║")
 	log.Println("║         Real-Time Ransomware & Stealer Detection           ║")
