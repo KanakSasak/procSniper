@@ -139,15 +139,6 @@ type ModifiedHighEntropyFile struct {
 }
 
 // CanaryActor stores ETW-attributed actor context for recent canary touches.
-type CanaryActor struct {
-	ProcessID   int
-	ProcessGuid string
-	Image       string
-	TargetPath  string
-	EventType   string
-	SeenAt      time.Time
-}
-
 // DetectionService orchestrates threat detection and response
 type DetectionService struct {
 	velocityTracker *domain.FileOperationTracker
@@ -179,15 +170,11 @@ type DetectionService struct {
 	directoryScanInProgress map[string]bool // DirPath -> scanning (prevents duplicate scans)
 	directoryScanMux        sync.RWMutex    // Protects directoryScanInProgress map
 
-	// Canary files (honeypot detection for slow-moving ransomware)
-	canaryFiles    map[string]*domain.CanaryFile // FilePath -> canary metadata
-	canaryFilesMux sync.RWMutex                  // Protects canaryFiles map
-	// ETW-attributed recent actors that touched canaries (for periodic scan attribution).
-	recentCanaryActors map[string]CanaryActor // normalized canonical canary path -> actor
-	canaryActorsMux    sync.RWMutex
-	// Latched canary compromises (suppresses periodic repeat alerts for already-compromised
-	// canaries). Extracted to the canary package (Phase 6 slice 1).
-	canaryLatches *canary.LatchSet
+	// Canary (honeypot) subsystem — owns the file registry, ETW actor attribution, the
+	// alert-dedup latches, and the response action. Reaches back into detection only via
+	// the AlertEmitter/RelatedActorProvider/TxtActivityProvider seams that DetectionService
+	// implements (Phase 6 slices 2–4).
+	canaryMgr *canary.Manager
 
 	// Detection thresholds from config
 	entropyFileThreshold   int
@@ -206,16 +193,15 @@ type DetectionService struct {
 	trustedProcessPaths map[string]struct{} // Full path matches (e.g., "c:\\windows\\system32\\searchprotocolhost.exe")
 
 	// ML inference integration
-	mlPredictor          domain.MLPredictor                // nil when ML not loaded
-	mlEnabled            bool                              // whether ML detection is active
-	mlConfidence         float64                           // minimum confidence threshold (0.0–1.0)
-	mlMux                sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
-	onMLPrediction       func(*domain.MLInferenceActivity) // callback for GUI event emission
-	mlMinIndicators      int                               // minimum non-zero features in feature vector before ML fires
-	mlLastInference      map[string]time.Time              // per-process inference cooldown tracker
-	mlCooldown           time.Duration                     // cooldown between inferences for same process
-	detectionMode        string                            // "rules_only", "hybrid", "ml_only"
-	canaryResponseAction string                            // "terminate", "suspend", "alert_only"
+	mlPredictor     domain.MLPredictor                // nil when ML not loaded
+	mlEnabled       bool                              // whether ML detection is active
+	mlConfidence    float64                           // minimum confidence threshold (0.0–1.0)
+	mlMux           sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
+	onMLPrediction  func(*domain.MLInferenceActivity) // callback for GUI event emission
+	mlMinIndicators int                               // minimum non-zero features in feature vector before ML fires
+	mlLastInference map[string]time.Time              // per-process inference cooldown tracker
+	mlCooldown      time.Duration                     // cooldown between inferences for same process
+	detectionMode   string                            // "rules_only", "hybrid", "ml_only"
 
 	// Alert-drop accounting (atomic). Dropped alerts were previously log-only and invisible.
 	alertsDropped         uint64 // total alerts dropped because alertChan was full
@@ -262,9 +248,6 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
 		modifiedHighEntropyFiles:  make(map[string]*ModifiedHighEntropyFile),  // Track modified high-entropy files
 		directoryScanInProgress:   make(map[string]bool),                      // Prevent goroutine explosion
-		canaryFiles:               make(map[string]*domain.CanaryFile),        // Honeypot files for detection
-		recentCanaryActors:        make(map[string]CanaryActor),
-		canaryLatches:             canary.NewLatchSet(),
 		entropyFileThreshold:      cfg.EntropyFileThreshold,
 		extensionFileThreshold:    cfg.ExtensionFileThreshold,
 		combinedThreshold:         cfg.CombinedThreshold,
@@ -280,8 +263,52 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 
 	ds.setTrustedProcesses(cfg.TrustedProcesses)
 	ds.velocityTracker.SetThresholds(cfg.IOVelocityMonitorThreshold, cfg.IOVelocityAnalyzeThreshold, cfg.IOVelocityCriticalThreshold)
+	// DetectionService implements the canary seams (AlertEmitter / RelatedActorProvider /
+	// TxtActivityProvider), so it wires itself into the manager.
+	ds.canaryMgr = canary.NewManager(ds, ds, ds)
 
 	return ds
+}
+
+// --- canary seams (implemented by DetectionService, consumed by canary.Manager) ---
+
+// RaiseIndicator implements canary.AlertEmitter.
+func (ds *DetectionService) RaiseIndicator(processGuid, image string, pid int, indicator domain.Indicator) int {
+	return ds.addRuleIndicator(processGuid, image, pid, indicator)
+}
+
+// Evaluate implements canary.AlertEmitter.
+func (ds *DetectionService) Evaluate(processGuid, image string, pid int) {
+	ds.evaluateAndAlert(processGuid, image, pid)
+}
+
+// SendAlert implements canary.AlertEmitter: non-blocking send with drop accounting.
+func (ds *DetectionService) SendAlert(alert *domain.Alert) {
+	select {
+	case ds.alertChan <- alert:
+		log.Printf("[ALERT] Canary compromise alert sent: %s (related suspects: %d)",
+			alert.Description, len(alert.RelatedProcesses))
+	default:
+		ds.recordDroppedAlert(alert.Severity)
+		log.Printf("[ALERT] Alert channel full, canary alert dropped (severity=%s, total dropped=%d)",
+			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
+	}
+}
+
+// RelatedActors implements canary.RelatedActorProvider.
+func (ds *DetectionService) RelatedActors(canaryPath, attributedGuid string, now time.Time) []domain.RelatedProcess {
+	return ds.collectRelatedVelocityActors(canaryPath, attributedGuid, now)
+}
+
+// TxtActivity implements canary.TxtActivityProvider.
+func (ds *DetectionService) TxtActivity(processGuid string) (int, int) {
+	ds.fileCountersMux.RLock()
+	defer ds.fileCountersMux.RUnlock()
+	counters, ok := ds.fileCounters[processGuid]
+	if !ok {
+		return 0, 0
+	}
+	return counters.TxtFileCount, len(counters.TxtFileDirectories)
 }
 
 func (ds *DetectionService) setTrustedProcesses(processes []string) {
@@ -341,13 +368,13 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
 
 	// Track canary touches from ETW create/open telemetry for periodic scan attribution.
-	if _, _, canaryMatch := ds.matchCanaryPath(event.TargetFile); canaryMatch {
-		ds.recordCanaryActor(event, "FILE_CREATE")
+	if _, _, canaryMatch := ds.canaryMgr.Match(event.TargetFile); canaryMatch {
+		ds.canaryMgr.RecordActor(event, "FILE_CREATE")
 	}
 
 	// Canary files are frequently opened/read by legitimate indexers/AV engines.
 	// Ignore create/open-style canary events and only react on write/rename/delete paths.
-	if _, isCanary := ds.isCanaryFile(event.TargetFile); isCanary {
+	if _, isCanary := ds.canaryMgr.IsCanaryFile(event.TargetFile); isCanary {
 		log.Printf("[CANARY] Ignoring create/open access on canary (waiting for write/rename/delete): %s", event.TargetFile)
 		return
 	}
@@ -972,7 +999,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
 
 	// Keep recent ETW actor context for periodic canary compromise attribution.
-	ds.recordCanaryActor(event, "FILE_MODIFIED")
+	ds.canaryMgr.RecordActor(event, "FILE_MODIFIED")
 
 	// Track modify operations so rename/encrypt bursts participate in velocity tiers.
 	tier := ds.updateVelocityTierForOperation(event, "modify")
@@ -1015,7 +1042,7 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 
 	// Real-time canary response is limited to destructive I/O paths (write/rename).
 	// Read/open-style accesses are intentionally ignored in ProcessFileCreate.
-	if ds.handleCanaryWriteOrRename(event) {
+	if ds.canaryMgr.HandleWriteOrRename(event) {
 		return
 	}
 
@@ -1251,103 +1278,6 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 
 // handleCanaryWriteOrRename handles real-time canary detection for write/overwrite/rename operations.
 // Returns true when the event targets a canary and should not continue through normal file-modified flow.
-func (ds *DetectionService) handleCanaryWriteOrRename(event *domain.MonitorEvent) bool {
-	canary, isCanary := ds.isCanaryFile(event.TargetFile)
-	if !isCanary {
-		return false
-	}
-
-	action := ds.GetCanaryResponseAction()
-	log.Printf("[CANARY] REAL-TIME DETECTION: Canary file WRITE/RENAME observed: %s (response_action=%s)", event.TargetFile, action)
-	log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
-
-	// Determine indicator points based on canary response action
-	var canaryPoints int
-	switch action {
-	case "alert_only":
-		canaryPoints = 0 // Alert only, no auto-response
-	case "suspend":
-		canaryPoints = 30 // Below auto-terminate threshold, triggers suspend
-	default: // "terminate"
-		canaryPoints = 100 // Immediate auto-terminate
-	}
-
-	// Correlate with ransom-note style .txt activity for very high confidence.
-	ds.fileCountersMux.RLock()
-	counters, hasCounters := ds.fileCounters[event.ProcessGuid]
-	var txtFileCount int
-	var txtDirCount int
-	if hasCounters {
-		txtFileCount = counters.TxtFileCount
-		txtDirCount = len(counters.TxtFileDirectories)
-	}
-	ds.fileCountersMux.RUnlock()
-
-	if txtFileCount >= 3 {
-		log.Printf("[CANARY] CORRELATION DETECTED: Canary write/rename + %d ransom-note files across %d directories",
-			txtFileCount, txtDirCount)
-
-		indicator := domain.Indicator{
-			Type:        domain.IndicatorCanaryCompromised,
-			Severity:    domain.ThreatCritical,
-			Points:      canaryPoints,
-			Description: fmt.Sprintf("CORRELATED: Canary file write/rename + %d ransom notes (high confidence ransomware)", txtFileCount),
-			Timestamp:   event.Timestamp,
-			Evidence: map[string]string{
-				"canary_path":      event.TargetFile,
-				"detection_method": "REAL_TIME_CANARY_WRITE_RENAME_WITH_RANSOM_NOTES",
-				"txt_file_count":   fmt.Sprintf("%d", txtFileCount),
-				"txt_directories":  fmt.Sprintf("%d", txtDirCount),
-				"correlation":      "CANARY_WRITE_RENAME_AND_RANSOM_NOTES",
-				"confidence":       "VERY_HIGH",
-				"response_action":  action,
-			},
-		}
-
-		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-		log.Printf("[CANARY] CORRELATED INDICATOR ADDED: Score: %d (action=%s)", score, action)
-
-		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-		return true
-	}
-
-	// No strong correlation yet: verify content change on canary.
-	canaryEntropy, err := domain.AnalyzeFileEntropy(event.TargetFile, canary.Extension)
-	if err != nil {
-		log.Printf("[CANARY] Canary write/rename observed but entropy check failed: %v", err)
-		return true
-	}
-
-	entropyDelta := canaryEntropy.Entropy - canary.OriginalEntropy
-	if entropyDelta >= 2.0 || canaryEntropy.IsLikelyEncrypted {
-		log.Printf("[CANARY] Canary ENCRYPTED via write/rename: entropy %.3f -> %.3f (delta +%.3f)",
-			canary.OriginalEntropy, canaryEntropy.Entropy, entropyDelta)
-
-		indicator := domain.Indicator{
-			Type:        domain.IndicatorCanaryCompromised,
-			Severity:    domain.ThreatCritical,
-			Points:      canaryPoints,
-			Description: "Honeypot file modified/encrypted (canary compromise)",
-			Timestamp:   event.Timestamp,
-			Evidence: map[string]string{
-				"canary_path":      event.TargetFile,
-				"original_entropy": fmt.Sprintf("%.3f", canary.OriginalEntropy),
-				"current_entropy":  fmt.Sprintf("%.3f", canaryEntropy.Entropy),
-				"entropy_delta":    fmt.Sprintf("%.3f", entropyDelta),
-				"detection_method": "REAL_TIME_CANARY_WRITE_RENAME",
-				"response_action":  action,
-			},
-		}
-
-		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-		log.Printf("[CANARY] ENCRYPTED CANARY DETECTED: Score: %d (action=%s)", score, action)
-
-		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-	}
-
-	return true
-}
-
 // ProcessProcessCreate handles process creation events
 func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *domain.MonitorEvent) {
 	if ds.isTrustedProcess(event.Image) {
@@ -1611,80 +1541,6 @@ func (ds *DetectionService) checkBrowserAndSSHAccess(event *domain.MonitorEvent)
 	}
 }
 
-func isCanaryIndicatorType(indicatorType domain.IndicatorType) bool {
-	if indicatorType == domain.IndicatorCanaryCompromised {
-		return true
-	}
-	return strings.HasPrefix(strings.ToUpper(string(indicatorType)), "CANARY_")
-}
-
-func extractCanaryPathFromAlert(alert *domain.Alert) string {
-	if alert == nil {
-		return ""
-	}
-
-	if path, ok := alert.Evidence["canary_path"]; ok {
-		if asText, ok := path.(string); ok {
-			return asText
-		}
-	}
-
-	for _, indicator := range alert.Indicators {
-		if !isCanaryIndicatorType(indicator.Type) {
-			continue
-		}
-		if path, ok := indicator.Evidence["canary_path"]; ok {
-			return path
-		}
-		if path, ok := indicator.Evidence["file"]; ok {
-			return path
-		}
-	}
-
-	return ""
-}
-
-func (ds *DetectionService) attachRelatedProcessesToCanaryAlert(alert *domain.Alert, canaryPathOverride string, attributedGuidOverride string) {
-	if alert == nil {
-		return
-	}
-
-	hasCanaryIndicator := false
-	for _, indicator := range alert.Indicators {
-		if isCanaryIndicatorType(indicator.Type) {
-			hasCanaryIndicator = true
-			break
-		}
-	}
-
-	if !hasCanaryIndicator && strings.TrimSpace(canaryPathOverride) == "" {
-		return
-	}
-
-	canaryPath := extractCanaryPathFromAlert(alert)
-	if strings.TrimSpace(canaryPath) == "" {
-		canaryPath = canaryPathOverride
-	}
-	if strings.TrimSpace(canaryPath) == "" {
-		return
-	}
-
-	attributedGuid := strings.TrimSpace(alert.ProcessGuid)
-	if strings.EqualFold(attributedGuid, "UNKNOWN") {
-		attributedGuid = ""
-	}
-	overrideGuid := strings.TrimSpace(attributedGuidOverride)
-	if strings.EqualFold(overrideGuid, "UNKNOWN") {
-		overrideGuid = ""
-	}
-	if attributedGuid == "" {
-		attributedGuid = overrideGuid
-	}
-
-	related := ds.collectRelatedVelocityActors(canaryPath, attributedGuid, time.Now())
-	alert.RelatedProcesses = related
-}
-
 // evaluateAndAlert evaluates threat level and creates alerts.
 // Two-stage pipeline: rule-based indicators accumulate first, then ML inference fires
 // once enough non-zero features have been gathered (mlMinIndicators threshold).
@@ -1795,7 +1651,7 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 		alert.AddIndicator(indicator)
 	}
 
-	ds.attachRelatedProcessesToCanaryAlert(alert, "", processGuid)
+	ds.canaryMgr.AttachRelated(alert, "", processGuid)
 
 	// Determine if auto-response is warranted
 	alert.AutoRespond = ds.threatScorer.ShouldAutoRespond(processGuid)
@@ -1978,21 +1834,12 @@ func (ds *DetectionService) GetDetectionMode() string {
 
 // SetCanaryResponseAction sets the canary response action: "terminate", "suspend", or "alert_only".
 func (ds *DetectionService) SetCanaryResponseAction(action string) {
-	switch action {
-	case "terminate", "suspend", "alert_only":
-		ds.canaryResponseAction = action
-	default:
-		ds.canaryResponseAction = "terminate"
-	}
-	log.Printf("[CONFIG] Canary response action set to: %s", ds.canaryResponseAction)
+	ds.canaryMgr.SetResponseAction(action)
 }
 
 // GetCanaryResponseAction returns the current canary response action.
 func (ds *DetectionService) GetCanaryResponseAction() string {
-	if ds.canaryResponseAction == "" {
-		return "terminate"
-	}
-	return ds.canaryResponseAction
+	return ds.canaryMgr.ResponseAction()
 }
 
 // addRuleIndicator records a rule-based indicator. In ML mode, indicators serve as
@@ -2248,172 +2095,7 @@ func (ds *DetectionService) emitMLActivity(callback func(*domain.MLInferenceActi
 // Canary files are decoy files with known low entropy that trigger alerts if encrypted/deleted
 // This catches slow-moving ransomware that doesn't trigger velocity thresholds
 func (ds *DetectionService) SetupCanaryFiles() error {
-	log.Println("[CANARY] Setting up honeypot files for ransomware detection...")
-	// Full setup resets latch state so recreated canaries can alert again.
-	ds.canaryLatches.ResetAll()
-
-	successCount := 0
-	failCount := 0
-
-	for _, location := range domain.CanaryLocations {
-		// Get full path for user directory
-		dirPath, err := domain.GetUserDirectory(location.Directory)
-		if err != nil {
-			log.Printf("[CANARY] Failed to get directory path for %s: %v", location.Directory, err)
-			failCount++
-			continue
-		}
-
-		// Full file path
-		filePath := filepath.Join(dirPath, location.FileName)
-
-		// Check if canary already exists
-		if _, err := os.Stat(filePath); err == nil {
-			log.Printf("[CANARY] Canary file already exists: %s", filePath)
-			// Analyze existing canary
-			entropy, err := domain.AnalyzeFileEntropy(filePath, location.Extension)
-			if err != nil {
-				log.Printf("[CANARY] Failed to analyze existing canary: %v", err)
-				failCount++
-				continue
-			}
-
-			// Track existing canary
-			ds.canaryFilesMux.Lock()
-			ds.canaryFiles[filePath] = &domain.CanaryFile{
-				Path:            filePath,
-				OriginalEntropy: entropy.Entropy,
-				FileSize:        entropy.FileSize,
-				Created:         time.Now(),
-				LastChecked:     time.Now(),
-				Extension:       location.Extension,
-			}
-			ds.canaryFilesMux.Unlock()
-			ds.canaryLatches.Reset(filePath)
-
-			log.Printf("[CANARY] ✓ Tracked existing canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
-			successCount++
-			continue
-		}
-
-		// Create new canary file (8KB size)
-		if err := domain.CreateCanaryFile(filePath, location.Extension, 8192); err != nil {
-			log.Printf("[CANARY] Failed to create canary %s: %v", filePath, err)
-			failCount++
-			continue
-		}
-
-		// Analyze created canary to get baseline entropy
-		entropy, err := domain.AnalyzeFileEntropy(filePath, location.Extension)
-		if err != nil {
-			log.Printf("[CANARY] Failed to analyze created canary: %v", err)
-			failCount++
-			continue
-		}
-
-		// Track canary file
-		ds.canaryFilesMux.Lock()
-		ds.canaryFiles[filePath] = &domain.CanaryFile{
-			Path:            filePath,
-			OriginalEntropy: entropy.Entropy,
-			FileSize:        entropy.FileSize,
-			Created:         time.Now(),
-			LastChecked:     time.Now(),
-			Extension:       location.Extension,
-		}
-		ds.canaryFilesMux.Unlock()
-		ds.canaryLatches.Reset(filePath)
-
-		log.Printf("[CANARY] ✓ Created canary: %s (entropy: %.3f, size: %d bytes)",
-			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
-		successCount++
-	}
-
-	// Setup system-level canaries in Program Files directories
-	log.Println("[CANARY] Setting up system-level honeypots in Program Files...")
-	for _, location := range domain.CanarySystemLocations {
-		// Use absolute path directly (no user directory lookup needed)
-		filePath := filepath.Join(location.Directory, location.FileName)
-
-		// Check if canary already exists
-		if _, err := os.Stat(filePath); err == nil {
-			log.Printf("[CANARY] System canary already exists: %s", filePath)
-			// Analyze existing canary
-			entropy, err := domain.AnalyzeFileEntropy(filePath, location.Extension)
-			if err != nil {
-				log.Printf("[CANARY] Failed to analyze existing system canary: %v", err)
-				failCount++
-				continue
-			}
-
-			// Track existing canary
-			ds.canaryFilesMux.Lock()
-			ds.canaryFiles[filePath] = &domain.CanaryFile{
-				Path:            filePath,
-				OriginalEntropy: entropy.Entropy,
-				FileSize:        entropy.FileSize,
-				Created:         time.Now(),
-				LastChecked:     time.Now(),
-				Extension:       location.Extension,
-			}
-			ds.canaryFilesMux.Unlock()
-			ds.canaryLatches.Reset(filePath)
-
-			log.Printf("[CANARY] ✓ Tracked existing system canary: %s (entropy: %.3f)", filePath, entropy.Entropy)
-			successCount++
-			continue
-		}
-
-		// Create new system canary file (8KB size)
-		if err := domain.CreateCanaryFile(filePath, location.Extension, 8192); err != nil {
-			log.Printf("[CANARY] Failed to create system canary %s: %v (requires admin privileges)", filePath, err)
-			failCount++
-			continue
-		}
-
-		// Analyze created canary to get baseline entropy
-		entropy, err := domain.AnalyzeFileEntropy(filePath, location.Extension)
-		if err != nil {
-			log.Printf("[CANARY] Failed to analyze created system canary: %v", err)
-			failCount++
-			continue
-		}
-
-		// Track canary file
-		ds.canaryFilesMux.Lock()
-		ds.canaryFiles[filePath] = &domain.CanaryFile{
-			Path:            filePath,
-			OriginalEntropy: entropy.Entropy,
-			FileSize:        entropy.FileSize,
-			Created:         time.Now(),
-			LastChecked:     time.Now(),
-			Extension:       location.Extension,
-		}
-		ds.canaryFilesMux.Unlock()
-		ds.canaryLatches.Reset(filePath)
-
-		log.Printf("[CANARY] ✓ Created system canary: %s (entropy: %.3f, size: %d bytes)",
-			filepath.Base(filePath), entropy.Entropy, entropy.FileSize)
-		successCount++
-	}
-
-	log.Printf("[CANARY] Setup complete: %d created/tracked, %d failed", successCount, failCount)
-
-	if successCount == 0 {
-		return fmt.Errorf("failed to create any canary files")
-	}
-
-	return nil
-}
-
-// isCanaryFile checks if a file path is a canary/honeypot file
-// Returns true if the file is being tracked as a canary
-func (ds *DetectionService) isCanaryFile(filePath string) (*domain.CanaryFile, bool) {
-	ds.canaryFilesMux.RLock()
-	defer ds.canaryFilesMux.RUnlock()
-
-	canary, exists := ds.canaryFiles[filePath]
-	return canary, exists
+	return ds.canaryMgr.Setup()
 }
 
 // normalizeCanaryPath delegates to the canary package; kept as a thin wrapper so the
@@ -2848,390 +2530,27 @@ func (ds *DetectionService) collectRelatedVelocityActors(canaryPath string, attr
 	return results
 }
 
-// matchCanaryPath resolves a target path to a tracked canonical canary path.
-// Match types: exact, renamed_prefix.
-func (ds *DetectionService) matchCanaryPath(targetPath string) (string, string, bool) {
-	targetNorm := normalizeCanaryPath(targetPath)
-	if targetNorm == "" {
-		return "", "", false
-	}
-
-	ds.canaryFilesMux.RLock()
-	defer ds.canaryFilesMux.RUnlock()
-
-	targetDir := normalizeCanaryPath(filepath.Dir(targetPath))
-	targetBase := strings.ToLower(filepath.Base(targetPath))
-
-	for canaryPath, canary := range ds.canaryFiles {
-		canonicalNorm := normalizeCanaryPath(canaryPath)
-		if targetNorm == canonicalNorm {
-			return canaryPath, "exact", true
-		}
-
-		// Rename pattern: ~canary_name.ext -> ~canary_name.ext.CONTI
-		canaryDir := normalizeCanaryPath(filepath.Dir(canaryPath))
-		if canaryDir != targetDir {
-			continue
-		}
-
-		baseName := strings.ToLower(filepath.Base(canaryPath))
-		baseNoExt := strings.TrimSuffix(baseName, strings.ToLower(canary.Extension))
-		if strings.HasPrefix(targetBase, baseNoExt) && targetBase != baseName {
-			return canaryPath, "renamed_prefix", true
-		}
-	}
-
-	return "", "", false
-}
-
-func (ds *DetectionService) recordCanaryActor(event *domain.MonitorEvent, eventType string) {
-	if event == nil {
-		return
-	}
-
-	canonicalPath, matchType, ok := ds.matchCanaryPath(event.TargetFile)
-	if !ok {
-		return
-	}
-
-	seenAt := event.Timestamp
-	if seenAt.IsZero() {
-		seenAt = time.Now()
-	}
-
-	actor := CanaryActor{
-		ProcessID:   event.ProcessID,
-		ProcessGuid: event.ProcessGuid,
-		Image:       event.Image,
-		TargetPath:  event.TargetFile,
-		EventType:   fmt.Sprintf("%s:%s", eventType, matchType),
-		SeenAt:      seenAt,
-	}
-
-	key := normalizeCanaryPath(canonicalPath)
-	ds.canaryActorsMux.Lock()
-	existing, exists := ds.recentCanaryActors[key]
-	if !exists || actor.SeenAt.After(existing.SeenAt) {
-		ds.recentCanaryActors[key] = actor
-	}
-	ds.canaryActorsMux.Unlock()
-}
-
-func (ds *DetectionService) resolveCanaryActor(canonicalCanaryPath, renamedPath string) (CanaryActor, bool) {
-	const attributionTTL = 120 * time.Second
-
-	key := normalizeCanaryPath(canonicalCanaryPath)
-	if key == "" {
-		return CanaryActor{}, false
-	}
-
-	ds.canaryActorsMux.Lock()
-	defer ds.canaryActorsMux.Unlock()
-
-	actor, ok := ds.recentCanaryActors[key]
-	if !ok {
-		return CanaryActor{}, false
-	}
-
-	if time.Since(actor.SeenAt) > attributionTTL {
-		delete(ds.recentCanaryActors, key)
-		return CanaryActor{}, false
-	}
-
-	if renamedPath != "" {
-		renamedNorm := normalizeCanaryPath(renamedPath)
-		if renamedNorm != "" && normalizeCanaryPath(actor.TargetPath) != renamedNorm {
-			// Keep attribution even if path differs, but prefer matching paths when available.
-			// No-op fallback: actor is still recent and canary-specific.
-		}
-	}
-
-	return actor, true
-}
-
 // CheckCanaryFiles periodically checks if canary files have been compromised
 // This function should be called on a timer (e.g., every 30 seconds)
 // Returns true if any canary was compromised (triggers immediate alert)
 func (ds *DetectionService) CheckCanaryFiles() bool {
-	ds.canaryFilesMux.RLock()
-	canaryCount := len(ds.canaryFiles)
-	ds.canaryFilesMux.RUnlock()
-
-	if canaryCount == 0 {
-		return false
-	}
-
-	log.Printf("[CANARY] Checking %d honeypot files...", canaryCount)
-
-	compromised := false
-	suppressedCanaryAlerts := 0
-
-	ds.canaryFilesMux.Lock()
-	defer ds.canaryFilesMux.Unlock()
-
-	for path, canary := range ds.canaryFiles {
-		canary.LastChecked = time.Now()
-
-		fileInfo, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				dirPath := filepath.Dir(path)
-				baseName := filepath.Base(path)
-				baseNameWithoutExt := strings.TrimSuffix(baseName, canary.Extension)
-
-				renamed := false
-				renamedPath := ""
-
-				entries, readErr := os.ReadDir(dirPath)
-				if readErr == nil {
-					for _, entry := range entries {
-						if entry.IsDir() {
-							continue
-						}
-
-						entryName := entry.Name()
-						if strings.HasPrefix(entryName, baseNameWithoutExt) && entryName != baseName {
-							renamedPath = filepath.Join(dirPath, entryName)
-							newExt := filepath.Ext(entryName)
-
-							log.Printf("[DETECTION] ?? CANARY RENAMED: %s -> %s", path, renamedPath)
-							log.Printf("[DETECTION] ?? Extension changed from %s to %s", canary.Extension, newExt)
-							log.Printf("[DETECTION] ?? This is a classic ransomware behavior!")
-
-							entropy, entropyErr := domain.AnalyzeFileEntropy(renamedPath, newExt)
-							if entropyErr == nil {
-								entropyDelta := entropy.Entropy - canary.OriginalEntropy
-								log.Printf("[DETECTION] ?? Renamed file entropy: %.3f (original: %.3f, delta +%.3f)",
-									entropy.Entropy, canary.OriginalEntropy, entropyDelta)
-
-								if entropyDelta >= 2.0 {
-									if !ds.alertCanaryCompromised(
-										path,
-										fmt.Sprintf("RENAMED_AND_ENCRYPTED (-> %s)", filepath.Base(renamedPath)),
-										entropy.Entropy,
-										canary.OriginalEntropy,
-										renamedPath,
-									) {
-										suppressedCanaryAlerts++
-									}
-								} else {
-									if !ds.alertCanaryCompromised(
-										path,
-										fmt.Sprintf("RENAMED (-> %s)", filepath.Base(renamedPath)),
-										0,
-										canary.OriginalEntropy,
-										renamedPath,
-									) {
-										suppressedCanaryAlerts++
-									}
-								}
-							} else {
-								if !ds.alertCanaryCompromised(
-									path,
-									fmt.Sprintf("RENAMED (-> %s)", filepath.Base(renamedPath)),
-									0,
-									canary.OriginalEntropy,
-									renamedPath,
-								) {
-									suppressedCanaryAlerts++
-								}
-							}
-
-							renamed = true
-							compromised = true
-							break
-						}
-					}
-				}
-
-				if !renamed {
-					log.Printf("[DETECTION] ?? CANARY DELETED: %s", path)
-					log.Printf("[DETECTION] ?? This honeypot file was deleted by malicious process!")
-					if !ds.alertCanaryCompromised(path, "DELETED", 0, canary.OriginalEntropy, "") {
-						suppressedCanaryAlerts++
-					}
-					compromised = true
-				}
-				continue
-			}
-
-			log.Printf("[DETECTION] ??  CANARY ACCESS DENIED: %s (error: %v)", path, err)
-			if !ds.alertCanaryCompromised(path, "ACCESS_DENIED", 0, canary.OriginalEntropy, "") {
-				suppressedCanaryAlerts++
-			}
-			compromised = true
-			continue
-		}
-
-		if fileInfo.Size() != canary.FileSize {
-			log.Printf("[DETECTION] ?? CANARY SIZE CHANGED: %s (was: %d bytes, now: %d bytes)",
-				path, canary.FileSize, fileInfo.Size())
-			if !ds.alertCanaryCompromised(path, "SIZE_CHANGED", 0, canary.OriginalEntropy, "") {
-				suppressedCanaryAlerts++
-			}
-			compromised = true
-			continue
-		}
-
-		entropy, entropyErr := domain.AnalyzeFileEntropy(path, canary.Extension)
-		if entropyErr != nil {
-			log.Printf("[CANARY] Failed to analyze %s: %v", path, entropyErr)
-			continue
-		}
-
-		entropyDelta := entropy.Entropy - canary.OriginalEntropy
-		if entropyDelta >= 2.0 {
-			log.Printf("[DETECTION] ?? CANARY ENCRYPTED: %s", path)
-			log.Printf("[DETECTION] ?? Entropy jumped from %.3f -> %.3f (delta +%.3f)",
-				canary.OriginalEntropy, entropy.Entropy, entropyDelta)
-			log.Printf("[DETECTION] ?? This honeypot file was encrypted by ransomware!")
-
-			if !ds.alertCanaryCompromised(path, "ENCRYPTED", entropy.Entropy, canary.OriginalEntropy, "") {
-				suppressedCanaryAlerts++
-			}
-			compromised = true
-			continue
-		}
-	}
-
-	if !compromised {
-		log.Printf("[CANARY] ? All %d honeypot files intact", canaryCount)
-	}
-	if suppressedCanaryAlerts > 0 {
-		log.Printf("[CANARY] Suppressed %d repeated canary compromise alerts (latched)", suppressedCanaryAlerts)
-	}
-
-	return compromised
-}
-
-// alertCanaryCompromised creates a CRITICAL alert when a canary file is compromised
-// This is a definitive ransomware indicator with near-zero false positives
-func (ds *DetectionService) alertCanaryCompromised(filePath string, compromiseType string, currentEntropy, originalEntropy float64, relatedPath string) bool {
-	log.Printf("[DETECTION] CRITICAL: CANARY FILE COMPROMISED")
-	log.Printf("[DETECTION] File: %s", filePath)
-	log.Printf("[DETECTION] Type: %s", compromiseType)
-
-	processGuid := "UNKNOWN"
-	processID := 0
-	image := "UNKNOWN"
-	attributionMethod := "CANARY_HONEYPOT_PERIODIC"
-
-	// Periodic canary scan does not have direct actor context by itself.
-	// Correlate with recent ETW activity when available.
-	if actor, ok := ds.resolveCanaryActor(filePath, relatedPath); ok {
-		processGuid = actor.ProcessGuid
-		processID = actor.ProcessID
-		image = actor.Image
-		attributionMethod = "CANARY_HONEYPOT_ETW_CORRELATED"
-		log.Printf("[CANARY] ETW attribution resolved: %s (PID: %d, GUID: %s, Event: %s)",
-			image, processID, processGuid, actor.EventType)
-	}
-
-	if !ds.canaryLatches.ShouldEmit(filePath, compromiseType, relatedPath, processGuid, time.Now()) {
-		return false
-	}
-
-	alert := &domain.Alert{
-		ID:          fmt.Sprintf("CANARY_%d", time.Now().Unix()),
-		Timestamp:   time.Now(),
-		Severity:    domain.ThreatCritical,
-		Category:    "RANSOMWARE",
-		ProcessGuid: processGuid,
-		ProcessID:   processID,
-		Image:       image,
-		Description: fmt.Sprintf("CANARY FILE COMPROMISED: %s (%s)", filepath.Base(filePath), compromiseType),
-		Score:       100,
-		Indicators: []domain.Indicator{
-			{
-				Type:        domain.IndicatorType(fmt.Sprintf("CANARY_%s", compromiseType)),
-				Severity:    domain.ThreatCritical,
-				Points:      100,
-				Description: fmt.Sprintf("Honeypot file compromised: %s", compromiseType),
-				Timestamp:   time.Now(),
-				Evidence: map[string]string{
-					"canary_path":         filePath,
-					"compromise_type":     compromiseType,
-					"original_entropy":    fmt.Sprintf("%.3f", originalEntropy),
-					"current_entropy":     fmt.Sprintf("%.3f", currentEntropy),
-					"entropy_delta":       fmt.Sprintf("%.3f", currentEntropy-originalEntropy),
-					"detection_method":    attributionMethod,
-					"false_positive_rate": "< 0.01%",
-					"related_path":        relatedPath,
-				},
-			},
-		},
-		Evidence: map[string]interface{}{
-			"canary_path":      filePath,
-			"compromise_type":  compromiseType,
-			"detection_method": attributionMethod,
-			"attributed_pid":   fmt.Sprintf("%d", processID),
-			"attributed_image": image,
-			"related_path":     relatedPath,
-		},
-		AutoRespond: true,
-	}
-	ds.attachRelatedProcessesToCanaryAlert(alert, filePath, processGuid)
-
-	select {
-	case ds.alertChan <- alert:
-		log.Printf("[ALERT] Canary compromise alert sent: %s (related suspects: %d)", filePath, len(alert.RelatedProcesses))
-	default:
-		ds.recordDroppedAlert(alert.Severity)
-		log.Printf("[ALERT] Alert channel full, canary alert dropped (severity=%s, total dropped=%d)",
-			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
-	}
-
-	return true
+	return ds.canaryMgr.CheckFiles()
 }
 
 // StartCanaryMonitoring starts periodic canary file checking
 // Checks every 30 seconds for compromised honeypot files
 func (ds *DetectionService) StartCanaryMonitoring(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	log.Println("[CANARY] Starting periodic monitoring (every 30 seconds)...")
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("[CANARY] Monitoring stopped (context cancelled)")
-			return
-		case <-ticker.C:
-			ds.CheckCanaryFiles()
-		}
-	}
+	ds.canaryMgr.StartMonitoring(ctx.Done())
 }
 
 // CleanupCanaryFiles removes all canary files on shutdown
 func (ds *DetectionService) CleanupCanaryFiles() {
-	ds.canaryFilesMux.Lock()
-	defer ds.canaryFilesMux.Unlock()
-
-	log.Printf("[CANARY] Cleaning up %d honeypot files...", len(ds.canaryFiles))
-
-	for path := range ds.canaryFiles {
-		if err := os.Remove(path); err != nil {
-			log.Printf("[CANARY] Failed to remove %s: %v", path, err)
-		} else {
-			log.Printf("[CANARY] Removed: %s", path)
-		}
-	}
-
-	clear(ds.canaryFiles)
-	ds.canaryLatches.ResetAll()
-
-	log.Println("[CANARY] Cleanup complete")
+	ds.canaryMgr.Cleanup()
 }
 
 // GetCanaryStats returns statistics about canary files
 func (ds *DetectionService) GetCanaryStats() map[string]interface{} {
-	ds.canaryFilesMux.RLock()
-	defer ds.canaryFilesMux.RUnlock()
-
-	return map[string]interface{}{
-		"total_canaries": len(ds.canaryFiles),
-	}
+	return ds.canaryMgr.Stats()
 }
 
 // CleanupOldHighIOFlags removes high I/O flags for processes inactive for specified duration
@@ -3424,7 +2743,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 		event.TargetFile, ext, filepath.Base(event.Image), event.ProcessID)
 
 	// Keep recent ETW actor context for periodic canary compromise attribution.
-	ds.recordCanaryActor(event, "FILE_DELETE")
+	ds.canaryMgr.RecordActor(event, "FILE_DELETE")
 
 	// Track delete operations so delete+rename ransomware patterns raise velocity tiers.
 	tier := ds.updateVelocityTierForOperation(event, "delete")
@@ -3441,7 +2760,7 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 
 	// REAL-TIME CANARY DETECTION: Check if deleted file is a honeypot
 	// This catches ransomware that deletes original canary files before/during encryption
-	if canary, isCanary := ds.isCanaryFile(event.TargetFile); isCanary {
+	if canary, isCanary := ds.canaryMgr.IsCanaryFile(event.TargetFile); isCanary {
 		log.Printf("[CANARY] 🚨 REAL-TIME DETECTION: Canary file DELETED: %s", event.TargetFile)
 		log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
 
