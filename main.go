@@ -186,15 +186,15 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	log.Printf("[*] Detection mode:")
 	log.Printf("    - Ransom Note Detection: %v (focus on behavioral detection)", cfg.EnableRansomNoteDetection)
 
-	detectionService = usecase.NewDetectionService(
-		responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		cfg.EnableRansomNoteDetection,
-		cfg.RansomwareExtensions,
-		responseCfg.Whitelist.Processes,
-	)
+	detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
+		EntropyFileThreshold:      responseCfg.DetectionThresholds.HighEntropyFileThreshold,
+		ExtensionFileThreshold:    responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
+		CombinedThreshold:         responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+		RenameExtThreshold:        responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
+		EnableRansomNoteDetection: cfg.EnableRansomNoteDetection,
+		RansomwareExtensions:      cfg.RansomwareExtensions,
+		TrustedProcesses:          responseCfg.Whitelist.Processes,
+	})
 	log.Println("[+] Detection engine initialized")
 
 	// Apply detection mode and canary response settings

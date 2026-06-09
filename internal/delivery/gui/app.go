@@ -122,15 +122,15 @@ func (a *App) StartProtection() models.OperationResult {
 	ctx, cancel := context.WithCancel(a.ctx)
 
 	// Initialize detection service
-	a.detectionService = usecase.NewDetectionService(
-		a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		a.cfg.EnableRansomNoteDetection,
-		a.cfg.RansomwareExtensions,
-		a.responseCfg.Whitelist.Processes,
-	)
+	a.detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
+		EntropyFileThreshold:      a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
+		ExtensionFileThreshold:    a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
+		CombinedThreshold:         a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+		RenameExtThreshold:        a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
+		EnableRansomNoteDetection: a.cfg.EnableRansomNoteDetection,
+		RansomwareExtensions:      a.cfg.RansomwareExtensions,
+		TrustedProcesses:          a.responseCfg.Whitelist.Processes,
+	})
 
 	// Wire ML settings/callback into the fresh DetectionService.
 	a.mlMux.RLock()

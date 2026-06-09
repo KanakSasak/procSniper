@@ -86,7 +86,13 @@ func (c *capturingPredictor) Close() error {
 }
 
 func newMLTestDetectionService() *DetectionService {
-	return NewDetectionService(10, 5, 5, 3, false, []string{".encrypted"}, nil)
+	return NewDetectionService(DetectionConfig{
+		EntropyFileThreshold:   10,
+		ExtensionFileThreshold: 5,
+		CombinedThreshold:      5,
+		RenameExtThreshold:     3,
+		RansomwareExtensions:   []string{".encrypted"},
+	})
 }
 
 func mustReceiveAlert(t *testing.T, ch <-chan *domain.Alert) *domain.Alert {

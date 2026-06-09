@@ -233,13 +233,22 @@ type DetectionService struct {
 	alertsDroppedOther    uint64
 }
 
-// NewDetectionService creates a new detection service
-// entropyThreshold: number of high entropy files required before adding entropy indicator
-// extensionThreshold: number of ransomware extension files required before adding extension indicator
-// combinedThreshold: files with BOTH high entropy AND ransomware extension for immediate termination
-// enableRansomNoteDetection: enable/disable ransom note detection (default: false, focus on behavioral)
-// ransomwareExtensions: list of ransomware file extensions to detect
-func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold, renameExtThreshold int, enableRansomNoteDetection bool, ransomwareExtensions []string, trustedProcesses []string) *DetectionService {
+// DetectionConfig carries the tunables for NewDetectionService. Using a named struct
+// instead of positional args prevents silently transposing the four same-typed int
+// thresholds (a compile-clean, detection-mis-tuning hazard).
+type DetectionConfig struct {
+	EntropyFileThreshold      int      // high-entropy file count before adding entropy indicator
+	ExtensionFileThreshold    int      // ransomware-extension file count before adding extension indicator
+	CombinedThreshold         int      // files with BOTH high entropy AND ransomware extension (immediate)
+	RenameExtThreshold        int      // rename-to-ransomware-extension threshold (defaults to 3 if <= 0)
+	EnableRansomNoteDetection bool     // enable ransom-note filename detection (default false: behavioral focus)
+	RansomwareExtensions      []string // ransomware file extensions to score
+	TrustedProcesses          []string // process names/paths exempt from detection
+}
+
+// NewDetectionService creates a new detection service from a DetectionConfig.
+func NewDetectionService(cfg DetectionConfig) *DetectionService {
+	renameExtThreshold := cfg.RenameExtThreshold
 	if renameExtThreshold <= 0 {
 		renameExtThreshold = 3
 	}
@@ -259,12 +268,12 @@ func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold
 		canaryFiles:               make(map[string]*domain.CanaryFile),        // Honeypot files for detection
 		recentCanaryActors:        make(map[string]CanaryActor),
 		compromisedCanaries:       make(map[string]CanaryCompromiseState),
-		entropyFileThreshold:      entropyThreshold,
-		extensionFileThreshold:    extensionThreshold,
-		combinedThreshold:         combinedThreshold,
+		entropyFileThreshold:      cfg.EntropyFileThreshold,
+		extensionFileThreshold:    cfg.ExtensionFileThreshold,
+		combinedThreshold:         cfg.CombinedThreshold,
 		renameExtThreshold:        renameExtThreshold,
-		enableRansomNoteDetection: enableRansomNoteDetection,
-		ransomwareExtensions:      ransomwareExtensions,
+		enableRansomNoteDetection: cfg.EnableRansomNoteDetection,
+		ransomwareExtensions:      cfg.RansomwareExtensions,
 		trustedProcessNames:       make(map[string]struct{}),
 		trustedProcessPaths:       make(map[string]struct{}),
 		mlMinIndicators:           4,
@@ -272,7 +281,7 @@ func NewDetectionService(entropyThreshold, extensionThreshold, combinedThreshold
 		mlCooldown:                2 * time.Second,
 	}
 
-	ds.setTrustedProcesses(trustedProcesses)
+	ds.setTrustedProcesses(cfg.TrustedProcesses)
 
 	return ds
 }
