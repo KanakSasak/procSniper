@@ -1518,72 +1518,6 @@ func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domai
 	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 }
 
-// ProcessBrowserAccess handles browser credential file access
-func (ds *DetectionService) ProcessBrowserAccess(ctx context.Context, event *domain.MonitorEvent) {
-	if ds.isTrustedProcess(event.Image) {
-		return
-	}
-
-	// Check if non-browser process is accessing browser files
-	targetLower := strings.ToLower(event.TargetFile)
-	imageLower := strings.ToLower(event.Image)
-
-	// Skip if legitimate browser
-	legitimateBrowsers := []string{"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"}
-	for _, browser := range legitimateBrowsers {
-		if strings.Contains(imageLower, browser) {
-			return
-		}
-	}
-
-	// ML feature tracking: detect browser history and SSH key access
-	ds.fileCountersMux.Lock()
-	mlC := ds.getOrInitMLCounters(event.ProcessGuid)
-	if strings.Contains(targetLower, "\\history") || strings.Contains(targetLower, "\\places.sqlite") {
-		mlC.BrowserHistoryHit = true
-	}
-	if strings.Contains(targetLower, "\\.ssh\\") || strings.Contains(targetLower, "\\id_rsa") ||
-		strings.Contains(targetLower, "\\id_ed25519") || strings.Contains(targetLower, "\\known_hosts") {
-		mlC.SSHKeyHit = true
-	}
-	ds.fileCountersMux.Unlock()
-
-	// Check if accessing browser credential paths
-	for _, credPath := range domain.BrowserCredentialPaths {
-		if strings.Contains(targetLower, strings.ToLower(credPath)) {
-			ds.fileCountersMux.Lock()
-			credCounters := ds.getOrInitMLCounters(event.ProcessGuid)
-			credCounters.BrowserCredentialHit = true
-			ds.fileCountersMux.Unlock()
-
-			indicator := domain.Indicator{
-				Type:        domain.IndicatorCredentialTheft,
-				Severity:    domain.ThreatCritical,
-				Points:      domain.IndicatorScores[domain.IndicatorCredentialTheft],
-				Description: "Browser credential file access",
-				Timestamp:   event.Timestamp,
-				Evidence: map[string]string{
-					"file":  event.TargetFile,
-					"image": event.Image,
-				},
-			}
-
-			score := ds.addRuleIndicator(
-				event.ProcessGuid,
-				event.Image,
-				event.ProcessID,
-				indicator,
-			)
-
-			log.Printf("[DETECTION] Browser credential access: %s accessing %s (Score: %d)",
-				event.Image, event.TargetFile, score)
-
-			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-			return
-		}
-	}
-}
-
 // checkBrowserAndSSHAccess detects non-browser processes touching browser credential,
 // history, or SSH key paths and sets the corresponding ML feature flags.
 // Called from ProcessFileModified and ProcessFileCreate to wire up features 9-11.
@@ -1626,6 +1560,11 @@ func (ds *DetectionService) checkBrowserAndSSHAccess(event *domain.MonitorEvent)
 
 	ds.fileCountersMux.Lock()
 	counters := ds.getOrInitMLCounters(event.ProcessGuid)
+	// Capture the false->true transition so the credential-theft indicator is raised at
+	// most once per process. IndicatorCredentialTheft is a repeatable type in the scorer
+	// and this runs on every qualifying file event, so emitting per event would inflate
+	// the score and could spuriously trip auto-terminate.
+	firstCredHit := credHit && !counters.BrowserCredentialHit
 	if credHit {
 		counters.BrowserCredentialHit = true
 	}
@@ -1640,6 +1579,28 @@ func (ds *DetectionService) checkBrowserAndSSHAccess(event *domain.MonitorEvent)
 	if credHit {
 		log.Printf("[DETECTION] Browser credential access: %s touching %s (PID: %d)",
 			event.Image, event.TargetFile, event.ProcessID)
+	}
+
+	// Raise the credential-theft indicator and evaluate on the first credential hit.
+	// Ported from the now-deleted ProcessBrowserAccess, which scored credential theft but
+	// was never routed by any ETW EventID — leaving this the sole credential-theft alert
+	// path. (AUDIT Phase 1: port-then-delete.)
+	if firstCredHit {
+		indicator := domain.Indicator{
+			Type:        domain.IndicatorCredentialTheft,
+			Severity:    domain.ThreatCritical,
+			Points:      domain.IndicatorScores[domain.IndicatorCredentialTheft],
+			Description: "Browser credential file access",
+			Timestamp:   event.Timestamp,
+			Evidence: map[string]string{
+				"file":  event.TargetFile,
+				"image": event.Image,
+			},
+		}
+		score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		log.Printf("[DETECTION] Browser credential indicator raised: %s accessing %s (Score: %d)",
+			event.Image, event.TargetFile, score)
+		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 	}
 }
 

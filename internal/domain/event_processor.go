@@ -10,5 +10,4 @@ type EventProcessor interface {
 	ProcessFileDelete(ctx context.Context, event *MonitorEvent)
 	ProcessProcessCreate(ctx context.Context, event *MonitorEvent)
 	ProcessLSASSAccess(ctx context.Context, event *MonitorEvent)
-	ProcessBrowserAccess(ctx context.Context, event *MonitorEvent)
 }
