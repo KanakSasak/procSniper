@@ -215,11 +215,11 @@ type DetectionService struct {
 	trustedProcessPaths map[string]struct{} // Full path matches (e.g., "c:\\windows\\system32\\searchprotocolhost.exe")
 
 	// ML inference integration
-	mlPredictor      domain.MLPredictor                // nil when ML not loaded
-	mlEnabled        bool                              // whether ML detection is active
-	mlConfidence     float64                           // minimum confidence threshold (0.0–1.0)
-	mlMux            sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
-	onMLPrediction   func(*domain.MLInferenceActivity) // callback for GUI event emission
+	mlPredictor          domain.MLPredictor                // nil when ML not loaded
+	mlEnabled            bool                              // whether ML detection is active
+	mlConfidence         float64                           // minimum confidence threshold (0.0–1.0)
+	mlMux                sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
+	onMLPrediction       func(*domain.MLInferenceActivity) // callback for GUI event emission
 	mlMinIndicators      int                               // minimum non-zero features in feature vector before ML fires
 	mlLastInference      map[string]time.Time              // per-process inference cooldown tracker
 	mlCooldown           time.Duration                     // cooldown between inferences for same process
@@ -244,6 +244,12 @@ type DetectionConfig struct {
 	EnableRansomNoteDetection bool     // enable ransom-note filename detection (default false: behavioral focus)
 	RansomwareExtensions      []string // ransomware file extensions to score
 	TrustedProcesses          []string // process names/paths exempt from detection
+
+	// I/O velocity tier thresholds in files/minute. <=0 keeps the domain default
+	// (10/30/100). Critical is sourced from io_velocity_threshold_per_minute.
+	IOVelocityMonitorThreshold  float64
+	IOVelocityAnalyzeThreshold  float64
+	IOVelocityCriticalThreshold float64
 }
 
 // NewDetectionService creates a new detection service from a DetectionConfig.
@@ -282,6 +288,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 	}
 
 	ds.setTrustedProcesses(cfg.TrustedProcesses)
+	ds.velocityTracker.SetThresholds(cfg.IOVelocityMonitorThreshold, cfg.IOVelocityAnalyzeThreshold, cfg.IOVelocityCriticalThreshold)
 
 	return ds
 }

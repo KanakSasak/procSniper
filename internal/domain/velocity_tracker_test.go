@@ -29,32 +29,39 @@ func TestFileOperationTracker_DetectAnomalousActivity(t *testing.T) {
 	processGuid := "{12345678-1234-1234-1234-123456789012}"
 
 	tests := []struct {
-		name           string
-		fileCount      int
-		expectedSusp   bool
-		expectedLevel  string
-		description    string
+		name          string
+		fileCount     int
+		expectedTier  VelocityTier
+		expectedLevel string
+		description   string
 	}{
 		{
 			name:          "Low velocity",
 			fileCount:     5,
-			expectedSusp:  false,
+			expectedTier:  VelocityTierNone,
 			expectedLevel: "NONE",
 			description:   "5 files in 60s = 5 files/min",
 		},
 		{
-			name:          "Medium velocity",
-			fileCount:     55,
-			expectedSusp:  false,
-			expectedLevel: "MEDIUM",
-			description:   "55 files in 60s = 55 files/min (suspicious)",
+			name:          "Monitor velocity",
+			fileCount:     15,
+			expectedTier:  VelocityTierMonitor,
+			expectedLevel: "MONITOR",
+			description:   "15 files in 60s = 15 files/min (10-29 monitor)",
 		},
 		{
-			name:          "High velocity - ransomware",
+			name:          "Analyze velocity",
+			fileCount:     55,
+			expectedTier:  VelocityTierAnalyze,
+			expectedLevel: "ANALYZE",
+			description:   "55 files in 60s = 55 files/min (30-99 analyze)",
+		},
+		{
+			name:          "Critical velocity - ransomware",
 			fileCount:     105,
-			expectedSusp:  true,
-			expectedLevel: "HIGH",
-			description:   "105 files in 60s = 105 files/min (ransomware)",
+			expectedTier:  VelocityTierCritical,
+			expectedLevel: "CRITICAL",
+			description:   "105 files in 60s = 105 files/min (>=100 ransomware)",
 		},
 	}
 
@@ -75,11 +82,11 @@ func TestFileOperationTracker_DetectAnomalousActivity(t *testing.T) {
 				tracker.AddOperation(op)
 			}
 
-			suspicious, velocity, level := tracker.DetectAnomalousActivity(processGuid)
+			tier, velocity, level := tracker.DetectAnomalousActivity(processGuid)
 
-			if suspicious != tt.expectedSusp {
-				t.Errorf("Suspicious = %v, expected %v (velocity: %.2f)",
-					suspicious, tt.expectedSusp, velocity)
+			if tier != tt.expectedTier {
+				t.Errorf("Tier = %v, expected %v (velocity: %.2f)",
+					tier, tt.expectedTier, velocity)
 			}
 
 			if level != tt.expectedLevel {
@@ -89,6 +96,43 @@ func TestFileOperationTracker_DetectAnomalousActivity(t *testing.T) {
 			t.Logf("%s - Velocity: %.2f files/min, Level: %s",
 				tt.description, velocity, level)
 		})
+	}
+}
+
+func TestFileOperationTracker_SetThresholds(t *testing.T) {
+	const processGuid = "{set-thresholds-guid}"
+	addOps := func(tr *FileOperationTracker, n int) {
+		for i := 0; i < n; i++ {
+			tr.AddOperation(FileOperation{
+				Timestamp:   time.Now(),
+				ProcessGuid: processGuid,
+				Operation:   "create",
+			})
+		}
+	}
+
+	// 60 files/min with default thresholds (10/30/100) is ANALYZE, not CRITICAL.
+	def := NewFileOperationTracker(60 * time.Second)
+	addOps(def, 60)
+	if tier, _, _ := def.DetectAnomalousActivity(processGuid); tier != VelocityTierAnalyze {
+		t.Errorf("default: 60 files/min tier = %v, expected ANALYZE", tier)
+	}
+
+	// Lowering the critical threshold to 50 must reclassify the same load as CRITICAL —
+	// this is the io_velocity_threshold_per_minute config wiring at the domain level.
+	tuned := NewFileOperationTracker(60 * time.Second)
+	tuned.SetThresholds(0, 0, 50) // only critical overridden; monitor/analyze keep defaults
+	addOps(tuned, 60)
+	if tier, _, _ := tuned.DetectAnomalousActivity(processGuid); tier != VelocityTierCritical {
+		t.Errorf("tuned critical=50: 60 files/min tier = %v, expected CRITICAL", tier)
+	}
+
+	// Non-positive overrides are ignored so an unset/zero config key can't zero a tier.
+	keep := NewFileOperationTracker(60 * time.Second)
+	keep.SetThresholds(-1, 0, 0)
+	addOps(keep, 60)
+	if tier, _, _ := keep.DetectAnomalousActivity(processGuid); tier != VelocityTierAnalyze {
+		t.Errorf("ignored overrides: 60 files/min tier = %v, expected ANALYZE", tier)
 	}
 }
 

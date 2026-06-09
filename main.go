@@ -187,13 +187,16 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	log.Printf("    - Ransom Note Detection: %v (focus on behavioral detection)", cfg.EnableRansomNoteDetection)
 
 	detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
-		EntropyFileThreshold:      responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		ExtensionFileThreshold:    responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		CombinedThreshold:         responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		RenameExtThreshold:        responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		EnableRansomNoteDetection: cfg.EnableRansomNoteDetection,
-		RansomwareExtensions:      cfg.RansomwareExtensions,
-		TrustedProcesses:          responseCfg.Whitelist.Processes,
+		EntropyFileThreshold:        responseCfg.DetectionThresholds.HighEntropyFileThreshold,
+		ExtensionFileThreshold:      responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
+		CombinedThreshold:           responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+		RenameExtThreshold:          responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
+		EnableRansomNoteDetection:   cfg.EnableRansomNoteDetection,
+		RansomwareExtensions:        cfg.RansomwareExtensions,
+		TrustedProcesses:            responseCfg.Whitelist.Processes,
+		IOVelocityMonitorThreshold:  float64(responseCfg.DetectionThresholds.IOVelocityMonitorThreshold),
+		IOVelocityAnalyzeThreshold:  float64(responseCfg.DetectionThresholds.IOVelocityAnalyzeThreshold),
+		IOVelocityCriticalThreshold: float64(responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute),
 	})
 	log.Println("[+] Detection engine initialized")
 

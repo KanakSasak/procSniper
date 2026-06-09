@@ -123,13 +123,16 @@ func (a *App) StartProtection() models.OperationResult {
 
 	// Initialize detection service
 	a.detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
-		EntropyFileThreshold:      a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		ExtensionFileThreshold:    a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		CombinedThreshold:         a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		RenameExtThreshold:        a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		EnableRansomNoteDetection: a.cfg.EnableRansomNoteDetection,
-		RansomwareExtensions:      a.cfg.RansomwareExtensions,
-		TrustedProcesses:          a.responseCfg.Whitelist.Processes,
+		EntropyFileThreshold:        a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
+		ExtensionFileThreshold:      a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
+		CombinedThreshold:           a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
+		RenameExtThreshold:          a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
+		EnableRansomNoteDetection:   a.cfg.EnableRansomNoteDetection,
+		RansomwareExtensions:        a.cfg.RansomwareExtensions,
+		TrustedProcesses:            a.responseCfg.Whitelist.Processes,
+		IOVelocityMonitorThreshold:  float64(a.responseCfg.DetectionThresholds.IOVelocityMonitorThreshold),
+		IOVelocityAnalyzeThreshold:  float64(a.responseCfg.DetectionThresholds.IOVelocityAnalyzeThreshold),
+		IOVelocityCriticalThreshold: float64(a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute),
 	})
 
 	// Wire ML settings/callback into the fresh DetectionService.

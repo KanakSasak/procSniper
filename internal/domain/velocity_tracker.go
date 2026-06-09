@@ -22,6 +22,14 @@ type FileOperationTracker struct {
 	operations []FileOperation
 	windowSize time.Duration
 	mu         sync.RWMutex
+
+	// Per-minute tier thresholds. Defaulted to the Tier*Threshold consts by the
+	// constructor and overridable via SetThresholds (wired from the io_velocity_* config
+	// keys). Set once at construction, before the tracker is shared with detection
+	// goroutines, so they are read without locking on the hot path.
+	monitorThreshold  float64
+	analyzeThreshold  float64
+	criticalThreshold float64
 }
 
 // VelocityTier represents the detection tier based on I/O velocity
@@ -59,11 +67,31 @@ const (
 	TierCriticalThreshold = 100.0 // Files per minute - immediate alert (catch fast ransomware)
 )
 
-// NewFileOperationTracker creates a new tracker with specified window size
+// NewFileOperationTracker creates a new tracker with specified window size.
+// Tier thresholds default to the Tier*Threshold consts; override via SetThresholds.
 func NewFileOperationTracker(windowSize time.Duration) *FileOperationTracker {
 	return &FileOperationTracker{
-		operations: make([]FileOperation, 0, 10000),
-		windowSize: windowSize,
+		operations:        make([]FileOperation, 0, 10000),
+		windowSize:        windowSize,
+		monitorThreshold:  TierMonitorThreshold,
+		analyzeThreshold:  TierAnalyzeThreshold,
+		criticalThreshold: TierCriticalThreshold,
+	}
+}
+
+// SetThresholds overrides the per-minute tier thresholds. Non-positive values are
+// ignored so an unset/zero config key cannot collapse a tier to 0. Call during
+// construction, before the tracker is shared with detection goroutines (not safe for
+// concurrent use with DetectAnomalousActivity).
+func (fot *FileOperationTracker) SetThresholds(monitor, analyze, critical float64) {
+	if monitor > 0 {
+		fot.monitorThreshold = monitor
+	}
+	if analyze > 0 {
+		fot.analyzeThreshold = analyze
+	}
+	if critical > 0 {
+		fot.criticalThreshold = critical
 	}
 }
 
@@ -105,11 +133,11 @@ func (fot *FileOperationTracker) GetVelocity(processGuid string) float64 {
 func (fot *FileOperationTracker) DetectAnomalousActivity(processGuid string) (VelocityTier, float64, string) {
 	velocity := fot.GetVelocity(processGuid)
 
-	if velocity >= TierCriticalThreshold {
+	if velocity >= fot.criticalThreshold {
 		return VelocityTierCritical, velocity, "CRITICAL"
-	} else if velocity >= TierAnalyzeThreshold {
+	} else if velocity >= fot.analyzeThreshold {
 		return VelocityTierAnalyze, velocity, "ANALYZE"
-	} else if velocity >= TierMonitorThreshold {
+	} else if velocity >= fot.monitorThreshold {
 		return VelocityTierMonitor, velocity, "MONITOR"
 	}
 

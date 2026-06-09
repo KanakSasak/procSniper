@@ -15,7 +15,9 @@ type DetectionThresholds struct {
 	RansomwareExtensionFileThreshold     int    `json:"ransomware_extension_file_threshold"`
 	RansomwareExtensionRenameThreshold   int    `json:"ransomware_extension_rename_threshold"`
 	CombinedEntropyAndExtensionThreshold int    `json:"combined_entropy_and_extension_threshold"`
-	IOVelocityThresholdPerMinute         int    `json:"io_velocity_threshold_per_minute"`
+	IOVelocityThresholdPerMinute         int    `json:"io_velocity_threshold_per_minute"` // CRITICAL tier (files/min)
+	IOVelocityMonitorThreshold           int    `json:"io_velocity_monitor_threshold"`    // MONITOR tier (files/min)
+	IOVelocityAnalyzeThreshold           int    `json:"io_velocity_analyze_threshold"`    // ANALYZE tier (files/min)
 	Note                                 string `json:"note"`
 }
 
@@ -48,8 +50,8 @@ type ResponseSetting struct {
 	RelatedSuspicionMinScore  int    `json:"related_suspicion_min_score"`
 	RelatedActorWindowSeconds int    `json:"related_actor_window_seconds"`
 	InvestigationMode         bool   `json:"investigation_mode"`
-	DetectionMode             string `json:"detection_mode"`              // "rules_only", "hybrid", "ml_only"
-	CanaryResponseAction      string `json:"canary_response_action"`      // "terminate", "suspend", "alert_only"
+	DetectionMode             string `json:"detection_mode"`         // "rules_only", "hybrid", "ml_only"
+	CanaryResponseAction      string `json:"canary_response_action"` // "terminate", "suspend", "alert_only"
 }
 
 // WhitelistConfig defines processes/paths exempt from auto-response
@@ -116,6 +118,17 @@ func LoadResponseConfig(configPath string) (*ResponseConfig, error) {
 	// Backward-compatible defaults for missing threshold fields.
 	if config.DetectionThresholds.RansomwareExtensionRenameThreshold <= 0 {
 		config.DetectionThresholds.RansomwareExtensionRenameThreshold = 3
+	}
+	// I/O velocity tiers: default to the research-backed 10/30/100 files/min so an
+	// omitted key (or a literal 0) never silently zeroes a tier.
+	if config.DetectionThresholds.IOVelocityMonitorThreshold <= 0 {
+		config.DetectionThresholds.IOVelocityMonitorThreshold = 10
+	}
+	if config.DetectionThresholds.IOVelocityAnalyzeThreshold <= 0 {
+		config.DetectionThresholds.IOVelocityAnalyzeThreshold = 30
+	}
+	if config.DetectionThresholds.IOVelocityThresholdPerMinute <= 0 {
+		config.DetectionThresholds.IOVelocityThresholdPerMinute = 100
 	}
 	if _, ok := responseSettingsHas["suspend_related_on_canary"]; !ok {
 		config.ResponseSettings.SuspendRelatedOnCanary = true
