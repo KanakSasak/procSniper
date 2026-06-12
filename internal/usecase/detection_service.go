@@ -193,16 +193,10 @@ type DetectionService struct {
 	trustedProcessNames map[string]struct{} // Basename matches (e.g., "searchprotocolhost.exe")
 	trustedProcessPaths map[string]struct{} // Full path matches (e.g., "c:\\windows\\system32\\searchprotocolhost.exe")
 
-	// ML inference integration
-	mlPredictor     domain.MLPredictor                // nil when ML not loaded
-	mlEnabled       bool                              // whether ML detection is active
-	mlConfidence    float64                           // minimum confidence threshold (0.0–1.0)
-	mlMux           sync.RWMutex                      // protects mlPredictor, mlEnabled, mlConfidence, mlLastInference
-	onMLPrediction  func(*domain.MLInferenceActivity) // callback for GUI event emission
-	mlMinIndicators int                               // minimum non-zero features in feature vector before ML fires
-	mlLastInference map[string]time.Time              // per-process inference cooldown tracker
-	mlCooldown      time.Duration                     // cooldown between inferences for same process
-	detectionMode   string                            // "rules_only", "hybrid", "ml_only"
+	// ML inference subsystem (predictor, gate, cooldown, decision policy). Detection-mode
+	// orchestration stays on the service; the ML mechanics live in mlEngine (Phase 6).
+	ml            *mlEngine
+	detectionMode string // "rules_only", "hybrid", "ml_only"
 
 	// Alert-drop accounting (atomic). Dropped alerts were previously log-only and invisible.
 	alertsDropped         uint64 // total alerts dropped because alertChan was full
@@ -256,9 +250,6 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		ransomwareExtensions:      cfg.RansomwareExtensions,
 		trustedProcessNames:       make(map[string]struct{}),
 		trustedProcessPaths:       make(map[string]struct{}),
-		mlMinIndicators:           4,
-		mlLastInference:           make(map[string]time.Time),
-		mlCooldown:                2 * time.Second,
 	}
 
 	ds.setTrustedProcesses(cfg.TrustedProcesses)
@@ -267,6 +258,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 	// TxtActivityProvider), so it wires itself into the manager.
 	ds.canaryMgr = canary.NewManager(ds, ds, ds)
 	ds.dirScanner = dirscan.NewScanner(ds, ds.ransomwareExtensions)
+	ds.ml = newMLEngine()
 
 	return ds
 }
@@ -1580,9 +1572,9 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 				nonZeroCount++
 			}
 		}
-		if nonZeroCount < ds.mlMinIndicators {
+		if nonZeroCount < ds.ml.MinIndicators() {
 			log.Printf("[ML][GATE] process=%s pid=%d features=%d/%d — accumulating (mode=%s)",
-				image, pid, nonZeroCount, ds.mlMinIndicators, mode)
+				image, pid, nonZeroCount, ds.ml.MinIndicators(), mode)
 			ds.logFeatureVector(image, pid, features)
 			if mode == "ml_only" {
 				return // ml_only: nothing else to do until ML gate passes
@@ -1590,26 +1582,20 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 			// hybrid: fall through to rule-based alert path below
 		} else {
 			log.Printf("[ML][GATE] process=%s pid=%d features=%d/%d — PASSED, firing inference (mode=%s)",
-				image, pid, nonZeroCount, ds.mlMinIndicators, mode)
+				image, pid, nonZeroCount, ds.ml.MinIndicators(), mode)
 			ds.logFeatureVector(image, pid, features)
 
 			// Cooldown: don't re-infer too quickly on the same process
-			ds.mlMux.RLock()
-			lastTime := ds.mlLastInference[processGuid]
-			ds.mlMux.RUnlock()
-			if !lastTime.IsZero() && time.Since(lastTime) < ds.mlCooldown {
+			if ds.ml.InCooldown(processGuid) {
 				if mode == "ml_only" {
 					return
 				}
 				// hybrid: fall through to rule-based path
 			} else {
 				// Enough features accumulated — run ML inference
-				activity := ds.runMLInference(processGuid, image, pid, features)
+				activity := ds.ml.Decide(processGuid, image, pid, features)
 				if activity != nil && activity.Stage == "decision" && activity.Prediction != nil {
-					ds.mlMux.Lock()
-					ds.mlLastInference[processGuid] = time.Now()
-					ds.mlMux.Unlock()
-
+					ds.ml.RecordInference(processGuid)
 					ds.emitMLDecisionAlert(activity.Prediction)
 					mlDecisionMade = true
 				}
@@ -1670,25 +1656,6 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 		log.Printf("[WARNING] Alert channel full, dropping alert (severity=%s, total dropped=%d)",
 			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
-}
-
-// mlDecision is the per-class ML detection/response policy.
-type mlDecision struct {
-	Category      string
-	Severity      domain.ThreatLevel
-	Score         int
-	IndicatorType domain.IndicatorType
-	Decision      string // MLInferenceActivity decision label
-	AutoRespond   bool
-}
-
-// mlDecisionPolicy is the single source of truth mapping an ML class label to its
-// detection/response policy, consumed by both runMLInference (activity fields) and
-// emitMLDecisionAlert (alert fields) so the two cannot silently diverge. Label 0 (benign)
-// is intentionally absent — no alert and no decision.
-var mlDecisionPolicy = map[int]mlDecision{
-	1: {Category: "RANSOMWARE", Severity: domain.ThreatCritical, Score: 100, IndicatorType: domain.IndicatorMLRansomware, Decision: "terminate_eligible", AutoRespond: true},
-	2: {Category: "STEALER", Severity: domain.ThreatMedium, Score: 30, IndicatorType: domain.IndicatorMLStealer, Decision: "alert_only", AutoRespond: false},
 }
 
 func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction) {
@@ -1780,48 +1747,33 @@ func (ds *DetectionService) GetAllThreats() []*domain.ThreatScore {
 
 // SetMLPredictor sets the ML predictor for inference.
 func (ds *DetectionService) SetMLPredictor(p domain.MLPredictor) {
-	ds.mlMux.Lock()
-	defer ds.mlMux.Unlock()
-	ds.mlPredictor = p
+	ds.ml.SetPredictor(p)
 }
 
 // SetMLEnabled enables or disables ML detection.
 // Rule-based indicators continue accumulating and serve as the gate for ML inference.
 func (ds *DetectionService) SetMLEnabled(enabled bool) {
-	ds.mlMux.Lock()
-	defer ds.mlMux.Unlock()
-	ds.mlEnabled = enabled
+	ds.ml.SetEnabled(enabled)
 }
 
 // SetMLConfidence sets the minimum malicious probability threshold for ML decisions.
 func (ds *DetectionService) SetMLConfidence(threshold float64) {
-	ds.mlMux.Lock()
-	defer ds.mlMux.Unlock()
-	ds.mlConfidence = threshold
+	ds.ml.SetConfidence(threshold)
 }
 
 // SetMLMinIndicators sets the minimum number of non-zero features in the
 // feature vector before ML inference is triggered for a process.
 func (ds *DetectionService) SetMLMinIndicators(n int) {
-	ds.mlMux.Lock()
-	defer ds.mlMux.Unlock()
-	if n < 1 {
-		n = 1
-	}
-	ds.mlMinIndicators = n
+	ds.ml.SetMinIndicators(n)
 }
 
 // SetMLPredictionCallback sets a callback invoked on every ML inference activity.
 func (ds *DetectionService) SetMLPredictionCallback(cb func(*domain.MLInferenceActivity)) {
-	ds.mlMux.Lock()
-	defer ds.mlMux.Unlock()
-	ds.onMLPrediction = cb
+	ds.ml.SetPredictionCallback(cb)
 }
 
 func (ds *DetectionService) isMLModeEnabled() bool {
-	ds.mlMux.RLock()
-	defer ds.mlMux.RUnlock()
-	return ds.mlEnabled
+	return ds.ml.Enabled()
 }
 
 // SetDetectionMode sets the detection mode: "rules_only", "hybrid", or "ml_only".
@@ -1976,124 +1928,6 @@ func (ds *DetectionService) getOrInitMLCounters(processGuid string) *ProcessFile
 		}
 	}
 	return counters
-}
-
-// runMLInference runs ML model inference for a process and emits an activity record
-// for every outcome (decision, benign, below-threshold, not-ready, error).
-// If precomputed features are provided, they are used instead of re-extracting.
-func (ds *DetectionService) runMLInference(processGuid, image string, pid int, precomputed ...[14]float64) *domain.MLInferenceActivity {
-	ds.mlMux.RLock()
-	predictor := ds.mlPredictor
-	enabled := ds.mlEnabled
-	threshold := ds.mlConfidence
-	callback := ds.onMLPrediction
-	ds.mlMux.RUnlock()
-
-	ready := predictor != nil && predictor.IsReady()
-	log.Printf("[ML][ATTEMPT] process=%s pid=%d threshold=%.4f mode_enabled=%v predictor_ready=%v",
-		image, pid, threshold, enabled, ready)
-
-	activity := &domain.MLInferenceActivity{
-		ProcessGuid:    processGuid,
-		ProcessID:      pid,
-		Image:          image,
-		Threshold:      threshold,
-		ModeEnabled:    enabled,
-		PredictorReady: ready,
-		Timestamp:      time.Now(),
-	}
-
-	if !enabled {
-		activity.Stage = "skipped"
-		activity.Reason = "ml_mode_disabled"
-		ds.emitMLActivity(callback, activity)
-		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s", image, pid, activity.Reason)
-		return activity
-	}
-
-	if !ready {
-		activity.Stage = "skipped"
-		activity.Reason = "predictor_not_ready"
-		ds.emitMLActivity(callback, activity)
-		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s", image, pid, activity.Reason)
-		return activity
-	}
-
-	var features [14]float64
-	if len(precomputed) > 0 {
-		features = precomputed[0]
-	} else {
-		features = ds.ExtractFeatureVector(processGuid)
-	}
-	prediction, err := predictor.Predict(features)
-	if err != nil {
-		activity.Stage = "error"
-		activity.Reason = "inference_error"
-		activity.Error = err.Error()
-		ds.emitMLActivity(callback, activity)
-		log.Printf("[ML][ERROR] process=%s pid=%d error=%v", image, pid, err)
-		return activity
-	}
-
-	prediction.ProcessGuid = processGuid
-	prediction.ProcessID = pid
-	prediction.Image = image
-	activity.Prediction = prediction
-	if !prediction.Timestamp.IsZero() {
-		activity.Timestamp = prediction.Timestamp
-	}
-
-	probRansom := prediction.Probabilities[1]
-	probStealer := prediction.Probabilities[2]
-	maliciousProb := probRansom + probStealer
-
-	if maliciousProb < threshold {
-		activity.Stage = "skipped"
-		activity.Reason = "below_threshold"
-		activity.Decision = "none"
-		activity.DecisionScore = 0
-		activity.DecisionAutoRespond = false
-		ds.emitMLActivity(callback, activity)
-		log.Printf("[ML][SKIP] process=%s pid=%d reason=%s malicious_prob=%.4f prob_ransom=%.4f prob_steal=%.4f threshold=%.4f",
-			image, pid, activity.Reason, maliciousProb, probRansom, probStealer, threshold)
-		return activity
-	}
-
-	decisionLabel := 1
-	decisionLabelName := domain.ClassLabels[1]
-	decisionConfidence := probRansom
-	if probStealer > probRansom {
-		decisionLabel = 2
-		decisionLabelName = domain.ClassLabels[2]
-		decisionConfidence = probStealer
-	}
-	prediction.Label = decisionLabel
-	prediction.LabelName = decisionLabelName
-	prediction.Confidence = decisionConfidence
-
-	if pol, ok := mlDecisionPolicy[decisionLabel]; ok {
-		activity.Decision = pol.Decision
-		activity.DecisionCategory = pol.Category
-		activity.DecisionScore = pol.Score
-		activity.DecisionAutoRespond = pol.AutoRespond
-	}
-
-	activity.Stage = "decision"
-	activity.Reason = "model_decision"
-	ds.emitMLActivity(callback, activity)
-	return activity
-}
-
-func (ds *DetectionService) emitMLActivity(callback func(*domain.MLInferenceActivity), activity *domain.MLInferenceActivity) {
-	if activity == nil {
-		return
-	}
-	if activity.Timestamp.IsZero() {
-		activity.Timestamp = time.Now()
-	}
-	if callback != nil {
-		callback(activity)
-	}
 }
 
 // SetupCanaryFiles creates honeypot files in common ransomware target directories
@@ -3031,14 +2865,7 @@ func (ds *DetectionService) cleanupStaleProcessState(maxAge time.Duration) int {
 	}
 	ds.fileCountersMux.Unlock()
 
-	ds.mlMux.Lock()
-	for guid, ts := range ds.mlLastInference {
-		if ts.Before(cutoff) {
-			delete(ds.mlLastInference, guid)
-			removed++
-		}
-	}
-	ds.mlMux.Unlock()
+	removed += ds.ml.EvictStale(cutoff)
 
 	return removed
 }
