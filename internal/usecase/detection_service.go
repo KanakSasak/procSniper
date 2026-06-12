@@ -146,15 +146,10 @@ type DetectionService struct {
 	threatScorer    *domain.ThreatScorer
 	alertChan       chan *domain.Alert
 
-	// Multi-tier velocity tracking
-	monitoredProcesses map[string]time.Time // Tier 1: Lightweight monitoring (10-29 files/min)
-	monitoredMux       sync.RWMutex         // Protects monitoredProcesses map
-	analyzedProcesses  map[string]time.Time // Tier 2: Deep analysis (30-99 files/min)
-	analyzedMux        sync.RWMutex         // Protects analyzedProcesses map
-	highIOProcesses    map[string]time.Time // Tier 3: Critical (>=100 files/min)
-	highIOProcessesMux sync.RWMutex         // Protects highIOProcesses map
-	velocityActors     map[string]*VelocityActorState
-	velocityActorsMux  sync.RWMutex
+	// Multi-tier velocity tracking — which processes reached MONITOR/ANALYZE/CRITICAL.
+	tiers             *tierStore
+	velocityActors    map[string]*VelocityActorState
+	velocityActorsMux sync.RWMutex
 
 	// File counters for threshold-based detection
 	fileCounters    map[string]*ProcessFileCounters // ProcessGuid -> counters
@@ -235,9 +230,6 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		velocityTracker:           domain.NewFileOperationTracker(60 * time.Second),
 		threatScorer:              domain.NewThreatScorer(),
 		alertChan:                 make(chan *domain.Alert, 100),
-		monitoredProcesses:        make(map[string]time.Time), // Tier 1: Lightweight monitoring
-		analyzedProcesses:         make(map[string]time.Time), // Tier 2: Deep analysis
-		highIOProcesses:           make(map[string]time.Time), // Tier 3: Critical
 		velocityActors:            make(map[string]*VelocityActorState),
 		fileCounters:              make(map[string]*ProcessFileCounters),
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
@@ -259,6 +251,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 	ds.canaryMgr = canary.NewManager(ds, ds, ds)
 	ds.dirScanner = dirscan.NewScanner(ds, ds.ransomwareExtensions)
 	ds.ml = newMLEngine()
+	ds.tiers = newTierStore()
 
 	return ds
 }
@@ -433,10 +426,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	case domain.VelocityTierCritical:
 		// TIER 3: CRITICAL (>=100 files/min)
 		// Immediate deep analysis + indicator + alert evaluation
-		ds.highIOProcessesMux.Lock()
-		if _, exists := ds.highIOProcesses[event.ProcessGuid]; !exists {
-			ds.highIOProcesses[event.ProcessGuid] = time.Now()
-			ds.highIOProcessesMux.Unlock()
+		if ds.tiers.MarkHighIO(event.ProcessGuid) {
 
 			indicator := domain.Indicator{
 				Type:        domain.IndicatorIOVelocity,
@@ -452,17 +442,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] 🔴 TIER 3 CRITICAL: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
-		} else {
-			ds.highIOProcessesMux.Unlock()
 		}
 
 	case domain.VelocityTierAnalyze:
 		// TIER 2: ANALYZE (30-99 files/min)
 		// Deep analysis enabled, but lower severity indicator
-		ds.analyzedMux.Lock()
-		if _, exists := ds.analyzedProcesses[event.ProcessGuid]; !exists {
-			ds.analyzedProcesses[event.ProcessGuid] = time.Now()
-			ds.analyzedMux.Unlock()
+		if ds.tiers.MarkAnalyzed(event.ProcessGuid) {
 
 			indicator := domain.Indicator{
 				Type:        domain.IndicatorIOVelocity,
@@ -478,22 +463,15 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] ⚠️  TIER 2 ANALYZE: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
-		} else {
-			ds.analyzedMux.Unlock()
 		}
 
 	case domain.VelocityTierMonitor:
 		// TIER 1: MONITOR (10-29 files/min)
 		// Lightweight tracking, no entropy analysis yet
-		ds.monitoredMux.Lock()
-		if _, exists := ds.monitoredProcesses[event.ProcessGuid]; !exists {
-			ds.monitoredProcesses[event.ProcessGuid] = time.Now()
-			ds.monitoredMux.Unlock()
+		if ds.tiers.MarkMonitored(event.ProcessGuid) {
 
 			log.Printf("[MONITORING] 👁️  TIER 1 MONITOR: %.2f files/min - %s (watching for escalation)", velocity, event.Image)
 			// No indicator added yet - just tracking
-		} else {
-			ds.monitoredMux.Unlock()
 		}
 
 	case domain.VelocityTierNone:
@@ -910,10 +888,7 @@ func (ds *DetectionService) updateVelocityTierForOperation(event *domain.Monitor
 
 	switch tier {
 	case domain.VelocityTierCritical:
-		ds.highIOProcessesMux.Lock()
-		if _, exists := ds.highIOProcesses[event.ProcessGuid]; !exists {
-			ds.highIOProcesses[event.ProcessGuid] = time.Now()
-			ds.highIOProcessesMux.Unlock()
+		if ds.tiers.MarkHighIO(event.ProcessGuid) {
 
 			indicator := domain.Indicator{
 				Type:        domain.IndicatorIOVelocity,
@@ -930,15 +905,10 @@ func (ds *DetectionService) updateVelocityTierForOperation(event *domain.Monitor
 
 			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] TIER 3 CRITICAL: %.2f files/min - %s (op=%s, Score: %d)", velocity, event.Image, operation, score)
-		} else {
-			ds.highIOProcessesMux.Unlock()
 		}
 
 	case domain.VelocityTierAnalyze:
-		ds.analyzedMux.Lock()
-		if _, exists := ds.analyzedProcesses[event.ProcessGuid]; !exists {
-			ds.analyzedProcesses[event.ProcessGuid] = time.Now()
-			ds.analyzedMux.Unlock()
+		if ds.tiers.MarkAnalyzed(event.ProcessGuid) {
 
 			indicator := domain.Indicator{
 				Type:        domain.IndicatorIOVelocity,
@@ -955,18 +925,11 @@ func (ds *DetectionService) updateVelocityTierForOperation(event *domain.Monitor
 
 			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
 			log.Printf("[DETECTION] TIER 2 ANALYZE: %.2f files/min - %s (op=%s, Score: %d)", velocity, event.Image, operation, score)
-		} else {
-			ds.analyzedMux.Unlock()
 		}
 
 	case domain.VelocityTierMonitor:
-		ds.monitoredMux.Lock()
-		if _, exists := ds.monitoredProcesses[event.ProcessGuid]; !exists {
-			ds.monitoredProcesses[event.ProcessGuid] = time.Now()
-			ds.monitoredMux.Unlock()
+		if ds.tiers.MarkMonitored(event.ProcessGuid) {
 			log.Printf("[MONITORING] TIER 1 MONITOR: %.2f files/min - %s (op=%s)", velocity, event.Image, operation)
-		} else {
-			ds.monitoredMux.Unlock()
 		}
 	}
 
@@ -2395,18 +2358,8 @@ func (ds *DetectionService) GetCanaryStats() map[string]interface{} {
 // CleanupOldHighIOFlags removes high I/O flags for processes inactive for specified duration
 // This prevents memory leaks and ensures stale flags don't affect detection
 func (ds *DetectionService) CleanupOldHighIOFlags(maxAge time.Duration) int {
-	ds.highIOProcessesMux.Lock()
-	defer ds.highIOProcessesMux.Unlock()
-
 	cutoff := time.Now().Add(-maxAge)
-	removed := 0
-
-	for guid, flaggedTime := range ds.highIOProcesses {
-		if flaggedTime.Before(cutoff) {
-			delete(ds.highIOProcesses, guid)
-			removed++
-		}
-	}
+	removed := ds.tiers.EvictHighIO(cutoff)
 
 	removedVelocityActors := ds.pruneVelocityActors(velocityActorRetention)
 
@@ -2419,9 +2372,7 @@ func (ds *DetectionService) CleanupOldHighIOFlags(maxAge time.Duration) int {
 
 // GetHighIOProcessCount returns the number of processes currently flagged for deep monitoring
 func (ds *DetectionService) GetHighIOProcessCount() int {
-	ds.highIOProcessesMux.RLock()
-	defer ds.highIOProcessesMux.RUnlock()
-	return len(ds.highIOProcesses)
+	return ds.tiers.HighIOCount()
 }
 
 // GetEntropyStats returns entropy tracker statistics
@@ -2438,10 +2389,7 @@ func (ds *DetectionService) GetEntropyStats() map[string]interface{} {
 
 // IsProcessFlagged checks if a process is currently flagged for deep monitoring
 func (ds *DetectionService) IsProcessFlagged(processGuid string) bool {
-	ds.highIOProcessesMux.RLock()
-	defer ds.highIOProcessesMux.RUnlock()
-	_, exists := ds.highIOProcesses[processGuid]
-	return exists
+	return ds.tiers.IsHighIO(processGuid)
 }
 
 // ProcessFileDelete handles file deletion events
@@ -2838,23 +2786,7 @@ func (ds *DetectionService) cleanupStaleProcessState(maxAge time.Duration) int {
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
 
-	ds.monitoredMux.Lock()
-	for guid, ts := range ds.monitoredProcesses {
-		if ts.Before(cutoff) {
-			delete(ds.monitoredProcesses, guid)
-			removed++
-		}
-	}
-	ds.monitoredMux.Unlock()
-
-	ds.analyzedMux.Lock()
-	for guid, ts := range ds.analyzedProcesses {
-		if ts.Before(cutoff) {
-			delete(ds.analyzedProcesses, guid)
-			removed++
-		}
-	}
-	ds.analyzedMux.Unlock()
+	removed += ds.tiers.EvictStale(cutoff)
 
 	ds.fileCountersMux.Lock()
 	for guid, counters := range ds.fileCounters {
