@@ -154,7 +154,7 @@ func seedForMLGate(ds *DetectionService, guid, image string, pid int, nFeatures 
 	ds.velocityActorsMux.Unlock()
 
 	// Seed file counters → features[2..7+]
-	ds.fileCountersMux.Lock()
+	ds.counters.mu.Lock()
 	counters := &ProcessFileCounters{
 		DirectorySet:         map[string]struct{}{"C:\\dir1": {}, "C:\\dir2": {}}, // feature[3]
 		ExtensionCounts:      map[string]int{".encrypted": 10, ".exe": 5},         // feature[7]
@@ -170,8 +170,8 @@ func seedForMLGate(ds *DetectionService, guid, image string, pid int, nFeatures 
 	if nFeatures >= 7 {
 		counters.ShadowCopyDeleteHit = true // feature[8]
 	}
-	ds.fileCounters[guid] = counters
-	ds.fileCountersMux.Unlock()
+	ds.counters.counters[guid] = counters
+	ds.counters.mu.Unlock()
 
 	// Seed threat scorer for score/level (needed for ThreatHigh+ assertions)
 	indicatorTypes := []domain.IndicatorType{
@@ -208,7 +208,7 @@ func seedFeaturesOnly(ds *DetectionService, guid, image string, pid int, nFeatur
 	}
 	ds.velocityActorsMux.Unlock()
 
-	ds.fileCountersMux.Lock()
+	ds.counters.mu.Lock()
 	counters := &ProcessFileCounters{
 		DirectorySet:    map[string]struct{}{"C:\\dir1": {}}, // feature[3]
 		ExtensionCounts: map[string]int{".txt": 3},           // feature[7]
@@ -217,8 +217,8 @@ func seedFeaturesOnly(ds *DetectionService, guid, image string, pid int, nFeatur
 	if nFeatures >= 3 {
 		counters.TxtFileCount = 2 // feature[2]
 	}
-	ds.fileCounters[guid] = counters
-	ds.fileCountersMux.Unlock()
+	ds.counters.counters[guid] = counters
+	ds.counters.mu.Unlock()
 }
 
 func TestDetectionService_MLOnlyRansomwareDecision(t *testing.T) {
@@ -617,9 +617,9 @@ func TestDetectionService_MLOnlyRenameFastPathUpdatesExtensionFeatureBeforeInfer
 		t.Fatalf("expected extension_match feature > 0 before inference, got %.4f", predictor.lastFeat[6])
 	}
 
-	ds.fileCountersMux.RLock()
-	counters := ds.fileCounters["guid-rename-feature"]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	counters := ds.counters.counters["guid-rename-feature"]
+	ds.counters.mu.RUnlock()
 	if counters == nil || counters.RansomExtensionCount < 3 {
 		t.Fatalf("expected RansomExtensionCount >= 3, got %+v", counters)
 	}
@@ -684,12 +684,12 @@ func TestDetectionService_RuleBasedRegressionWhenMLDisabled(t *testing.T) {
 func TestDetectionService_ExtractFeatureVector_UsesDirectMLFlags(t *testing.T) {
 	ds := newMLTestDetectionService()
 
-	ds.fileCountersMux.Lock()
-	counters := ds.getOrInitMLCounters("guid-features")
+	ds.counters.mu.Lock()
+	counters := ds.counters.getOrInitLocked("guid-features")
 	counters.ShadowCopyDeleteHit = true
 	counters.BrowserCredentialHit = true
 	counters.LSASSAccessHit = true
-	ds.fileCountersMux.Unlock()
+	ds.counters.mu.Unlock()
 
 	features := ds.ExtractFeatureVector("guid-features")
 
@@ -787,9 +787,9 @@ func TestDetectionService_MLBrowserAccessFromFileModified(t *testing.T) {
 	}
 	ds.ProcessFileModified(context.Background(), event)
 
-	ds.fileCountersMux.RLock()
-	counters := ds.fileCounters["guid-browser-test"]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	counters := ds.counters.counters["guid-browser-test"]
+	ds.counters.mu.RUnlock()
 	if counters == nil || !counters.BrowserCredentialHit {
 		t.Fatal("expected BrowserCredentialHit=true after writing to Chrome Login Data path")
 	}
@@ -810,9 +810,9 @@ func TestDetectionService_MLBrowserHistoryFromFileCreate(t *testing.T) {
 	}
 	ds.ProcessFileCreate(context.Background(), event)
 
-	ds.fileCountersMux.RLock()
-	counters := ds.fileCounters["guid-history-test"]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	counters := ds.counters.counters["guid-history-test"]
+	ds.counters.mu.RUnlock()
 	if counters == nil || !counters.BrowserHistoryHit {
 		t.Fatal("expected BrowserHistoryHit=true after creating file at Chrome History path")
 	}
@@ -852,9 +852,9 @@ func TestDetectionService_MLParentPropagationShadowCopy(t *testing.T) {
 	ds.ProcessProcessCreate(context.Background(), childEvent)
 
 	// Verify parent got the ShadowCopyDeleteHit flag
-	ds.fileCountersMux.RLock()
-	parentCounters := ds.fileCounters[parentGuid]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	parentCounters := ds.counters.counters[parentGuid]
+	ds.counters.mu.RUnlock()
 	if parentCounters == nil || !parentCounters.ShadowCopyDeleteHit {
 		t.Fatal("expected parent ShadowCopyDeleteHit=true after child ran vssadmin delete shadows")
 	}
@@ -894,9 +894,9 @@ func TestDetectionService_MLParentPropagationSystemInfo(t *testing.T) {
 	ds.ProcessProcessCreate(context.Background(), childEvent)
 
 	// Verify parent got the SystemInfoHit flag
-	ds.fileCountersMux.RLock()
-	parentCounters := ds.fileCounters[parentGuid]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	parentCounters := ds.counters.counters[parentGuid]
+	ds.counters.mu.RUnlock()
 	if parentCounters == nil || !parentCounters.SystemInfoHit {
 		t.Fatal("expected parent SystemInfoHit=true after child ran systeminfo")
 	}
@@ -937,9 +937,9 @@ func TestDetectionService_MLParentPropagationShadowCopy_PPID0(t *testing.T) {
 	ds.ProcessProcessCreate(context.Background(), childEvent)
 
 	// Verify the active velocity actor received the ShadowCopyDeleteHit flag via broadcast
-	ds.fileCountersMux.RLock()
-	ransomCounters := ds.fileCounters[ransomGuid]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	ransomCounters := ds.counters.counters[ransomGuid]
+	ds.counters.mu.RUnlock()
 	if ransomCounters == nil || !ransomCounters.ShadowCopyDeleteHit {
 		t.Fatal("expected active velocity actor to receive ShadowCopyDeleteHit=true when child PPID=0")
 	}
@@ -980,9 +980,9 @@ func TestDetectionService_BroadcastSkipsInactiveActors(t *testing.T) {
 	ds.ProcessProcessCreate(context.Background(), childEvent)
 
 	// Verify the inactive actor did NOT get the flag
-	ds.fileCountersMux.RLock()
-	inactiveCounters := ds.fileCounters[inactiveGuid]
-	ds.fileCountersMux.RUnlock()
+	ds.counters.mu.RLock()
+	inactiveCounters := ds.counters.counters[inactiveGuid]
+	ds.counters.mu.RUnlock()
 	if inactiveCounters != nil && inactiveCounters.ShadowCopyDeleteHit {
 		t.Fatal("inactive velocity actor should NOT receive ShadowCopyDeleteHit via broadcast")
 	}

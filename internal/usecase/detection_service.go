@@ -151,9 +151,8 @@ type DetectionService struct {
 	velocityActors    map[string]*VelocityActorState
 	velocityActorsMux sync.RWMutex
 
-	// File counters for threshold-based detection
-	fileCounters    map[string]*ProcessFileCounters // ProcessGuid -> counters
-	fileCountersMux sync.RWMutex                    // Protects fileCounters map
+	// File counters for threshold-based detection (owns the map + its lock; Phase 6)
+	counters *counterStore
 
 	// Entropy tracking for detecting encryption
 	entropyTracker *domain.EntropyTracker // Tracks entropy changes over time
@@ -231,7 +230,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		threatScorer:              domain.NewThreatScorer(),
 		alertChan:                 make(chan *domain.Alert, 100),
 		velocityActors:            make(map[string]*VelocityActorState),
-		fileCounters:              make(map[string]*ProcessFileCounters),
+		counters:                  newCounterStore(),
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
 		modifiedHighEntropyFiles:  make(map[string]*ModifiedHighEntropyFile),  // Track modified high-entropy files
 		entropyFileThreshold:      cfg.EntropyFileThreshold,
@@ -288,13 +287,14 @@ func (ds *DetectionService) RelatedActors(canaryPath, attributedGuid string, now
 
 // TxtActivity implements canary.TxtActivityProvider.
 func (ds *DetectionService) TxtActivity(processGuid string) (int, int) {
-	ds.fileCountersMux.RLock()
-	defer ds.fileCountersMux.RUnlock()
-	counters, ok := ds.fileCounters[processGuid]
-	if !ok {
-		return 0, 0
-	}
-	return counters.TxtFileCount, len(counters.TxtFileDirectories)
+	var txtCount, dirCount int
+	ds.counters.Read(processGuid, func(counters *ProcessFileCounters, ok bool) {
+		if ok {
+			txtCount = counters.TxtFileCount
+			dirCount = len(counters.TxtFileDirectories)
+		}
+	})
+	return txtCount, dirCount
 }
 
 func (ds *DetectionService) setTrustedProcesses(processes []string) {
@@ -481,13 +481,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	}
 
 	// ML feature tracking: accumulate directory + extension stats for every file create
-	ds.fileCountersMux.Lock()
-	mlCounters := ds.getOrInitMLCounters(event.ProcessGuid)
-	mlCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-	if ext != "" {
-		mlCounters.ExtensionCounts[strings.ToLower(ext)]++
-	}
-	ds.fileCountersMux.Unlock()
+	ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
+		c.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+		if ext != "" {
+			c.ExtensionCounts[strings.ToLower(ext)]++
+		}
+	})
 
 	// STAGE 2: Determine analysis level based on tier
 	// CRITICAL and ANALYZE tiers get deep file analysis
@@ -506,38 +505,28 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	if ext == ".txt" && txtTrackingEnabled {
 		dirPath := filepath.Dir(event.TargetFile)
 
-		ds.fileCountersMux.Lock()
-		counters, exists := ds.fileCounters[event.ProcessGuid]
-		if !exists {
-			counters = &ProcessFileCounters{
-				HighEntropyCount:           0,
-				RansomExtensionCount:       0,
-				CombinedEntropyAndExtCount: 0,
-				TxtFileCount:               0,
-				TxtFileDirectories:         make([]string, 0),
-				LastUpdated:                time.Now(),
+		var txtCount, dirCount int
+		var txtDirs []string
+		ds.counters.Mutate(event.ProcessGuid, func(counters *ProcessFileCounters) {
+			counters.TxtFileCount++
+
+			// Track unique directories where .txt files are created
+			dirExists := false
+			for _, existingDir := range counters.TxtFileDirectories {
+				if existingDir == dirPath {
+					dirExists = true
+					break
+				}
 			}
-			ds.fileCounters[event.ProcessGuid] = counters
-		}
-
-		counters.TxtFileCount++
-
-		// Track unique directories where .txt files are created
-		dirExists := false
-		for _, existingDir := range counters.TxtFileDirectories {
-			if existingDir == dirPath {
-				dirExists = true
-				break
+			if !dirExists {
+				counters.TxtFileDirectories = append(counters.TxtFileDirectories, dirPath)
 			}
-		}
-		if !dirExists {
-			counters.TxtFileDirectories = append(counters.TxtFileDirectories, dirPath)
-		}
 
-		txtCount := counters.TxtFileCount
-		dirCount := len(counters.TxtFileDirectories)
-		counters.LastUpdated = time.Now()
-		ds.fileCountersMux.Unlock()
+			txtCount = counters.TxtFileCount
+			dirCount = len(counters.TxtFileDirectories)
+			txtDirs = append([]string(nil), counters.TxtFileDirectories...)
+			counters.LastUpdated = time.Now()
+		})
 
 		log.Printf("[TIER 2] .txt file created: %s (%d total .txt files across %d directories)",
 			filepath.Base(event.TargetFile), txtCount, dirCount)
@@ -549,8 +538,9 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 				txtCount, dirCount)
 			log.Printf("[TIER 2] Triggering directory scan to find encrypted files alongside ransom notes...")
 
-			// Trigger directory scan to find ENCRYPTED FILES
-			go ds.dirScanner.ScanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, counters.TxtFileDirectories, event.Timestamp)
+			// Trigger directory scan to find ENCRYPTED FILES (snapshot the dirs taken under
+			// the counters lock so the goroutine never races future appends).
+			go ds.dirScanner.ScanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, txtDirs, event.Timestamp)
 		}
 	}
 
@@ -561,21 +551,9 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 	log.Printf("[DEEP ANALYSIS] Analyzing file from high I/O process: %s", event.TargetFile)
 
-	// Get or create file counters for this process
-	ds.fileCountersMux.Lock()
-	counters, exists := ds.fileCounters[event.ProcessGuid]
-	if !exists {
-		counters = &ProcessFileCounters{
-			HighEntropyCount:           0,
-			RansomExtensionCount:       0,
-			CombinedEntropyAndExtCount: 0,
-			TxtFileCount:               0,
-			TxtFileDirectories:         make([]string, 0),
-			LastUpdated:                time.Now(),
-		}
-		ds.fileCounters[event.ProcessGuid] = counters
-	}
-	ds.fileCountersMux.Unlock()
+	// The counters entry was already created by the ML tracking block above; the deep-analysis
+	// increments below go through ds.counters.Mutate, which get-or-inits under the store lock
+	// regardless (no escaped pointer reused across separate lock acquisitions).
 
 	// Check both conditions: ransomware extension AND entropy
 	hasRansomExtension := domain.IsRansomwareExtension(event.TargetFile, ds.ransomwareExtensions)
@@ -725,13 +703,14 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	// CRITICAL PATH: Files with BOTH high entropy AND ransomware extension
 	// This is the highest confidence indicator - triggers immediate termination
 	if hasRansomExtension && hasHighEntropy {
-		ds.fileCountersMux.Lock()
-		counters.CombinedEntropyAndExtCount++
-		counters.HighEntropyCount++
-		counters.RansomExtensionCount++
-		counters.LastUpdated = time.Now()
-		combinedCount := counters.CombinedEntropyAndExtCount
-		ds.fileCountersMux.Unlock()
+		var combinedCount int
+		ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
+			c.CombinedEntropyAndExtCount++
+			c.HighEntropyCount++
+			c.RansomExtensionCount++
+			c.LastUpdated = time.Now()
+			combinedCount = c.CombinedEntropyAndExtCount
+		})
 
 		log.Printf("[DETECTION] ⚠️  CRITICAL: File with HIGH ENTROPY + RANSOMWARE EXTENSION detected: %s (%.3f) - Combined Count: %d/%d",
 			event.TargetFile, entropy.Entropy, combinedCount, ds.combinedThreshold)
@@ -789,11 +768,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 	// SEPARATE PATH: Check for ransomware extension only (without high entropy)
 	if hasRansomExtension {
-		ds.fileCountersMux.Lock()
-		counters.RansomExtensionCount++
-		counters.LastUpdated = time.Now()
-		currentCount := counters.RansomExtensionCount
-		ds.fileCountersMux.Unlock()
+		var currentCount int
+		ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
+			c.RansomExtensionCount++
+			c.LastUpdated = time.Now()
+			currentCount = c.RansomExtensionCount
+		})
 
 		log.Printf("[DETECTION] Ransomware extension file detected: %s (Count: %d/%d)",
 			event.TargetFile, currentCount, ds.extensionFileThreshold)
@@ -827,11 +807,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 
 	// SEPARATE PATH: Check for high entropy only (without ransomware extension)
 	if hasHighEntropy {
-		ds.fileCountersMux.Lock()
-		counters.HighEntropyCount++
-		counters.LastUpdated = time.Now()
-		currentCount := counters.HighEntropyCount
-		ds.fileCountersMux.Unlock()
+		var currentCount int
+		ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
+			c.HighEntropyCount++
+			c.LastUpdated = time.Now()
+			currentCount = c.HighEntropyCount
+		})
 
 		log.Printf("[DETECTION] High entropy file detected: %s (%.3f > %.3f) - Count: %d/%d",
 			event.TargetFile, entropy.Entropy, entropy.Threshold, currentCount, ds.entropyFileThreshold)
@@ -965,36 +946,35 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 
 	// ML feature tracking: directory + extension from modify events
 	isRename := isRenameMonitorEvent(event)
-	ds.fileCountersMux.Lock()
-	modMLCounters := ds.getOrInitMLCounters(event.ProcessGuid)
-	modMLCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-	if ext != "" {
-		modMLCounters.ExtensionCounts[strings.ToLower(ext)]++
-		// For rename events, also track the original (inner) extension so Shannon
-		// entropy is non-zero. E.g., "document.pdf.CONTI" → track both ".conti" and ".pdf".
-		if isRename {
-			base := strings.TrimSuffix(event.TargetFile, ext)
-			if innerExt := filepath.Ext(base); innerExt != "" {
-				modMLCounters.ExtensionCounts[strings.ToLower(innerExt)]++
+	ds.counters.Mutate(event.ProcessGuid, func(modMLCounters *ProcessFileCounters) {
+		modMLCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+		if ext != "" {
+			modMLCounters.ExtensionCounts[strings.ToLower(ext)]++
+			// For rename events, also track the original (inner) extension so Shannon
+			// entropy is non-zero. E.g., "document.pdf.CONTI" → track both ".conti" and ".pdf".
+			if isRename {
+				base := strings.TrimSuffix(event.TargetFile, ext)
+				if innerExt := filepath.Ext(base); innerExt != "" {
+					modMLCounters.ExtensionCounts[strings.ToLower(innerExt)]++
+				}
 			}
 		}
-	}
-	// Track .txt files from rename events (ransomware may rename tmp → README.txt)
-	if isRename && strings.EqualFold(ext, ".txt") {
-		modMLCounters.TxtFileCount++
-		dirPath := filepath.Dir(event.TargetFile)
-		dirExists := false
-		for _, d := range modMLCounters.TxtFileDirectories {
-			if d == dirPath {
-				dirExists = true
-				break
+		// Track .txt files from rename events (ransomware may rename tmp → README.txt)
+		if isRename && strings.EqualFold(ext, ".txt") {
+			modMLCounters.TxtFileCount++
+			dirPath := filepath.Dir(event.TargetFile)
+			dirExists := false
+			for _, d := range modMLCounters.TxtFileDirectories {
+				if d == dirPath {
+					dirExists = true
+					break
+				}
+			}
+			if !dirExists {
+				modMLCounters.TxtFileDirectories = append(modMLCounters.TxtFileDirectories, dirPath)
 			}
 		}
-		if !dirExists {
-			modMLCounters.TxtFileDirectories = append(modMLCounters.TxtFileDirectories, dirPath)
-		}
-	}
-	ds.fileCountersMux.Unlock()
+	})
 
 	// ML feature tracking: detect browser credential / history / SSH key access
 	ds.checkBrowserAndSSHAccess(event)
@@ -1015,19 +995,19 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 
 		const renameWindow = 60 * time.Second
 
-		ds.fileCountersMux.Lock()
-		counters := ds.getOrInitMLCounters(event.ProcessGuid)
-		if counters.RenameRansomExtHits == nil {
-			counters.RenameRansomExtHits = make([]time.Time, 0, ds.renameExtThreshold+2)
-		}
-		counters.RenameRansomExtHits = trimRenameHits(counters.RenameRansomExtHits, now, renameWindow)
-		counters.RenameRansomExtHits = append(counters.RenameRansomExtHits, now)
-		// Keep ML feature counters current before triggering inference.
-		counters.RansomExtensionCount++
-		renameCount := len(counters.RenameRansomExtHits)
-		extensionCount := counters.RansomExtensionCount
-		counters.LastUpdated = now
-		ds.fileCountersMux.Unlock()
+		var renameCount, extensionCount int
+		ds.counters.Mutate(event.ProcessGuid, func(counters *ProcessFileCounters) {
+			if counters.RenameRansomExtHits == nil {
+				counters.RenameRansomExtHits = make([]time.Time, 0, ds.renameExtThreshold+2)
+			}
+			counters.RenameRansomExtHits = trimRenameHits(counters.RenameRansomExtHits, now, renameWindow)
+			counters.RenameRansomExtHits = append(counters.RenameRansomExtHits, now)
+			// Keep ML feature counters current before triggering inference.
+			counters.RansomExtensionCount++
+			renameCount = len(counters.RenameRansomExtHits)
+			extensionCount = counters.RansomExtensionCount
+			counters.LastUpdated = now
+		})
 
 		log.Printf("[DETECTION] Rename-to-ransom-extension observed: %s (%d/%d in %s, extension_count=%d)",
 			event.TargetFile, renameCount, ds.renameExtThreshold, renameWindow, extensionCount)
@@ -1192,21 +1172,13 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 		log.Printf("[FILE_MODIFIED] Modified file has high entropy: %.3f (threshold: %.3f)",
 			currentEntropy.Entropy, currentEntropy.Threshold)
 
-		// Get or create file counters
-		ds.fileCountersMux.Lock()
-		counters, exists := ds.fileCounters[event.ProcessGuid]
-		if !exists {
-			counters = &ProcessFileCounters{
-				HighEntropyCount:           0,
-				RansomExtensionCount:       0,
-				CombinedEntropyAndExtCount: 0,
-				LastUpdated:                time.Now(),
-			}
-			ds.fileCounters[event.ProcessGuid] = counters
-		}
-		counters.HighEntropyCount++
-		currentCount := counters.HighEntropyCount
-		ds.fileCountersMux.Unlock()
+		// NOTE: this path intentionally does NOT touch LastUpdated — preserved from the
+		// pre-counterStore behavior (changing it would alter eviction timing for these processes).
+		var currentCount int
+		ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
+			c.HighEntropyCount++
+			currentCount = c.HighEntropyCount
+		})
 
 		log.Printf("[FILE_MODIFIED] High-entropy modification count: %d/%d",
 			currentCount, ds.entropyFileThreshold)
@@ -1546,80 +1518,77 @@ func (ds *DetectionService) logFeatureVector(image string, pid int, features [14
 func (ds *DetectionService) ExtractFeatureVector(processGuid string) [14]float64 {
 	var features [14]float64
 
-	// Feature 0: velocity (files/min in last 60s)
+	// Feature 0: velocity (files/min in last 60s). Read under velocityActorsMux only; the
+	// cumulative count for feature 1 is copied out as a value so no pointer escapes the lock.
+	var cumulativeFileCount int
 	ds.velocityActorsMux.RLock()
-	actor, hasActor := ds.velocityActors[processGuid]
-	if hasActor {
+	if actor, hasActor := ds.velocityActors[processGuid]; hasActor {
 		features[0] = float64(actor.TotalOps60s)
+		cumulativeFileCount = actor.CumulativeFileCount
 	}
 	ds.velocityActorsMux.RUnlock()
 
-	// Features 1-4 from file counters
-	ds.fileCountersMux.RLock()
-	counters, hasCounters := ds.fileCounters[processGuid]
-	if hasCounters {
-		// Feature 1: file_count (cumulative total file ops since process start)
-		if hasActor {
-			features[1] = float64(actor.CumulativeFileCount)
+	// Feature 5: is_signed (default 0 for v1 — PE signature check not implemented yet)
+	features[5] = 0
+
+	// Features 1-4 and 6-13 from file counters — read entirely inside the store's read lock
+	// so the counters pointer (and the ExtensionCounts map iterated below) never escapes it.
+	ds.counters.Read(processGuid, func(counters *ProcessFileCounters, hasCounters bool) {
+		if !hasCounters {
+			return
 		}
+		// Feature 1: file_count (cumulative total file ops since process start)
+		features[1] = float64(cumulativeFileCount)
 		// Feature 2: txt_file_count
 		features[2] = float64(counters.TxtFileCount)
 		// Feature 3: directory_count
 		features[3] = float64(len(counters.DirectorySet))
 		// Feature 4: file_delete_count
 		features[4] = float64(counters.DeleteCount)
-	}
-	ds.fileCountersMux.RUnlock()
 
-	// Feature 5: is_signed (default 0 for v1 — PE signature check not implemented yet)
-	features[5] = 0
-
-	// Feature 6: extension_match (boolean: 1 if ransomware extensions observed, 0 otherwise)
-	if hasCounters && counters.RansomExtensionCount > 0 {
-		features[6] = 1.0
-	}
-
-	// Feature 7: extension_entropy (Shannon entropy of the extension frequency distribution)
-	if hasCounters && counters.ExtensionCounts != nil {
-		total := 0
-		for _, c := range counters.ExtensionCounts {
-			total += c
+		// Feature 6: extension_match (boolean: 1 if ransomware extensions observed, 0 otherwise)
+		if counters.RansomExtensionCount > 0 {
+			features[6] = 1.0
 		}
-		if total > 0 {
-			entropy := 0.0
+
+		// Feature 7: extension_entropy (Shannon entropy of the extension frequency distribution)
+		if counters.ExtensionCounts != nil {
+			total := 0
 			for _, c := range counters.ExtensionCounts {
-				p := float64(c) / float64(total)
-				if p > 0 {
-					entropy -= p * math.Log2(p)
-				}
+				total += c
 			}
-			features[7] = entropy
+			if total > 0 {
+				entropy := 0.0
+				for _, c := range counters.ExtensionCounts {
+					p := float64(c) / float64(total)
+					if p > 0 {
+						entropy -= p * math.Log2(p)
+					}
+				}
+				features[7] = entropy
+			}
 		}
-	}
 
-	// Features 8-13: boolean indicators (1.0 if present, 0.0 otherwise)
-	if hasCounters && counters.ShadowCopyDeleteHit {
-		features[8] = 1 // shadow_copy_delete
-	}
-	if hasCounters && counters.BrowserCredentialHit {
-		features[9] = 1 // browser_credential_access
-	}
-
-	// Feature 10: browser_history_access
-	if hasCounters && counters.BrowserHistoryHit {
-		features[10] = 1
-	}
-	// Feature 11: ssh_key_access
-	if hasCounters && counters.SSHKeyHit {
-		features[11] = 1
-	}
-	if hasCounters && counters.LSASSAccessHit {
-		features[12] = 1 // lsass_access
-	}
-	// Feature 13: system_info_queries
-	if hasCounters && counters.SystemInfoHit {
-		features[13] = 1
-	}
+		// Features 8-13: boolean indicators (1.0 if present, 0.0 otherwise)
+		if counters.ShadowCopyDeleteHit {
+			features[8] = 1 // shadow_copy_delete
+		}
+		if counters.BrowserCredentialHit {
+			features[9] = 1 // browser_credential_access
+		}
+		if counters.BrowserHistoryHit {
+			features[10] = 1 // browser_history_access
+		}
+		if counters.SSHKeyHit {
+			features[11] = 1 // ssh_key_access
+		}
+		if counters.LSASSAccessHit {
+			features[12] = 1 // lsass_access
+		}
+		if counters.SystemInfoHit {
+			features[13] = 1 // system_info_queries
+		}
+	})
 
 	return features
 }
@@ -1628,32 +1597,7 @@ func (ds *DetectionService) ExtractFeatureVector(processGuid string) [14]float64
 // (initializing it if needed). It is the analyzerSink hook for analyzers that mutate ML
 // feature flags.
 func (ds *DetectionService) setMLCounter(processGuid string, set func(*ProcessFileCounters)) {
-	ds.fileCountersMux.Lock()
-	defer ds.fileCountersMux.Unlock()
-	set(ds.getOrInitMLCounters(processGuid))
-}
-
-// getOrInitMLCounters returns the ProcessFileCounters for a GUID, initializing ML fields if needed.
-func (ds *DetectionService) getOrInitMLCounters(processGuid string) *ProcessFileCounters {
-	counters, exists := ds.fileCounters[processGuid]
-	if !exists {
-		counters = &ProcessFileCounters{
-			TxtFileDirectories: make([]string, 0),
-			DirectorySet:       make(map[string]struct{}),
-			ExtensionCounts:    make(map[string]int),
-			LastUpdated:        time.Now(),
-		}
-		ds.fileCounters[processGuid] = counters
-	} else {
-		// Ensure ML maps are initialized (for pre-existing counters created before ML)
-		if counters.DirectorySet == nil {
-			counters.DirectorySet = make(map[string]struct{})
-		}
-		if counters.ExtensionCounts == nil {
-			counters.ExtensionCounts = make(map[string]int)
-		}
-	}
-	return counters
+	ds.counters.Mutate(processGuid, set)
 }
 
 // SetupCanaryFiles creates honeypot files in common ransomware target directories
@@ -1911,18 +1855,17 @@ func (ds *DetectionService) propagateMLFlagToParent(event *domain.MonitorEvent, 
 		}
 		return
 	}
-	ds.fileCountersMux.Lock()
-	parentCounters := ds.getOrInitMLCounters(parentGuid)
-	if shadowCopy {
-		parentCounters.ShadowCopyDeleteHit = true
-	}
-	if systemInfo {
-		parentCounters.SystemInfoHit = true
-	}
-	if lsassAccess {
-		parentCounters.LSASSAccessHit = true
-	}
-	ds.fileCountersMux.Unlock()
+	ds.counters.Mutate(parentGuid, func(parentCounters *ProcessFileCounters) {
+		if shadowCopy {
+			parentCounters.ShadowCopyDeleteHit = true
+		}
+		if systemInfo {
+			parentCounters.SystemInfoHit = true
+		}
+		if lsassAccess {
+			parentCounters.LSASSAccessHit = true
+		}
+	})
 	log.Printf("[ML][PARENT_PROPAGATE] child_pid=%d parent_guid=%s shadow=%v sysinfo=%v lsass=%v",
 		event.ProcessID, parentGuid, shadowCopy, systemInfo, lsassAccess)
 }
@@ -1949,9 +1892,7 @@ func (ds *DetectionService) broadcastMLFlagToActiveActors(event *domain.MonitorE
 		return
 	}
 
-	ds.fileCountersMux.Lock()
-	for _, guid := range activeGuids {
-		counters := ds.getOrInitMLCounters(guid)
+	ds.counters.MutateMany(activeGuids, func(counters *ProcessFileCounters) {
 		if shadowCopy {
 			counters.ShadowCopyDeleteHit = true
 		}
@@ -1961,8 +1902,7 @@ func (ds *DetectionService) broadcastMLFlagToActiveActors(event *domain.MonitorE
 		if lsassAccess {
 			counters.LSASSAccessHit = true
 		}
-	}
-	ds.fileCountersMux.Unlock()
+	})
 
 	log.Printf("[ML][BROADCAST] Propagated flags to %d active actors (child_pid=%d shadow=%v sysinfo=%v lsass=%v)",
 		len(activeGuids), event.ProcessID, shadowCopy, systemInfo, lsassAccess)
@@ -2175,14 +2115,13 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 	tier := ds.updateVelocityTierForOperation(event, "delete")
 
 	// ML feature tracking: increment delete counter, track directory + extension
-	ds.fileCountersMux.Lock()
-	delCounters := ds.getOrInitMLCounters(event.ProcessGuid)
-	delCounters.DeleteCount++
-	delCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-	if ext != "" {
-		delCounters.ExtensionCounts[strings.ToLower(ext)]++
-	}
-	ds.fileCountersMux.Unlock()
+	ds.counters.Mutate(event.ProcessGuid, func(delCounters *ProcessFileCounters) {
+		delCounters.DeleteCount++
+		delCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
+		if ext != "" {
+			delCounters.ExtensionCounts[strings.ToLower(ext)]++
+		}
+	})
 
 	// REAL-TIME CANARY DETECTION: Check if deleted file is a honeypot
 	// This catches ransomware that deletes original canary files before/during encryption
@@ -2191,15 +2130,14 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 		log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
 
 		// Check for correlation with .txt file creation
-		ds.fileCountersMux.RLock()
-		counters, hasCounters := ds.fileCounters[event.ProcessGuid]
 		var txtFileCount int
 		var txtDirCount int
-		if hasCounters {
-			txtFileCount = counters.TxtFileCount
-			txtDirCount = len(counters.TxtFileDirectories)
-		}
-		ds.fileCountersMux.RUnlock()
+		ds.counters.Read(event.ProcessGuid, func(counters *ProcessFileCounters, hasCounters bool) {
+			if hasCounters {
+				txtFileCount = counters.TxtFileCount
+				txtDirCount = len(counters.TxtFileDirectories)
+			}
+		})
 
 		// HIGH CONFIDENCE CORRELATION: Canary deleted + ransom notes created
 		if txtFileCount >= 3 {
@@ -2550,16 +2488,7 @@ func (ds *DetectionService) cleanupStaleProcessState(maxAge time.Duration) int {
 	removed := 0
 
 	removed += ds.tiers.EvictStale(cutoff)
-
-	ds.fileCountersMux.Lock()
-	for guid, counters := range ds.fileCounters {
-		if counters != nil && counters.LastUpdated.Before(cutoff) {
-			delete(ds.fileCounters, guid)
-			removed++
-		}
-	}
-	ds.fileCountersMux.Unlock()
-
+	removed += ds.counters.Evict(cutoff)
 	removed += ds.ml.EvictStale(cutoff)
 
 	return removed
