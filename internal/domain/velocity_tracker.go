@@ -15,13 +15,27 @@ type FileOperation struct {
 	Image       string // Process executable path
 }
 
-// FileOperationTracker tracks file operations in sliding time windows
-// Research shows ransomware encrypts at 38-280 files/second
-// Detection threshold: 100 files/minute for high-confidence alerts
+// velocityShardCount is the number of striped shards (power of two so we can mask). Operations
+// are partitioned by FNV-1a(ProcessGuid) so events from different processes contend on
+// different locks and each scan touches only one shard's slice instead of a global one.
+const velocityShardCount = 64
+
+// velocityShard holds the windowed operations for the processes whose GUID hashes to it.
+type velocityShard struct {
+	mu  sync.RWMutex
+	ops []FileOperation
+}
+
+// FileOperationTracker tracks file operations in sliding time windows.
+// Research shows ransomware encrypts at 38-280 files/second; detection threshold is
+// 100 files/minute for high-confidence alerts.
+//
+// The operation store is striped by ProcessGuid across velocityShardCount shards (Phase 5):
+// AddOperation/GetVelocity touch only the one shard for a process, so the per-event hot path
+// no longer serializes every process through a single global lock + global-slice scan.
 type FileOperationTracker struct {
-	operations []FileOperation
+	shards     [velocityShardCount]velocityShard
 	windowSize time.Duration
-	mu         sync.RWMutex
 
 	// Per-minute tier thresholds. Defaulted to the Tier*Threshold consts by the
 	// constructor and overridable via SetThresholds (wired from the io_velocity_* config
@@ -71,12 +85,29 @@ const (
 // Tier thresholds default to the Tier*Threshold consts; override via SetThresholds.
 func NewFileOperationTracker(windowSize time.Duration) *FileOperationTracker {
 	return &FileOperationTracker{
-		operations:        make([]FileOperation, 0, 10000),
 		windowSize:        windowSize,
 		monitorThreshold:  TierMonitorThreshold,
 		analyzeThreshold:  TierAnalyzeThreshold,
 		criticalThreshold: TierCriticalThreshold,
 	}
+}
+
+// fnvHash32a is an allocation-free FNV-1a hash used to pick a process's shard.
+func fnvHash32a(s string) uint32 {
+	const (
+		offset = uint32(2166136261)
+		prime  = uint32(16777619)
+	)
+	h := offset
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime
+	}
+	return h
+}
+
+func (fot *FileOperationTracker) shardFor(processGuid string) *velocityShard {
+	return &fot.shards[fnvHash32a(processGuid)&(velocityShardCount-1)]
 }
 
 // SetThresholds overrides the per-minute tier thresholds. Non-positive values are
@@ -95,31 +126,37 @@ func (fot *FileOperationTracker) SetThresholds(monitor, analyze, critical float6
 	}
 }
 
-// AddOperation adds a file operation and removes expired ones
+// AddOperation adds a file operation and removes expired ones from its shard.
+// The prune predicate is purely per-op-timestamp (no cross-process coupling), so partitioning
+// by ProcessGuid yields counts identical to the former global slice.
 func (fot *FileOperationTracker) AddOperation(op FileOperation) {
-	fot.mu.Lock()
-	defer fot.mu.Unlock()
+	sh := fot.shardFor(op.ProcessGuid)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	// Remove operations outside window
 	cutoff := time.Now().Add(-fot.windowSize)
-	validOps := make([]FileOperation, 0, len(fot.operations)+1)
+	validOps := make([]FileOperation, 0, len(sh.ops)+1)
 
-	for _, existingOp := range fot.operations {
+	for _, existingOp := range sh.ops {
 		if existingOp.Timestamp.After(cutoff) {
 			validOps = append(validOps, existingOp)
 		}
 	}
 
-	fot.operations = append(validOps, op)
+	sh.ops = append(validOps, op)
 }
 
-// GetVelocity calculates files per minute for a specific process
+// GetVelocity calculates files per minute for a specific process.
+// Mirrors the original: counts the process's operations in its (already-pruned) shard and
+// divides by the fixed window — no read-time re-filtering.
 func (fot *FileOperationTracker) GetVelocity(processGuid string) float64 {
-	fot.mu.RLock()
-	defer fot.mu.RUnlock()
+	sh := fot.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
 	count := 0
-	for _, op := range fot.operations {
+	for _, op := range sh.ops {
 		if op.ProcessGuid == processGuid {
 			count++
 		}
@@ -152,11 +189,12 @@ func (fot *FileOperationTracker) GetVelocityTier(processGuid string) VelocityTie
 
 // GetOperationCount returns total operations in window for a process
 func (fot *FileOperationTracker) GetOperationCount(processGuid string) int {
-	fot.mu.RLock()
-	defer fot.mu.RUnlock()
+	sh := fot.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
 	count := 0
-	for _, op := range fot.operations {
+	for _, op := range sh.ops {
 		if op.ProcessGuid == processGuid {
 			count++
 		}
@@ -166,13 +204,14 @@ func (fot *FileOperationTracker) GetOperationCount(processGuid string) int {
 
 // GetRecentOperations returns recent operations for a process
 func (fot *FileOperationTracker) GetRecentOperations(processGuid string, limit int) []FileOperation {
-	fot.mu.RLock()
-	defer fot.mu.RUnlock()
+	sh := fot.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
 	result := make([]FileOperation, 0, limit)
-	for i := len(fot.operations) - 1; i >= 0 && len(result) < limit; i-- {
-		if fot.operations[i].ProcessGuid == processGuid {
-			result = append(result, fot.operations[i])
+	for i := len(sh.ops) - 1; i >= 0 && len(result) < limit; i-- {
+		if sh.ops[i].ProcessGuid == processGuid {
+			result = append(result, sh.ops[i])
 		}
 	}
 
@@ -181,11 +220,12 @@ func (fot *FileOperationTracker) GetRecentOperations(processGuid string, limit i
 
 // GetOperationsByType counts operations by type for a process
 func (fot *FileOperationTracker) GetOperationsByType(processGuid string) map[string]int {
-	fot.mu.RLock()
-	defer fot.mu.RUnlock()
+	sh := fot.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
 	counts := make(map[string]int)
-	for _, op := range fot.operations {
+	for _, op := range sh.ops {
 		if op.ProcessGuid == processGuid {
 			counts[op.Operation]++
 		}
@@ -193,21 +233,24 @@ func (fot *FileOperationTracker) GetOperationsByType(processGuid string) map[str
 	return counts
 }
 
-// Cleanup removes all expired operations
+// Cleanup removes all expired operations across every shard, returning the total removed.
 func (fot *FileOperationTracker) Cleanup() int {
-	fot.mu.Lock()
-	defer fot.mu.Unlock()
-
 	cutoff := time.Now().Add(-fot.windowSize)
-	validOps := make([]FileOperation, 0, len(fot.operations))
+	removed := 0
 
-	for _, op := range fot.operations {
-		if op.Timestamp.After(cutoff) {
-			validOps = append(validOps, op)
+	for i := range fot.shards {
+		sh := &fot.shards[i]
+		sh.mu.Lock()
+		validOps := make([]FileOperation, 0, len(sh.ops))
+		for _, op := range sh.ops {
+			if op.Timestamp.After(cutoff) {
+				validOps = append(validOps, op)
+			}
 		}
+		removed += len(sh.ops) - len(validOps)
+		sh.ops = validOps
+		sh.mu.Unlock()
 	}
 
-	removed := len(fot.operations) - len(validOps)
-	fot.operations = validOps
 	return removed
 }
