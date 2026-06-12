@@ -354,9 +354,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
 
 	// Track canary touches from ETW create/open telemetry for periodic scan attribution.
-	if _, _, canaryMatch := ds.canaryMgr.Match(event.TargetFile); canaryMatch {
-		ds.canaryMgr.RecordActor(event, "FILE_CREATE")
-	}
+	ds.recordCanaryTouch(event, "FILE_CREATE")
 
 	// Canary files are frequently opened/read by legitimate indexers/AV engines.
 	// Ignore create/open-style canary events and only react on write/rename/delete paths.
@@ -481,12 +479,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	}
 
 	// ML feature tracking: accumulate directory + extension stats for every file create
-	ds.counters.Mutate(event.ProcessGuid, func(c *ProcessFileCounters) {
-		c.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-		if ext != "" {
-			c.ExtensionCounts[strings.ToLower(ext)]++
-		}
-	})
+	ds.recordMLFeatures(event, "create")
 
 	// STAGE 2: Determine analysis level based on tier
 	// CRITICAL and ANALYZE tiers get deep file analysis
@@ -501,47 +494,11 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	// Pattern: Ransomware creates .txt files across multiple directories alongside encrypted files.
 	// In ML mode, track at ALL tiers so the txt_file_count feature is populated early.
 	// In rule-based mode, only track at Tier 2/3 to avoid noise.
+	// In ML mode, track .txt at ALL tiers so the txt_file_count feature populates early;
+	// in rule-based mode only at Tier 2/3 to avoid noise.
 	txtTrackingEnabled := ds.isMLModeEnabled() || tier == domain.VelocityTierAnalyze || tier == domain.VelocityTierCritical
 	if ext == ".txt" && txtTrackingEnabled {
-		dirPath := filepath.Dir(event.TargetFile)
-
-		var txtCount, dirCount int
-		var txtDirs []string
-		ds.counters.Mutate(event.ProcessGuid, func(counters *ProcessFileCounters) {
-			counters.TxtFileCount++
-
-			// Track unique directories where .txt files are created
-			dirExists := false
-			for _, existingDir := range counters.TxtFileDirectories {
-				if existingDir == dirPath {
-					dirExists = true
-					break
-				}
-			}
-			if !dirExists {
-				counters.TxtFileDirectories = append(counters.TxtFileDirectories, dirPath)
-			}
-
-			txtCount = counters.TxtFileCount
-			dirCount = len(counters.TxtFileDirectories)
-			txtDirs = append([]string(nil), counters.TxtFileDirectories...)
-			counters.LastUpdated = time.Now()
-		})
-
-		log.Printf("[TIER 2] .txt file created: %s (%d total .txt files across %d directories)",
-			filepath.Base(event.TargetFile), txtCount, dirCount)
-
-		// TRIGGER: If >= 5 .txt files created across multiple directories
-		// This is a STRONG INDICATOR to inspect directories for encrypted files
-		if txtCount >= 5 && dirCount >= 3 {
-			log.Printf("[TIER 2] 🔍 RANSOM NOTE PATTERN DETECTED: %d .txt files across %d directories",
-				txtCount, dirCount)
-			log.Printf("[TIER 2] Triggering directory scan to find encrypted files alongside ransom notes...")
-
-			// Trigger directory scan to find ENCRYPTED FILES (snapshot the dirs taken under
-			// the counters lock so the goroutine never races future appends).
-			go ds.dirScanner.ScanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, txtDirs, event.Timestamp)
-		}
+		ds.trackRansomNote(event, true)
 	}
 
 	if !shouldDeepAnalyze {
@@ -939,42 +896,20 @@ func (ds *DetectionService) ProcessFileModified(ctx context.Context, event *doma
 		event.TargetFile, ext, processImage, event.ProcessID, event.ProcessGuid)
 
 	// Keep recent ETW actor context for periodic canary compromise attribution.
-	ds.canaryMgr.RecordActor(event, "FILE_MODIFIED")
+	ds.recordCanaryTouch(event, "FILE_MODIFIED")
 
 	// Track modify operations so rename/encrypt bursts participate in velocity tiers.
 	tier := ds.updateVelocityTierForOperation(event, "modify")
 
 	// ML feature tracking: directory + extension from modify events
 	isRename := isRenameMonitorEvent(event)
-	ds.counters.Mutate(event.ProcessGuid, func(modMLCounters *ProcessFileCounters) {
-		modMLCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-		if ext != "" {
-			modMLCounters.ExtensionCounts[strings.ToLower(ext)]++
-			// For rename events, also track the original (inner) extension so Shannon
-			// entropy is non-zero. E.g., "document.pdf.CONTI" → track both ".conti" and ".pdf".
-			if isRename {
-				base := strings.TrimSuffix(event.TargetFile, ext)
-				if innerExt := filepath.Ext(base); innerExt != "" {
-					modMLCounters.ExtensionCounts[strings.ToLower(innerExt)]++
-				}
-			}
-		}
-		// Track .txt files from rename events (ransomware may rename tmp → README.txt)
-		if isRename && strings.EqualFold(ext, ".txt") {
-			modMLCounters.TxtFileCount++
-			dirPath := filepath.Dir(event.TargetFile)
-			dirExists := false
-			for _, d := range modMLCounters.TxtFileDirectories {
-				if d == dirPath {
-					dirExists = true
-					break
-				}
-			}
-			if !dirExists {
-				modMLCounters.TxtFileDirectories = append(modMLCounters.TxtFileDirectories, dirPath)
-			}
-		}
-	})
+	ds.recordMLFeatures(event, "modify")
+
+	// Track .txt files from rename events (ransomware may rename tmp → README.txt).
+	// rename path: count only, no scan trigger and no LastUpdated bump (matches prior behavior).
+	if isRename && strings.EqualFold(ext, ".txt") {
+		ds.trackRansomNote(event, false)
+	}
 
 	// ML feature tracking: detect browser credential / history / SSH key access
 	ds.checkBrowserAndSSHAccess(event)
@@ -2109,19 +2044,13 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 		event.TargetFile, ext, filepath.Base(event.Image), event.ProcessID)
 
 	// Keep recent ETW actor context for periodic canary compromise attribution.
-	ds.canaryMgr.RecordActor(event, "FILE_DELETE")
+	ds.recordCanaryTouch(event, "FILE_DELETE")
 
 	// Track delete operations so delete+rename ransomware patterns raise velocity tiers.
 	tier := ds.updateVelocityTierForOperation(event, "delete")
 
 	// ML feature tracking: increment delete counter, track directory + extension
-	ds.counters.Mutate(event.ProcessGuid, func(delCounters *ProcessFileCounters) {
-		delCounters.DeleteCount++
-		delCounters.DirectorySet[filepath.Dir(event.TargetFile)] = struct{}{}
-		if ext != "" {
-			delCounters.ExtensionCounts[strings.ToLower(ext)]++
-		}
-	})
+	ds.recordMLFeatures(event, "delete")
 
 	// REAL-TIME CANARY DETECTION: Check if deleted file is a honeypot
 	// This catches ransomware that deletes original canary files before/during encryption
