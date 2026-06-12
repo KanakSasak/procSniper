@@ -1672,32 +1672,38 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 	}
 }
 
+// mlDecision is the per-class ML detection/response policy.
+type mlDecision struct {
+	Category      string
+	Severity      domain.ThreatLevel
+	Score         int
+	IndicatorType domain.IndicatorType
+	Decision      string // MLInferenceActivity decision label
+	AutoRespond   bool
+}
+
+// mlDecisionPolicy is the single source of truth mapping an ML class label to its
+// detection/response policy, consumed by both runMLInference (activity fields) and
+// emitMLDecisionAlert (alert fields) so the two cannot silently diverge. Label 0 (benign)
+// is intentionally absent — no alert and no decision.
+var mlDecisionPolicy = map[int]mlDecision{
+	1: {Category: "RANSOMWARE", Severity: domain.ThreatCritical, Score: 100, IndicatorType: domain.IndicatorMLRansomware, Decision: "terminate_eligible", AutoRespond: true},
+	2: {Category: "STEALER", Severity: domain.ThreatMedium, Score: 30, IndicatorType: domain.IndicatorMLStealer, Decision: "alert_only", AutoRespond: false},
+}
+
 func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction) {
 	if prediction == nil {
 		return
 	}
 
-	var (
-		category      string
-		severity      domain.ThreatLevel
-		score         int
-		indicatorType domain.IndicatorType
-	)
-
-	switch prediction.Label {
-	case 1: // ransomware
-		category = "RANSOMWARE"
-		severity = domain.ThreatCritical
-		score = 100
-		indicatorType = domain.IndicatorMLRansomware
-	case 2: // stealer
-		category = "STEALER"
-		severity = domain.ThreatMedium
-		score = 30
-		indicatorType = domain.IndicatorMLStealer
-	default: // benign
+	pol, ok := mlDecisionPolicy[prediction.Label]
+	if !ok { // benign / unknown label — no alert
 		return
 	}
+	category := pol.Category
+	severity := pol.Severity
+	score := pol.Score
+	indicatorType := pol.IndicatorType
 
 	description := fmt.Sprintf("ML decision: %s (%.1f%% confidence)", prediction.LabelName, prediction.Confidence*100)
 	maliciousProb := prediction.Probabilities[1] + prediction.Probabilities[2]
@@ -1727,8 +1733,9 @@ func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction)
 		},
 	})
 
-	// Policy: ransomware => terminate-eligible, stealer => alert-only
-	alert.AutoRespond = prediction.Label == 1
+	// Policy (single source: mlDecisionPolicy): ransomware => terminate-eligible,
+	// stealer => alert-only.
+	alert.AutoRespond = pol.AutoRespond
 	log.Printf("[ML][DECISION] process=%s pid=%d label=%s confidence=%.4f malicious_prob=%.4f prob_ransom=%.4f prob_steal=%.4f score=%d auto_respond=%v",
 		prediction.Image,
 		prediction.ProcessID,
@@ -2064,17 +2071,11 @@ func (ds *DetectionService) runMLInference(processGuid, image string, pid int, p
 	prediction.LabelName = decisionLabelName
 	prediction.Confidence = decisionConfidence
 
-	switch decisionLabel {
-	case 1:
-		activity.Decision = "terminate_eligible"
-		activity.DecisionCategory = "RANSOMWARE"
-		activity.DecisionScore = 100
-		activity.DecisionAutoRespond = true
-	case 2:
-		activity.Decision = "alert_only"
-		activity.DecisionCategory = "STEALER"
-		activity.DecisionScore = 30
-		activity.DecisionAutoRespond = false
+	if pol, ok := mlDecisionPolicy[decisionLabel]; ok {
+		activity.Decision = pol.Decision
+		activity.DecisionCategory = pol.Category
+		activity.DecisionScore = pol.Score
+		activity.DecisionAutoRespond = pol.AutoRespond
 	}
 
 	activity.Stage = "decision"
