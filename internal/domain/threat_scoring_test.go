@@ -283,8 +283,8 @@ func TestThreatScorer_CleanupOldScores(t *testing.T) {
 	}
 	scorer.AddIndicator(recentGuid, "C:\\recent.exe", 5678, indicator2)
 
-	// Manually set LastSeen to simulate age
-	scorer.scores[oldGuid].LastSeen = time.Now().Add(-10 * time.Minute)
+	// Manually set LastSeen to simulate age (single-threaded here; reach into the shard).
+	scorer.shardFor(oldGuid).scores[oldGuid].LastSeen = time.Now().Add(-10 * time.Minute)
 
 	// Cleanup scores older than 5 minutes
 	removed := scorer.CleanupOldScores(5 * time.Minute)

@@ -84,27 +84,46 @@ type ThreatScore struct {
 	Category    string // "RANSOMWARE", "STEALER", "UNKNOWN"
 }
 
-// ThreatScorer manages threat scoring for all processes
-type ThreatScorer struct {
-	scores map[string]*ThreatScore
+// threatShardCount stripes the score map so per-process scoring contends on different locks.
+// Power of two for masking; keyed by FNV-1a(ProcessGuid) — same striping discipline as the
+// velocity tracker (Phase 5).
+const threatShardCount = 64
+
+type threatShard struct {
 	mu     sync.RWMutex
+	scores map[string]*ThreatScore
+}
+
+// ThreatScorer manages threat scoring for all processes, striped by ProcessGuid (Phase 5) so
+// AddIndicator/EvaluateThreat/GetThreatScore for different processes no longer serialize on a
+// single map lock. Cross-process methods (GetAllThreats/CleanupOldScores/Reset) fan out across
+// shards, locking each in turn — never two at once, preserving a deadlock-free ordering.
+type ThreatScorer struct {
+	shards [threatShardCount]threatShard
 }
 
 // NewThreatScorer creates a new threat scorer
 func NewThreatScorer() *ThreatScorer {
-	return &ThreatScorer{
-		scores: make(map[string]*ThreatScore),
+	ts := &ThreatScorer{}
+	for i := range ts.shards {
+		ts.shards[i].scores = make(map[string]*ThreatScore)
 	}
+	return ts
+}
+
+func (ts *ThreatScorer) shardFor(processGuid string) *threatShard {
+	return &ts.shards[fnvHash32a(processGuid)&(threatShardCount-1)]
 }
 
 // AddIndicator adds a threat indicator and returns the new score
 // For certain indicator types (like IO_VELOCITY), only the first occurrence is counted
 // to prevent score inflation from repeated detections of the same behavior
 func (ts *ThreatScorer) AddIndicator(processGuid string, image string, pid int, indicator Indicator) int {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	sh := ts.shardFor(processGuid)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	score, exists := ts.scores[processGuid]
+	score, exists := sh.scores[processGuid]
 	if !exists {
 		score = &ThreatScore{
 			ProcessGuid: processGuid,
@@ -114,7 +133,7 @@ func (ts *ThreatScorer) AddIndicator(processGuid string, image string, pid int, 
 			Indicators:  make([]Indicator, 0),
 			Category:    "UNKNOWN",
 		}
-		ts.scores[processGuid] = score
+		sh.scores[processGuid] = score
 	}
 
 	// Check if this indicator type already exists (for non-repeatable indicators)
@@ -174,10 +193,11 @@ func (ts *ThreatScorer) categorizeThreat(score *ThreatScore) string {
 
 // EvaluateThreat returns threat level and score for a process
 func (ts *ThreatScorer) EvaluateThreat(processGuid string) (ThreatLevel, int) {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
+	sh := ts.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	score, exists := ts.scores[processGuid]
+	score, exists := sh.scores[processGuid]
 	if !exists {
 		return ThreatNone, 0
 	}
@@ -208,10 +228,11 @@ func (ts *ThreatScorer) EvaluateThreat(processGuid string) (ThreatLevel, int) {
 
 // GetThreatScore returns the threat score for a process
 func (ts *ThreatScorer) GetThreatScore(processGuid string) *ThreatScore {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
+	sh := ts.shardFor(processGuid)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	score, exists := ts.scores[processGuid]
+	score, exists := sh.scores[processGuid]
 	if !exists {
 		return nil
 	}
@@ -226,17 +247,22 @@ func (ts *ThreatScorer) GetThreatScore(processGuid string) *ThreatScore {
 
 // GetAllThreats returns all processes with non-zero threat scores
 func (ts *ThreatScorer) GetAllThreats() []*ThreatScore {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-
-	threats := make([]*ThreatScore, 0, len(ts.scores))
-	for _, score := range ts.scores {
-		if score.Score > 0 {
-			scoreCopy := *score
-			scoreCopy.Indicators = make([]Indicator, len(score.Indicators))
-			copy(scoreCopy.Indicators, score.Indicators)
-			threats = append(threats, &scoreCopy)
+	// Per-shard-consistent snapshot, NOT globally atomic (Phase 5): each shard is RLocked in
+	// turn and its scores deep-copied, so a score can change in an unvisited shard mid-scan.
+	// Each returned ThreatScore is internally consistent; consumers treat this as advisory stats.
+	threats := make([]*ThreatScore, 0)
+	for i := range ts.shards {
+		sh := &ts.shards[i]
+		sh.mu.RLock()
+		for _, score := range sh.scores {
+			if score.Score > 0 {
+				scoreCopy := *score
+				scoreCopy.Indicators = make([]Indicator, len(score.Indicators))
+				copy(scoreCopy.Indicators, score.Indicators)
+				threats = append(threats, &scoreCopy)
+			}
 		}
+		sh.mu.RUnlock()
 	}
 
 	return threats
@@ -244,17 +270,19 @@ func (ts *ThreatScorer) GetAllThreats() []*ThreatScore {
 
 // CleanupOldScores removes scores for processes inactive for specified duration
 func (ts *ThreatScorer) CleanupOldScores(maxAge time.Duration) int {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
 
-	for guid, score := range ts.scores {
-		if score.LastSeen.Before(cutoff) {
-			delete(ts.scores, guid)
-			removed++
+	for i := range ts.shards {
+		sh := &ts.shards[i]
+		sh.mu.Lock()
+		for guid, score := range sh.scores {
+			if score.LastSeen.Before(cutoff) {
+				delete(sh.scores, guid)
+				removed++
+			}
 		}
+		sh.mu.Unlock()
 	}
 
 	return removed
@@ -268,7 +296,10 @@ func (ts *ThreatScorer) ShouldAutoRespond(processGuid string) bool {
 
 // Reset clears all tracked threat scores.
 func (ts *ThreatScorer) Reset() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	ts.scores = make(map[string]*ThreatScore)
+	for i := range ts.shards {
+		sh := &ts.shards[i]
+		sh.mu.Lock()
+		sh.scores = make(map[string]*ThreatScore)
+		sh.mu.Unlock()
+	}
 }
