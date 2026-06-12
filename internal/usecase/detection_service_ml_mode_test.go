@@ -158,7 +158,7 @@ func seedForMLGate(ds *DetectionService, guid, image string, pid int, nFeatures 
 	ds.fileCountersMux.Lock()
 	counters := &ProcessFileCounters{
 		DirectorySet:         map[string]struct{}{"C:\\dir1": {}, "C:\\dir2": {}}, // feature[3]
-		ExtensionCounts:      map[string]int{".encrypted": 10, ".exe": 5},        // feature[7]
+		ExtensionCounts:      map[string]int{".encrypted": 10, ".exe": 5},         // feature[7]
 		RansomExtensionCount: 10,                                                  // feature[6] (extension_match)
 		LastUpdated:          time.Now(),
 	}
@@ -212,7 +212,7 @@ func seedFeaturesOnly(ds *DetectionService, guid, image string, pid int, nFeatur
 	ds.fileCountersMux.Lock()
 	counters := &ProcessFileCounters{
 		DirectorySet:    map[string]struct{}{"C:\\dir1": {}}, // feature[3]
-		ExtensionCounts: map[string]int{".txt": 3},          // feature[7]
+		ExtensionCounts: map[string]int{".txt": 3},           // feature[7]
 		LastUpdated:     time.Now(),
 	}
 	if nFeatures >= 3 {
@@ -224,6 +224,7 @@ func seedFeaturesOnly(ds *DetectionService, guid, image string, pid int, nFeatur
 
 func TestDetectionService_MLOnlyRansomwareDecision(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -286,6 +287,7 @@ func TestDetectionService_MLOnlyRansomwareDecision(t *testing.T) {
 
 func TestDetectionService_MLOnlyStealerDecision(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -347,6 +349,7 @@ func TestDetectionService_MLOnlyStealerDecision(t *testing.T) {
 
 func TestDetectionService_MLOnlyBenignHighConfidenceBelowMaliciousThreshold(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -382,6 +385,7 @@ func TestDetectionService_MLOnlyBenignHighConfidenceBelowMaliciousThreshold(t *t
 
 func TestDetectionService_MLOnlyMaliciousSumAboveThresholdTriggersDecision(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -423,6 +427,7 @@ func TestDetectionService_MLOnlyMaliciousSumAboveThresholdTriggersDecision(t *te
 
 func TestDetectionService_MLOnlyLowConfidenceNoDecision(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -458,6 +463,7 @@ func TestDetectionService_MLOnlyLowConfidenceNoDecision(t *testing.T) {
 
 func TestDetectionService_MLInferenceFailureNoFallback(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,
@@ -489,6 +495,7 @@ func TestDetectionService_MLInferenceFailureNoFallback(t *testing.T) {
 
 func TestDetectionService_MLPredictorNotReadyNoFallback(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{ready: false})
 	ds.SetMLEnabled(true)
@@ -544,6 +551,7 @@ func TestDetectionService_RuleIndicatorsAccumulateInMLMode(t *testing.T) {
 
 func TestDetectionService_MLOnlyActivityWhenPredictorBecomesReady(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 
 	predictor := &fakePredictor{
@@ -588,6 +596,7 @@ func TestDetectionService_MLOnlyActivityWhenPredictorBecomesReady(t *testing.T) 
 
 func TestDetectionService_MLOnlyRenameFastPathUpdatesExtensionFeatureBeforeInference(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	// Set mlMinIndicators to 1 so rename events can trigger ML with just 1 non-zero feature
 	ds.SetMLMinIndicators(1)
 	predictor := &capturingPredictor{
@@ -734,7 +743,7 @@ func TestDetectionService_MLGateBlocksInsufficientFeatures(t *testing.T) {
 	// Add one indicator so score > 0 (ThreatLow) to reach the ML gate
 	ds.threatScorer.AddIndicator("guid-gate-test", `C:\test.exe`, 1234, domain.Indicator{
 		Type: domain.IndicatorHighEntropy, Severity: domain.ThreatLow,
-		Points: domain.IndicatorScores[domain.IndicatorHighEntropy],
+		Points:      domain.IndicatorScores[domain.IndicatorHighEntropy],
 		Description: "seeded for score", Timestamp: time.Now(),
 	})
 
@@ -751,6 +760,7 @@ func TestDetectionService_MLGateBlocksInsufficientFeatures(t *testing.T) {
 // when the non-zero feature count reaches the mlMinIndicators threshold.
 func TestDetectionService_MLGatePassesAtThreshold(t *testing.T) {
 	ds := newMLTestDetectionService()
+	ds.SetDetectionMode("ml_only")
 	activities := attachActivityCapture(ds)
 	ds.SetMLPredictor(&fakePredictor{
 		ready: true,

@@ -39,35 +39,32 @@ func TestThreatScorer_AddIndicator(t *testing.T) {
 
 func TestThreatScorer_EvaluateThreat(t *testing.T) {
 	tests := []struct {
-		name           string
-		indicators     []IndicatorType
-		expectedLevel  ThreatLevel
+		name             string
+		indicators       []IndicatorType
+		expectedLevel    ThreatLevel
 		expectedMinScore int
-		description    string
+		description      string
 	}{
 		{
-			name:           "Single low indicator",
-			indicators:     []IndicatorType{IndicatorRansomExtension},
-			expectedLevel:  ThreatLow,
-			expectedMinScore: 20,
-			description:    "20 points - LOW threat",
+			name:             "Low threat",
+			indicators:       []IndicatorType{IndicatorHighEntropy}, // 25
+			expectedLevel:    ThreatLow,
+			expectedMinScore: 25,
+			description:      "25 points - LOW threat (1-30)",
 		},
 		{
-			name:           "Medium threat",
-			indicators:     []IndicatorType{IndicatorHighEntropy, IndicatorRansomExtension},
-			expectedLevel:  ThreatMedium,
-			expectedMinScore: 45,
-			description:    "45 points - MEDIUM threat",
+			name:             "Medium threat",
+			indicators:       []IndicatorType{IndicatorRansomExtension}, // 50
+			expectedLevel:    ThreatMedium,
+			expectedMinScore: 50,
+			description:      "50 points - MEDIUM threat (31-60)",
 		},
 		{
-			name: "High threat",
-			indicators: []IndicatorType{
-				IndicatorHighEntropy,
-				IndicatorIOVelocity,
-			},
-			expectedLevel:  ThreatMedium,
-			expectedMinScore: 55,
-			description:    "55 points - MEDIUM threat (61 needed for HIGH)",
+			name:             "High threat",
+			indicators:       []IndicatorType{IndicatorHighEntropy, IndicatorRansomExtension}, // 25+50=75
+			expectedLevel:    ThreatHigh,
+			expectedMinScore: 75,
+			description:      "75 points - HIGH threat (61-85)",
 		},
 		{
 			name: "Critical threat",
@@ -76,10 +73,10 @@ func TestThreatScorer_EvaluateThreat(t *testing.T) {
 				IndicatorIOVelocity,
 				IndicatorShadowCopyDeletion,
 				IndicatorRansomExtension,
-			},
-			expectedLevel:  ThreatCritical,
+			}, // (25+30+25+50)=130 x1.5 temporal (>=3 indicators <60s) = 195
+			expectedLevel:    ThreatCritical,
 			expectedMinScore: 100,
-			description:    "100+ points - CRITICAL threat with auto-response",
+			description:      "130 base x1.5 temporal = 195 - CRITICAL threat with auto-response",
 		},
 	}
 
@@ -231,10 +228,10 @@ func TestThreatScorer_ShouldAutoRespond(t *testing.T) {
 
 	// Add indicators to reach CRITICAL level (86+ points)
 	criticalIndicators := []IndicatorType{
-		IndicatorHighEntropy,       // 25
-		IndicatorIOVelocity,        // 30
+		IndicatorHighEntropy,        // 25
+		IndicatorIOVelocity,         // 30
 		IndicatorShadowCopyDeletion, // 25
-		IndicatorRansomExtension,   // 20
+		IndicatorRansomExtension,    // 20
 	} // Total: 100 points
 
 	for _, indType := range criticalIndicators {
