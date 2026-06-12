@@ -194,3 +194,95 @@ func (a commandAnalyzer) analyze(event *domain.MonitorEvent) {
 
 	a.sink.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 }
+
+// credentialAccessAnalyzer flags a non-browser process touching browser credential stores,
+// browser history, or SSH key files (credential theft). Migrated verbatim from
+// DetectionService.checkBrowserAndSSHAccess (Phase 6). The credential-theft indicator is
+// raised at most once per process — the false->true transition of BrowserCredentialHit is
+// captured inside the setMLCounter closure so it stays under the counters lock.
+type credentialAccessAnalyzer struct{ sink analyzerSink }
+
+var _ eventAnalyzer = credentialAccessAnalyzer{}
+
+func (a credentialAccessAnalyzer) analyze(event *domain.MonitorEvent) {
+	if event == nil || strings.TrimSpace(event.TargetFile) == "" {
+		return
+	}
+	targetLower := strings.ToLower(event.TargetFile)
+	imageLower := strings.ToLower(event.Image)
+
+	// Skip legitimate browsers — they're expected to access their own files
+	for _, browser := range []string{"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"} {
+		if strings.Contains(imageLower, browser) {
+			return
+		}
+	}
+
+	var credHit, historyHit, sshHit bool
+
+	// Check browser credential paths
+	for _, credPath := range domain.BrowserCredentialPaths {
+		if strings.Contains(targetLower, strings.ToLower(credPath)) {
+			credHit = true
+			break
+		}
+	}
+	// Check browser history paths
+	if strings.Contains(targetLower, "\\history") || strings.Contains(targetLower, "\\places.sqlite") {
+		historyHit = true
+	}
+	// Check SSH key paths
+	if strings.Contains(targetLower, "\\.ssh\\") || strings.Contains(targetLower, "\\id_rsa") ||
+		strings.Contains(targetLower, "\\id_ed25519") || strings.Contains(targetLower, "\\known_hosts") {
+		sshHit = true
+	}
+
+	if !credHit && !historyHit && !sshHit {
+		return
+	}
+
+	// Capture the false->true transition so the credential-theft indicator is raised at
+	// most once per process. IndicatorCredentialTheft is a repeatable type in the scorer
+	// and this runs on every qualifying file event, so emitting per event would inflate
+	// the score and could spuriously trip auto-terminate.
+	var firstCredHit bool
+	a.sink.setMLCounter(event.ProcessGuid, func(c *ProcessFileCounters) {
+		firstCredHit = credHit && !c.BrowserCredentialHit
+		if credHit {
+			c.BrowserCredentialHit = true
+		}
+		if historyHit {
+			c.BrowserHistoryHit = true
+		}
+		if sshHit {
+			c.SSHKeyHit = true
+		}
+	})
+
+	if credHit {
+		log.Printf("[DETECTION] Browser credential access: %s touching %s (PID: %d)",
+			event.Image, event.TargetFile, event.ProcessID)
+	}
+
+	// Raise the credential-theft indicator and evaluate on the first credential hit.
+	// Ported from the now-deleted ProcessBrowserAccess, which scored credential theft but
+	// was never routed by any ETW EventID — leaving this the sole credential-theft alert
+	// path. (AUDIT Phase 1: port-then-delete.)
+	if firstCredHit {
+		indicator := domain.Indicator{
+			Type:        domain.IndicatorCredentialTheft,
+			Severity:    domain.ThreatCritical,
+			Points:      domain.IndicatorScores[domain.IndicatorCredentialTheft],
+			Description: "Browser credential file access",
+			Timestamp:   event.Timestamp,
+			Evidence: map[string]string{
+				"file":  event.TargetFile,
+				"image": event.Image,
+			},
+		}
+		score := a.sink.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
+		log.Printf("[DETECTION] Browser credential indicator raised: %s accessing %s (Score: %d)",
+			event.Image, event.TargetFile, score)
+		a.sink.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+	}
+}
