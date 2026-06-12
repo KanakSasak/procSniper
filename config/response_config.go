@@ -201,7 +201,17 @@ func (rc *ResponseConfig) IsWhitelisted(path string) bool {
 	return false
 }
 
-// ShouldAutoTerminate determines if auto-terminate should be triggered
+// ShouldAutoTerminate applies CONFIG SAFETY VETOES only. As of Phase 4 the
+// respond/no-respond verdict is owned by alert.AutoRespond and is checked by the
+// orchestrator's processAlert BEFORE this is called. This returns false only when a
+// safety control (investigation mode, whitelist, global kill-switch) must suppress an
+// already-approved termination, and true otherwise.
+//
+// PRECONDITION: only call this once alert.AutoRespond is already known true — it
+// default-permits (returns true when no veto fires). The score and extensionMatch params
+// are retained for signature stability and are intentionally no longer authoritative; do
+// NOT reintroduce score/extension as trigger conditions here (that was the score-override
+// hazard Phase 4 removed).
 func (rc *ResponseConfig) ShouldAutoTerminate(score int, extensionMatch bool, path string) bool {
 	// Investigation mode disables auto-terminate
 	if rc.ResponseSettings.InvestigationMode {
@@ -218,17 +228,7 @@ func (rc *ResponseConfig) ShouldAutoTerminate(score int, extensionMatch bool, pa
 		return false
 	}
 
-	// Immediate response on extension match
-	if rc.ResponseSettings.TerminateOnExtensionMatch && extensionMatch {
-		return true
-	}
-
-	// Auto-terminate on critical score
-	if rc.ResponseSettings.TerminateOnCriticalScore && score >= rc.ResponseSettings.CriticalScoreThreshold {
-		return true
-	}
-
-	return false
+	return true
 }
 
 // GetQuarantineDirectory returns the quarantine directory path

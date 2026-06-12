@@ -90,3 +90,71 @@ func TestLoadResponseConfig_MalformedDiskFileErrors(t *testing.T) {
 		t.Error("expected parse error for malformed on-disk config, got nil")
 	}
 }
+
+// As of Phase 4, ShouldAutoTerminate is VETO-ONLY: alert.AutoRespond owns the verdict and
+// is gated upstream by the orchestrator. This pins that (1) it default-permits when no
+// safety control fires, (2) each of the three vetoes forces false, and (3) the score and
+// extensionMatch params are inert — a high score + extension match can NOT force true once
+// a veto applies, and are not needed to permit.
+func TestResponseConfig_ShouldAutoTerminate_VetoOnly(t *testing.T) {
+	cases := []struct {
+		name          string
+		rc            ResponseConfig
+		score         int
+		extensionHit  bool
+		path          string
+		wantTerminate bool
+	}{
+		{
+			name:          "no veto -> permit (score/extension irrelevant)",
+			rc:            ResponseConfig{ResponseSettings: ResponseSetting{AutoTerminateEnabled: true}},
+			score:         0,
+			extensionHit:  false,
+			path:          `C:\victim\proc.exe`,
+			wantTerminate: true,
+		},
+		{
+			name:          "investigation mode -> veto",
+			rc:            ResponseConfig{ResponseSettings: ResponseSetting{AutoTerminateEnabled: true, InvestigationMode: true}},
+			score:         100,
+			extensionHit:  true,
+			path:          `C:\victim\proc.exe`,
+			wantTerminate: false,
+		},
+		{
+			name: "whitelisted path -> veto",
+			rc: ResponseConfig{
+				ResponseSettings: ResponseSetting{AutoTerminateEnabled: true},
+				Whitelist:        WhitelistConfig{Enabled: true, Paths: []string{`c:\trusted`}},
+			},
+			score:         100,
+			extensionHit:  true,
+			path:          `C:\trusted\app.exe`,
+			wantTerminate: false,
+		},
+		{
+			name:          "global kill-switch off -> veto",
+			rc:            ResponseConfig{ResponseSettings: ResponseSetting{AutoTerminateEnabled: false}},
+			score:         100,
+			extensionHit:  true,
+			path:          `C:\victim\proc.exe`,
+			wantTerminate: false,
+		},
+		{
+			name:          "kill-switch off beats high score + extension (params inert)",
+			rc:            ResponseConfig{ResponseSettings: ResponseSetting{AutoTerminateEnabled: false, TerminateOnCriticalScore: true, CriticalScoreThreshold: 1, TerminateOnExtensionMatch: true}},
+			score:         100,
+			extensionHit:  true,
+			path:          `C:\victim\proc.exe`,
+			wantTerminate: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.rc.ShouldAutoTerminate(tc.score, tc.extensionHit, tc.path); got != tc.wantTerminate {
+				t.Errorf("ShouldAutoTerminate(%d, %v, %q) = %v, want %v",
+					tc.score, tc.extensionHit, tc.path, got, tc.wantTerminate)
+			}
+		})
+	}
+}

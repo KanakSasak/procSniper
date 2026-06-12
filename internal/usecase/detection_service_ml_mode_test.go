@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"procSniper/config"
 	"procSniper/internal/domain"
 )
 
@@ -272,17 +271,9 @@ func TestDetectionService_MLOnlyRansomwareDecision(t *testing.T) {
 	if !activity.DecisionAutoRespond {
 		t.Fatal("expected DecisionAutoRespond=true")
 	}
-
-	rc := &config.ResponseConfig{
-		ResponseSettings: config.ResponseSetting{
-			AutoTerminateEnabled:     true,
-			TerminateOnCriticalScore: true,
-			CriticalScoreThreshold:   49,
-		},
-	}
-	if !rc.ShouldAutoTerminate(alert.Score, false, alert.Image) {
-		t.Fatal("expected ML ransomware alert to be terminate-eligible")
-	}
+	// Terminate-eligibility is now owned by alert.AutoRespond (asserted above); the
+	// orchestrator gates on it directly (Phase 4). The config ShouldAutoTerminate is
+	// veto-only and no longer expresses the verdict, so it is not asserted here.
 }
 
 func TestDetectionService_MLOnlyStealerDecision(t *testing.T) {
@@ -334,17 +325,9 @@ func TestDetectionService_MLOnlyStealerDecision(t *testing.T) {
 	if activity.DecisionAutoRespond {
 		t.Fatal("expected DecisionAutoRespond=false")
 	}
-
-	rc := &config.ResponseConfig{
-		ResponseSettings: config.ResponseSetting{
-			AutoTerminateEnabled:     true,
-			TerminateOnCriticalScore: true,
-			CriticalScoreThreshold:   49,
-		},
-	}
-	if rc.ShouldAutoTerminate(alert.Score, false, alert.Image) {
-		t.Fatal("expected ML stealer alert to be alert-only under default threshold")
-	}
+	// alert.AutoRespond=false (asserted above) is what now keeps the stealer alert-only:
+	// the orchestrator's primary gate suppresses termination regardless of score/config
+	// (Phase 4). ShouldAutoTerminate is veto-only and no longer expresses the verdict.
 }
 
 func TestDetectionService_MLOnlyBenignHighConfidenceBelowMaliciousThreshold(t *testing.T) {

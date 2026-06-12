@@ -193,6 +193,20 @@ func (ro *ResponseOrchestrator) processAlert(ctx context.Context, alert *domain.
 	// Forward to syslog if configured
 	ro.sendSyslogAlert(alert)
 
+	// PRIMARY GATE (Phase 4): the detection layer owns the respond/no-respond verdict.
+	// alert.AutoRespond is set upstream by ShouldAutoRespond (rule path, ThreatCritical),
+	// the ML decision policy, or the canary manager. The config checks below are
+	// VETO-ONLY: they may downgrade a true verdict to no-action, but must NEVER upgrade a
+	// false one. Checking it here — before ShouldAutoTerminate — makes that structural:
+	// termination is unreachable for any AutoRespond=false alert, whatever its score or
+	// extension match.
+	if !alert.AutoRespond {
+		ro.mu.Lock()
+		ro.stats.autoResponsesBlocked++
+		ro.mu.Unlock()
+		return
+	}
+
 	// Check if auto-response should be triggered
 	extensionMatch := ro.hasRansomwareExtension(alert)
 	imagePath := alert.Image
