@@ -3,6 +3,7 @@ package usecase
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -539,6 +540,216 @@ func (ds *DetectionService) analyzeModifiedFileEntropy(event *domain.MonitorEven
 				currentCount, score)
 
 			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+		}
+	}
+}
+
+// analyzeDeletedFile performs the filesystem-bound, delete-specific detection for a deleted
+// file: the immediate hardcoded rename-variant probe (.conti/.encrypted/...), then — for
+// deep-analysis-eligible tiers — the deduped directory scan, the modify-delete pattern check
+// (consuming the modifiedHighEntropyFiles entry under its lock), and the ransomware-extension
+// rename probe over the configured extension list. Extracted verbatim from the tail of
+// ProcessFileDelete (Phase 6 S9); it owns its own early returns, so the orchestrator calls it
+// after the canary-delete correlation block and does nothing after. tier is from the caller.
+func (ds *DetectionService) analyzeDeletedFile(event *domain.MonitorEvent, tier domain.VelocityTier) {
+	// CRITICAL: Check for ransomware rename IMMEDIATELY on ALL deletions
+	// This catches ransomware in early stages before I/O velocity threshold is reached
+	// When Conti renames document.docx → document.docx.conti:
+	//   - ETW fires Event ID 23 (FileDelete) for "document.docx"
+	//   - But NO Event ID 11 (FileCreate) for "document.docx.conti"
+	// Solution: When file deleted, check if .conti/.encrypted/etc version exists
+	log.Printf("[SPECIFIC FILE CHECK] Checking if %s was renamed to malicious extension...", filepath.Base(event.TargetFile))
+
+	potentialRansomFiles := []string{
+		event.TargetFile + ".conti",
+		event.TargetFile + ".encrypted",
+		event.TargetFile + ".locked",
+		event.TargetFile + ".enc",
+		event.TargetFile + ".crypt",
+	}
+
+	foundRenamed := false
+	for _, ransomFile := range potentialRansomFiles {
+		if _, err := os.Stat(ransomFile); err == nil {
+			// Encrypted version exists! This is a ransomware rename operation
+			log.Printf("[DETECTION] 🚨 MALICIOUS FILE RENAME DETECTED: %s → %s by %s (PID: %d)",
+				filepath.Base(event.TargetFile), filepath.Base(ransomFile),
+				filepath.Base(event.Image), event.ProcessID)
+
+			indicator := domain.Indicator{
+				Type:     domain.IndicatorRansomExtension,
+				Severity: domain.ThreatCritical,
+				Points:   domain.IndicatorScores[domain.IndicatorRansomExtension],
+				Description: fmt.Sprintf("CRITICAL: File encrypted via rename: %s → %s",
+					filepath.Base(event.TargetFile), filepath.Base(ransomFile)),
+				Timestamp: event.Timestamp,
+				Evidence: map[string]string{
+					"original_file":  filepath.Base(event.TargetFile),
+					"encrypted_file": filepath.Base(ransomFile),
+					"operation":      "rename_encryption",
+				},
+			}
+
+			score := ds.addRuleIndicator(
+				event.ProcessGuid,
+				event.Image,
+				event.ProcessID,
+				indicator,
+			)
+
+			log.Printf("[DETECTION] 🔴 MALICIOUS RENAME INDICATOR ADDED: %s (Score: %d)",
+				filepath.Base(ransomFile), score)
+
+			// Immediately evaluate for response
+			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+			foundRenamed = true
+			break // Only trigger once
+		}
+	}
+
+	if !foundRenamed {
+		log.Printf("[SPECIFIC FILE CHECK] No malicious renamed file found for %s", filepath.Base(event.TargetFile))
+	}
+
+	// PERFORMANCE OPTIMIZATION: Only analyze deletions from ANALYZE or CRITICAL tier processes
+	// This prevents unnecessary directory scans for normal file operations (browser cache, temp files, etc.)
+
+	shouldDeepAnalyze := (tier == domain.VelocityTierCritical || tier == domain.VelocityTierAnalyze)
+
+	if !shouldDeepAnalyze {
+		// MONITOR tier or below: skip deep directory analysis
+		return
+	}
+
+	log.Printf("[DEEP ANALYSIS] File deleted by high I/O process: %s", event.TargetFile)
+
+	// ENHANCED DETECTION 1: Progressive directory scan for ransomware extensions
+	// FLAW #3 FIX: No 8-second delay - scan immediately with progressive re-scans
+	// FLAW #7 FIX: Deduplication prevents goroutine explosion
+	// When ransomware operates, it often encrypts entire directories
+	// Strategy: Progressive scans (0s, 2s, 5s) catch encryption at different stages
+	// Progressive directory scan (deduped per directory), now owned by dirscan.Scanner.
+	// If a scan is already running for this directory, preserve the original behavior of
+	// skipping the rest of delete handling.
+	if !ds.dirScanner.ScanDeletedFileDir(event) {
+		return
+	}
+
+	// CRITICAL DETECTION: Check for modify-delete pattern
+	// Classic ransomware behavior: modify file (encrypt in-place) → delete original → create .ENCRYPTED copy
+	// This is a VERY strong indicator with low false positive rate
+	ds.modifiedHighEntropyFilesMux.Lock()
+	modifiedFile, wasRecentlyModified := ds.modifiedHighEntropyFiles[event.TargetFile]
+	if wasRecentlyModified {
+		// Remove from tracking map
+		delete(ds.modifiedHighEntropyFiles, event.TargetFile)
+	}
+	ds.modifiedHighEntropyFilesMux.Unlock()
+
+	if wasRecentlyModified {
+		// File was modified with high entropy and NOW deleted - CRITICAL ransomware pattern!
+		timeSinceModification := time.Since(modifiedFile.Timestamp)
+
+		// Only trigger if deletion happened within 30 seconds of modification
+		// (legitimate apps don't encrypt files then immediately delete them)
+		if timeSinceModification < 30*time.Second {
+			log.Printf("[DETECTION] 🚨 MODIFY-DELETE PATTERN DETECTED: %s", event.TargetFile)
+			log.Printf("[DETECTION] 🚨 File modified with high entropy (%.3f) then deleted %.1f seconds later",
+				modifiedFile.Entropy, timeSinceModification.Seconds())
+
+			indicator := domain.Indicator{
+				Type:        domain.IndicatorModifyDeletePattern,
+				Severity:    domain.ThreatCritical,
+				Points:      domain.IndicatorScores[domain.IndicatorModifyDeletePattern],
+				Description: fmt.Sprintf("CRITICAL: File modified with high entropy (%.3f) then deleted - classic ransomware pattern", modifiedFile.Entropy),
+				Timestamp:   event.Timestamp,
+				Evidence: map[string]string{
+					"file":                event.TargetFile,
+					"entropy":             fmt.Sprintf("%.3f", modifiedFile.Entropy),
+					"time_since_modify":   fmt.Sprintf("%.1fs", timeSinceModification.Seconds()),
+					"pattern":             "MODIFY_HIGH_ENTROPY_THEN_DELETE",
+					"confidence":          "VERY_HIGH",
+					"false_positive_risk": "VERY_LOW",
+				},
+			}
+
+			score := ds.addRuleIndicator(
+				event.ProcessGuid,
+				event.Image,
+				event.ProcessID,
+				indicator,
+			)
+
+			log.Printf("[DETECTION] 🔴 MODIFY-DELETE INDICATOR ADDED: %s (Score: %d)",
+				filepath.Base(event.TargetFile), score)
+
+			// Immediate evaluation - this is critical
+			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+			return
+		}
+	}
+
+	// Check if a ransomware-renamed version exists
+	// Common pattern: file.txt deleted -> file.txt.omega exists
+	for _, ransomExt := range ds.ransomwareExtensions {
+		renamedPath := event.TargetFile + ransomExt
+
+		// Check if renamed file exists
+		if _, err := os.Stat(renamedPath); err == nil {
+			// Ransomware extension pattern detected via file rename
+			indicator := domain.Indicator{
+				Type:        domain.IndicatorRansomExtension,
+				Severity:    domain.ThreatCritical,
+				Points:      domain.IndicatorScores[domain.IndicatorRansomExtension],
+				Description: fmt.Sprintf("File renamed with ransomware extension (delete + rename pattern)"),
+				Timestamp:   event.Timestamp,
+				Evidence: map[string]string{
+					"deleted_file": event.TargetFile,
+					"renamed_to":   renamedPath,
+					"extension":    ransomExt,
+				},
+			}
+
+			score := ds.addRuleIndicator(
+				event.ProcessGuid,
+				event.Image,
+				event.ProcessID,
+				indicator,
+			)
+
+			log.Printf("[DETECTION] 🔴 Ransomware file rename detected: %s -> %s (Score: %d)",
+				event.TargetFile, renamedPath, score)
+
+			// Also check entropy of the renamed file
+			ext := filepath.Ext(renamedPath)
+			entropy, err := domain.AnalyzeFileEntropy(renamedPath, ext)
+			if err == nil && entropy.IsLikelyEncrypted {
+				entropyIndicator := domain.Indicator{
+					Type:        domain.IndicatorHighEntropy,
+					Severity:    domain.ThreatCritical,
+					Points:      domain.IndicatorScores[domain.IndicatorHighEntropy],
+					Description: fmt.Sprintf("High entropy in renamed file: %.3f", entropy.Entropy),
+					Timestamp:   event.Timestamp,
+					Evidence: map[string]string{
+						"entropy":   fmt.Sprintf("%.3f", entropy.Entropy),
+						"threshold": fmt.Sprintf("%.3f", entropy.Threshold),
+						"file":      renamedPath,
+					},
+				}
+
+				score = ds.addRuleIndicator(
+					event.ProcessGuid,
+					event.Image,
+					event.ProcessID,
+					entropyIndicator,
+				)
+
+				log.Printf("[DETECTION] 🔴 High entropy in renamed file: %s (%.3f > %.3f, Score: %d)",
+					renamedPath, entropy.Entropy, entropy.Threshold, score)
+			}
+
+			ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+			return
 		}
 	}
 }
