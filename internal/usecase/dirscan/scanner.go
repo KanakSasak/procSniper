@@ -29,14 +29,21 @@ type AlertEmitter interface {
 	Evaluate(processGuid, image string, pid int)
 }
 
-// Scanner owns the directory-scan concern: the in-progress dedup set and the ransomware
-// extension list, emitting through the injected AlertEmitter.
+// defaultScanConcurrency bounds the number of concurrent distinct-directory progressive scans
+// so a delete burst across many directories cannot spawn unbounded (multi-second-sleeping)
+// goroutines. Generous enough that normal/test load is unaffected.
+const defaultScanConcurrency = 16
+
+// Scanner owns the directory-scan concern: the in-progress dedup set, the ransomware
+// extension list, and a bound on concurrent scans, emitting through the injected AlertEmitter.
 type Scanner struct {
 	emitter        AlertEmitter
 	ransomwareExts []string
 
 	inProgressMu sync.Mutex
 	inProgress   map[string]bool // DirPath -> scanning (prevents duplicate progressive scans)
+
+	sem chan struct{} // bounds concurrent distinct-directory scans (Phase 5)
 }
 
 // NewScanner builds a Scanner wired to the detection-pipeline emitter.
@@ -45,6 +52,15 @@ func NewScanner(emitter AlertEmitter, ransomwareExts []string) *Scanner {
 		emitter:        emitter,
 		ransomwareExts: ransomwareExts,
 		inProgress:     make(map[string]bool),
+		sem:            make(chan struct{}, defaultScanConcurrency),
+	}
+}
+
+// SetScanConcurrency overrides the bound on concurrent distinct-directory scans (default 16).
+// Call before the scanner is shared with detection goroutines.
+func (s *Scanner) SetScanConcurrency(n int) {
+	if n > 0 {
+		s.sem = make(chan struct{}, n)
 	}
 }
 
@@ -192,9 +208,24 @@ func (s *Scanner) ScanDeletedFileDir(event *domain.MonitorEvent) bool {
 	s.inProgress[dirPath] = true
 	s.inProgressMu.Unlock()
 
+	// Bound concurrent distinct-directory scans. If saturated, roll back the dedup mark and
+	// skip spawning — the directory stays eligible for a later delete event (no permanent loss,
+	// no unbounded sleeping-goroutine pileup).
+	select {
+	case s.sem <- struct{}{}:
+		// acquired a scan slot
+	default:
+		s.inProgressMu.Lock()
+		delete(s.inProgress, dirPath)
+		s.inProgressMu.Unlock()
+		log.Printf("[PATH ANALYSIS] Scan concurrency bound reached (%d), deferring scan for %s", cap(s.sem), dirPath)
+		return false
+	}
+
 	// Run progressive directory scan in parallel to avoid blocking event processing
 	go func() {
 		defer func() {
+			<-s.sem // release the scan slot
 			// Cleanup: Remove from in-progress map when done
 			s.inProgressMu.Lock()
 			delete(s.inProgress, dirPath)
