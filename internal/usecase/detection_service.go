@@ -192,10 +192,11 @@ type DetectionService struct {
 	detectionMode string // "rules_only", "hybrid", "ml_only"
 
 	// Alert-drop accounting (atomic). Dropped alerts were previously log-only and invisible.
-	alertsDropped         uint64 // total alerts dropped because alertChan was full
+	alertsDropped         uint64 // total alerts not delivered (channel full OR low-priority watermark shed)
 	alertsDroppedCritical uint64
 	alertsDroppedHigh     uint64
 	alertsDroppedOther    uint64
+	alertsShedLowPriority uint64 // subset of alertsDropped: low-priority alerts shed at the reserve watermark
 }
 
 // DetectionConfig carries the tunables for NewDetectionService. Using a named struct
@@ -227,7 +228,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 	ds := &DetectionService{
 		velocityTracker:           domain.NewFileOperationTracker(60 * time.Second),
 		threatScorer:              domain.NewThreatScorer(),
-		alertChan:                 make(chan *domain.Alert, 100),
+		alertChan:                 make(chan *domain.Alert, alertChanCapacity),
 		velocityActors:            make(map[string]*VelocityActorState),
 		counters:                  newCounterStore(),
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
@@ -268,12 +269,10 @@ func (ds *DetectionService) Evaluate(processGuid, image string, pid int) {
 
 // SendAlert implements canary.AlertEmitter: non-blocking send with drop accounting.
 func (ds *DetectionService) SendAlert(alert *domain.Alert) {
-	select {
-	case ds.alertChan <- alert:
+	if ds.trySend(alert) {
 		log.Printf("[ALERT] Canary compromise alert sent: %s (related suspects: %d)",
 			alert.Description, len(alert.RelatedProcesses))
-	default:
-		ds.recordDroppedAlert(alert.Severity)
+	} else {
 		log.Printf("[ALERT] Alert channel full, canary alert dropped (severity=%s, total dropped=%d)",
 			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
@@ -684,13 +683,11 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 	// Determine if auto-response is warranted
 	alert.AutoRespond = ds.threatScorer.ShouldAutoRespond(processGuid)
 
-	// Send alert
-	select {
-	case ds.alertChan <- alert:
+	// Send alert (priority-aware: low-priority alerts are shed first under load)
+	if ds.trySend(alert) {
 		log.Printf("[ALERT] %s - %s (PID: %d, Score: %d, Auto-Respond: %v, Mode: %s)",
 			alert.Severity, alert.Description, pid, score, alert.AutoRespond, mode)
-	default:
-		ds.recordDroppedAlert(alert.Severity)
+	} else {
 		log.Printf("[WARNING] Alert channel full, dropping alert (severity=%s, total dropped=%d)",
 			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
@@ -753,12 +750,10 @@ func (ds *DetectionService) emitMLDecisionAlert(prediction *domain.MLPrediction)
 		alert.AutoRespond,
 	)
 
-	select {
-	case ds.alertChan <- alert:
+	if ds.trySend(alert) {
 		log.Printf("[ALERT][ML] %s - %s (PID: %d, Score: %d, Auto-Respond: %v)",
 			alert.Severity, alert.Description, alert.ProcessID, alert.Score, alert.AutoRespond)
-	default:
-		ds.recordDroppedAlert(alert.Severity)
+	} else {
 		log.Printf("[WARNING][ML] Alert channel full, dropping ML alert (severity=%s, total dropped=%d)",
 			alert.Severity, atomic.LoadUint64(&ds.alertsDropped))
 	}
@@ -1568,6 +1563,36 @@ func (ds *DetectionService) CleanupOldModifiedFiles(maxAge time.Duration) int {
 	return removed + removedVelocityActors
 }
 
+// Reserved-capacity shedding (Phase 5): once the fixed-capacity alert channel is
+// alertShedWatermark-deep, low-priority alerts are shed so the remaining slots stay available
+// for high-priority (Critical / EventID 1/10) alerts. Capacity stays fixed — no unbounded
+// buffering; a flood of high-priority alerts can still fill the channel and drop.
+const (
+	alertChanCapacity  = 100
+	alertShedWatermark = 80
+)
+
+// trySend performs a priority-aware non-blocking send onto the alert channel, accounting for a
+// drop (and, for watermark sheds, a low-priority shed) when the alert is not delivered. Returns
+// true if the alert was enqueued. High-priority alerts may use the whole buffer; low-priority
+// alerts are refused once the buffer crosses the reserve watermark. len(chan) is a lock-free,
+// racy-but-monotone read — a stale value only mis-sheds a LOW alert at the margin, never a HIGH
+// one (high-priority alerts skip the watermark check entirely).
+func (ds *DetectionService) trySend(alert *domain.Alert) bool {
+	if !alert.IsHighPriority() && len(ds.alertChan) >= alertShedWatermark {
+		atomic.AddUint64(&ds.alertsShedLowPriority, 1)
+		ds.recordDroppedAlert(alert.Severity)
+		return false
+	}
+	select {
+	case ds.alertChan <- alert:
+		return true
+	default:
+		ds.recordDroppedAlert(alert.Severity)
+		return false
+	}
+}
+
 // recordDroppedAlert increments the total and per-severity alert-drop counters.
 // Alert drops were previously log-only; this makes detection-integrity loss observable.
 func (ds *DetectionService) recordDroppedAlert(sev domain.ThreatLevel) {
@@ -1585,10 +1610,11 @@ func (ds *DetectionService) recordDroppedAlert(sev domain.ThreatLevel) {
 // GetDropStats returns a snapshot of alert-drop counters for statistics reporting.
 func (ds *DetectionService) GetDropStats() map[string]uint64 {
 	return map[string]uint64{
-		"alerts_dropped_total":    atomic.LoadUint64(&ds.alertsDropped),
-		"alerts_dropped_critical": atomic.LoadUint64(&ds.alertsDroppedCritical),
-		"alerts_dropped_high":     atomic.LoadUint64(&ds.alertsDroppedHigh),
-		"alerts_dropped_other":    atomic.LoadUint64(&ds.alertsDroppedOther),
+		"alerts_dropped_total":     atomic.LoadUint64(&ds.alertsDropped),
+		"alerts_dropped_critical":  atomic.LoadUint64(&ds.alertsDroppedCritical),
+		"alerts_dropped_high":      atomic.LoadUint64(&ds.alertsDroppedHigh),
+		"alerts_dropped_other":     atomic.LoadUint64(&ds.alertsDroppedOther),
+		"alerts_shed_low_priority": atomic.LoadUint64(&ds.alertsShedLowPriority),
 	}
 }
 

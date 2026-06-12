@@ -13,6 +13,7 @@ type Alert struct {
 	Category         string // "RANSOMWARE", "STEALER", "CREDENTIAL_THEFT"
 	ProcessGuid      string
 	ProcessID        int
+	EventID          int // source MonitorEvent.EventID when an originating event is in scope; 0 for accumulated-indicator alerts
 	Image            string
 	Description      string
 	Score            int
@@ -61,6 +62,15 @@ func NewAlert(category string, severity ThreatLevel, processGuid string, pid int
 // AddIndicator adds a threat indicator to the alert
 func (a *Alert) AddIndicator(indicator Indicator) {
 	a.Indicators = append(a.Indicators, indicator)
+}
+
+// IsHighPriority reports whether the alert must be protected from tail-drop when the alert
+// channel saturates (Phase 5): Critical-severity alerts, or alerts whose originating event is
+// a process create (EventID 1) or process access (EventID 10) — the high-value behavioral
+// signals. EventID is 0 for accumulated-indicator alerts (no single originating event in
+// scope), so those are protected iff their severity is Critical.
+func (a *Alert) IsHighPriority() bool {
+	return a.Severity == ThreatCritical || a.EventID == 1 || a.EventID == 10
 }
 
 // AddEvidence adds evidence to the alert
