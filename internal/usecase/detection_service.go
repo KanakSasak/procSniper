@@ -397,84 +397,18 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 		ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
 	}
 
-	// Always track file operation for velocity calculation
-	op := domain.FileOperation{
-		Timestamp:   event.Timestamp,
-		ProcessGuid: event.ProcessGuid,
-		ProcessID:   event.ProcessID,
-		Operation:   "create",
-		FilePath:    event.TargetFile,
-		Image:       event.Image,
-	}
-	ds.velocityTracker.AddOperation(op)
-
 	// ML feature tracking: detect browser credential / history / SSH key access.
 	// Run before velocity tiering so low-velocity creates are still checked — stealer
-	// access is independent of I/O velocity, and this matches ProcessFileModified (which
-	// previously detected it while ProcessFileCreate skipped it via the TierNone return).
+	// access is independent of I/O velocity, and this matches ProcessFileModified.
 	ds.checkBrowserAndSSHAccess(event)
 
-	// STAGE 1: Multi-Tier Velocity Detection
-	// Implements graduated response based on I/O velocity
-	tier, velocity, tierName := ds.velocityTracker.DetectAnomalousActivity(event.ProcessGuid)
-	ds.trackVelocityActor(event, "create", tier, false)
-
-	// Handle each tier with appropriate response
-	switch tier {
-	case domain.VelocityTierCritical:
-		// TIER 3: CRITICAL (>=100 files/min)
-		// Immediate deep analysis + indicator + alert evaluation
-		if ds.tiers.MarkHighIO(event.ProcessGuid) {
-
-			indicator := domain.Indicator{
-				Type:        domain.IndicatorIOVelocity,
-				Severity:    domain.ThreatCritical,
-				Points:      domain.IndicatorScores[domain.IndicatorIOVelocity],
-				Description: fmt.Sprintf("CRITICAL I/O velocity: %.2f files/min (fast ransomware)", velocity),
-				Timestamp:   event.Timestamp,
-				Evidence: map[string]string{
-					"velocity": fmt.Sprintf("%.2f", velocity),
-					"tier":     tierName,
-				},
-			}
-
-			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-			log.Printf("[DETECTION] 🔴 TIER 3 CRITICAL: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
-		}
-
-	case domain.VelocityTierAnalyze:
-		// TIER 2: ANALYZE (30-99 files/min)
-		// Deep analysis enabled, but lower severity indicator
-		if ds.tiers.MarkAnalyzed(event.ProcessGuid) {
-
-			indicator := domain.Indicator{
-				Type:        domain.IndicatorIOVelocity,
-				Severity:    domain.ThreatHigh,
-				Points:      domain.IndicatorScores[domain.IndicatorIOVelocity] - 5, // 25 points (30-5)
-				Description: fmt.Sprintf("High I/O velocity: %.2f files/min (moderate ransomware)", velocity),
-				Timestamp:   event.Timestamp,
-				Evidence: map[string]string{
-					"velocity": fmt.Sprintf("%.2f", velocity),
-					"tier":     tierName,
-				},
-			}
-
-			score := ds.addRuleIndicator(event.ProcessGuid, event.Image, event.ProcessID, indicator)
-			log.Printf("[DETECTION] ⚠️  TIER 2 ANALYZE: %.2f files/min - %s (Score: %d)", velocity, event.Image, score)
-		}
-
-	case domain.VelocityTierMonitor:
-		// TIER 1: MONITOR (10-29 files/min)
-		// Lightweight tracking, no entropy analysis yet
-		if ds.tiers.MarkMonitored(event.ProcessGuid) {
-
-			log.Printf("[MONITORING] 👁️  TIER 1 MONITOR: %.2f files/min - %s (watching for escalation)", velocity, event.Image)
-			// No indicator added yet - just tracking
-		}
-
-	case domain.VelocityTierNone:
-		// TIER 0: NONE (<10 files/min)
-		// Normal activity, no action needed
+	// STAGE 1: Multi-tier velocity detection — shared with modify/delete via
+	// updateVelocityTierForOperation (AddOperation -> DetectAnomalousActivity -> the
+	// once-per-process tier switch + IOVelocity indicator + trackVelocityActor). TierNone is
+	// below the MONITOR threshold, so bail before ML/txt accumulation and deep analysis,
+	// exactly as the former inline switch's TierNone case did.
+	tier := ds.updateVelocityTierForOperation(event, "create")
+	if tier == domain.VelocityTierNone {
 		return
 	}
 

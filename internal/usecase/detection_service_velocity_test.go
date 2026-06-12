@@ -64,3 +64,25 @@ func TestDetectionService_VelocityTierFlagging(t *testing.T) {
 		t.Errorf("IOVelocity indicators = %d, want exactly 1", ioCount)
 	}
 }
+
+// TestDetectionService_CreateTierNoneSkipsAccumulation pins the ordering invariant preserved
+// across the velocity-tier dedupe (Phase 6 S5): a single low-velocity create is TierNone, so
+// ProcessFileCreate must return BEFORE the ML feature accumulation — it must not create a
+// counters entry. (updateVelocityTierForOperation still tracks the velocity actor for None.)
+func TestDetectionService_CreateTierNoneSkipsAccumulation(t *testing.T) {
+	ds := newMLTestDetectionService()
+	ds.ProcessFileCreate(context.Background(), &domain.MonitorEvent{
+		Timestamp:   time.Now(),
+		ProcessGuid: "guid-none",
+		ProcessID:   1000,
+		Image:       `C:\proc.exe`,
+		TargetFile:  `C:\victim\only.docx`,
+	})
+
+	if f := ds.ExtractFeatureVector("guid-none"); f[3] != 0 {
+		t.Errorf("directory_count = %v, want 0 (TierNone create must not accumulate ML counters)", f[3])
+	}
+	if ds.IsProcessFlagged("guid-none") {
+		t.Error("a single create should not be high-IO flagged")
+	}
+}
