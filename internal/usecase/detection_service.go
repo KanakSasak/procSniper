@@ -425,6 +425,12 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 	}
 	ds.velocityTracker.AddOperation(op)
 
+	// ML feature tracking: detect browser credential / history / SSH key access.
+	// Run before velocity tiering so low-velocity creates are still checked — stealer
+	// access is independent of I/O velocity, and this matches ProcessFileModified (which
+	// previously detected it while ProcessFileCreate skipped it via the TierNone return).
+	ds.checkBrowserAndSSHAccess(event)
+
 	// STAGE 1: Multi-Tier Velocity Detection
 	// Implements graduated response based on I/O velocity
 	tier, velocity, tierName := ds.velocityTracker.DetectAnomalousActivity(event.ProcessGuid)
@@ -512,9 +518,6 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 		mlCounters.ExtensionCounts[strings.ToLower(ext)]++
 	}
 	ds.fileCountersMux.Unlock()
-
-	// ML feature tracking: detect browser credential / history / SSH key access
-	ds.checkBrowserAndSSHAccess(event)
 
 	// STAGE 2: Determine analysis level based on tier
 	// CRITICAL and ANALYZE tiers get deep file analysis
