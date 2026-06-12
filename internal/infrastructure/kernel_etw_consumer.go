@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"procSniper/internal/domain"
+	"procSniper/internal/infrastructure/etwcache"
 )
 
 // ETW Provider GUIDs
@@ -81,18 +82,8 @@ const (
 	skewTolerance = 2 * time.Second
 )
 
-// writeDebounceKey is used to debounce write events per (PID, FileKey)
-type writeDebounceKey struct {
-	PID     uint32
-	FileKey uint64
-}
-
-// FileObjectEntry stores the file path and opener's PID/GUID for cross-process correlation.
-type FileObjectEntry struct {
-	Path       string
-	OpenerPID  uint32
-	OpenerGUID string
-}
+// writeDebounceKey and FileObjectEntry moved to internal/infrastructure/etwcache (Phase 6 S1/S2)
+// so the consumer's correlation caches are unit-testable off a live kernel feed.
 
 // DeadProcessRecord stores recently terminated process context for post-kill suppression.
 type DeadProcessRecord struct {
@@ -122,13 +113,11 @@ type KernelETWConsumer struct {
 	pidGuidCache map[uint32]string
 	pidGuidMux   sync.RWMutex
 
-	// FileObject -> FileObjectEntry cache (populated by Create events)
-	fileObjectCache map[uint64]FileObjectEntry
-	fileObjectMux   sync.RWMutex
+	// FileObject/FileKey -> entry cache for cross-process file correlation (etwcache, Phase 6).
+	fileObjects *etwcache.FileObjectStore
 
-	// Write event debouncer
-	writeDebounce    map[writeDebounceKey]time.Time
-	writeDebounceMux sync.Mutex
+	// Write event debouncer (etwcache, Phase 6).
+	writeDebouncer *etwcache.WriteDebouncer
 
 	// Recently dead process tracking for post-kill ETW suppression.
 	deadProcesses map[uint32]DeadProcessRecord
@@ -163,8 +152,8 @@ func NewKernelETWConsumer(eventProcessor domain.EventProcessor, workerPoolSize i
 		workerPoolSize:  workerPoolSize,
 		eventChannel:    make(chan *domain.MonitorEvent, 1000),
 		pidGuidCache:    make(map[uint32]string),
-		fileObjectCache: make(map[uint64]FileObjectEntry),
-		writeDebounce:   make(map[writeDebounceKey]time.Time),
+		fileObjects:     etwcache.NewFileObjectStore(),
+		writeDebouncer:  etwcache.NewWriteDebouncer(time.Second),
 		imageCache:      make(map[uint32]string),
 		deadProcesses:   make(map[uint32]DeadProcessRecord),
 		ownPID:          uint32(os.Getpid()),
@@ -566,23 +555,19 @@ func (kc *KernelETWConsumer) handleFileOpen(ctx context.Context, e *etw.Event) {
 	// Always cache FileObject → FileObjectEntry for write/delete/rename correlation
 	fileObject := getUint64Prop(props, "FileObject")
 	pid := e.Header.ProcessID
-	entry := FileObjectEntry{
+	entry := etwcache.FileObjectEntry{
 		Path:       filePath,
 		OpenerPID:  pid,
 		OpenerGUID: kc.lookupProcessGuid(pid),
 	}
 	if fileObject != 0 {
-		kc.fileObjectMux.Lock()
-		kc.fileObjectCache[fileObject] = entry
-		kc.fileObjectMux.Unlock()
+		kc.fileObjects.Put(fileObject, entry)
 	}
 
 	// Also cache under FileKey if available
 	fileKey := getUint64Prop(props, "FileKey")
 	if fileKey != 0 {
-		kc.fileObjectMux.Lock()
-		kc.fileObjectCache[fileKey] = entry
-		kc.fileObjectMux.Unlock()
+		kc.fileObjects.Put(fileKey, entry)
 	}
 
 	// Check create disposition using explicit field first, then CreateOptions fallback.
@@ -621,13 +606,11 @@ func (kc *KernelETWConsumer) handleFileCreateNew(ctx context.Context, e *etw.Eve
 	fileObject := getUint64Prop(props, "FileObject")
 	if fileObject != 0 {
 		pid := e.Header.ProcessID
-		kc.fileObjectMux.Lock()
-		kc.fileObjectCache[fileObject] = FileObjectEntry{
+		kc.fileObjects.Put(fileObject, etwcache.FileObjectEntry{
 			Path:       filePath,
 			OpenerPID:  pid,
 			OpenerGUID: kc.lookupProcessGuid(pid),
-		}
-		kc.fileObjectMux.Unlock()
+		})
 	}
 
 	kc.emitFileCreate(ctx, e, filePath)
@@ -680,16 +663,9 @@ func (kc *KernelETWConsumer) handleFileWrite(ctx context.Context, e *etw.Event) 
 	pid := e.Header.ProcessID
 
 	// Debounce: only emit one write event per (PID, FileKey) per second
-	debounceKey := writeDebounceKey{PID: pid, FileKey: fileKey}
-	kc.writeDebounceMux.Lock()
-	if lastEmit, ok := kc.writeDebounce[debounceKey]; ok {
-		if time.Since(lastEmit) < time.Second {
-			kc.writeDebounceMux.Unlock()
-			return
-		}
+	if !kc.writeDebouncer.ShouldEmit(pid, fileKey, time.Now()) {
+		return
 	}
-	kc.writeDebounce[debounceKey] = time.Now()
-	kc.writeDebounceMux.Unlock()
 
 	processGuid := kc.lookupProcessGuid(pid)
 	imagePath := kc.lookupProcessImage(pid)
@@ -888,9 +864,7 @@ func (kc *KernelETWConsumer) handleFileClose(e *etw.Event) {
 	props, _ := e.EventProperties()
 	fileObject := getUint64Prop(props, "FileObject")
 	if fileObject != 0 {
-		kc.fileObjectMux.Lock()
-		delete(kc.fileObjectCache, fileObject)
-		kc.fileObjectMux.Unlock()
+		kc.fileObjects.Delete(fileObject)
 	}
 }
 
@@ -1194,38 +1168,12 @@ func (kc *KernelETWConsumer) lookupProcessImage(pid uint32) string {
 }
 
 func (kc *KernelETWConsumer) lookupFilePath(fileKey, fileObject uint64) string {
-	kc.fileObjectMux.RLock()
-	defer kc.fileObjectMux.RUnlock()
-
-	if fileKey != 0 {
-		if entry, ok := kc.fileObjectCache[fileKey]; ok {
-			return entry.Path
-		}
-	}
-	if fileObject != 0 {
-		if entry, ok := kc.fileObjectCache[fileObject]; ok {
-			return entry.Path
-		}
-	}
-	return ""
+	return kc.fileObjects.Path(fileKey, fileObject)
 }
 
-// lookupFileObjectEntry returns the full FileObjectEntry (path + opener PID/GUID) for cross-process correlation.
-func (kc *KernelETWConsumer) lookupFileObjectEntry(fileKey, fileObject uint64) (FileObjectEntry, bool) {
-	kc.fileObjectMux.RLock()
-	defer kc.fileObjectMux.RUnlock()
-
-	if fileKey != 0 {
-		if entry, ok := kc.fileObjectCache[fileKey]; ok {
-			return entry, true
-		}
-	}
-	if fileObject != 0 {
-		if entry, ok := kc.fileObjectCache[fileObject]; ok {
-			return entry, true
-		}
-	}
-	return FileObjectEntry{}, false
+// lookupFileObjectEntry returns the full entry (path + opener PID/GUID) for cross-process correlation.
+func (kc *KernelETWConsumer) lookupFileObjectEntry(fileKey, fileObject uint64) (etwcache.FileObjectEntry, bool) {
+	return kc.fileObjects.Entry(fileKey, fileObject)
 }
 
 // ============================================================================
@@ -1251,38 +1199,15 @@ func (kc *KernelETWConsumer) cleanupCaches(ctx context.Context) {
 }
 
 func (kc *KernelETWConsumer) cleanWriteDebounceCache() {
-	kc.writeDebounceMux.Lock()
-	defer kc.writeDebounceMux.Unlock()
-
-	cutoff := time.Now().Add(-30 * time.Second)
-	for key, ts := range kc.writeDebounce {
-		if ts.Before(cutoff) {
-			delete(kc.writeDebounce, key)
-		}
-	}
+	kc.writeDebouncer.Sweep(time.Now(), 30*time.Second)
 }
 
 func (kc *KernelETWConsumer) cleanFileObjectCache() {
-	// FileObject cache is cleaned on FileClose events.
-	// This is a safety net for handles that were never closed (leaked handles).
-	// We keep a reasonable size limit instead of time-based eviction since
-	// we can't timestamp cache entries without overhead.
-	kc.fileObjectMux.Lock()
-	defer kc.fileObjectMux.Unlock()
-
+	// FileObject cache is cleaned on FileClose events. This is a safety net for handles that
+	// were never closed (leaked handles): a size cap with map-iteration-order eviction.
 	const maxCacheSize = 100000
-	if len(kc.fileObjectCache) > maxCacheSize {
-		// Evict half the cache (random eviction due to map iteration order)
-		count := 0
-		for key := range kc.fileObjectCache {
-			if count >= maxCacheSize/2 {
-				break
-			}
-			delete(kc.fileObjectCache, key)
-			count++
-		}
-		log.Printf("[ETW] FileObject cache trimmed from %d to %d entries\n",
-			maxCacheSize, len(kc.fileObjectCache))
+	if trimmed, size := kc.fileObjects.Trim(maxCacheSize); trimmed {
+		log.Printf("[ETW] FileObject cache trimmed from >%d to %d entries\n", maxCacheSize, size)
 	}
 }
 
