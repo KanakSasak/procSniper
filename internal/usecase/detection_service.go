@@ -15,6 +15,7 @@ import (
 
 	"procSniper/internal/domain"
 	"procSniper/internal/usecase/canary"
+	"procSniper/internal/usecase/dirscan"
 )
 
 // DetectionService orchestrates threat detection and response
@@ -166,9 +167,9 @@ type DetectionService struct {
 	modifiedHighEntropyFiles    map[string]*ModifiedHighEntropyFile // FilePath -> details
 	modifiedHighEntropyFilesMux sync.RWMutex                        // Protects modifiedHighEntropyFiles map
 
-	// Directory scan deduplication (FLAW #7 fix: prevent goroutine explosion)
-	directoryScanInProgress map[string]bool // DirPath -> scanning (prevents duplicate scans)
-	directoryScanMux        sync.RWMutex    // Protects directoryScanInProgress map
+	// Directory scanning for ransomware bulk-encryption / ransom-note correlation.
+	// Owns its own per-directory dedup state; emits via the AlertEmitter seam (Phase 6).
+	dirScanner *dirscan.Scanner
 
 	// Canary (honeypot) subsystem — owns the file registry, ETW actor attribution, the
 	// alert-dedup latches, and the response action. Reaches back into detection only via
@@ -247,7 +248,6 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 		fileCounters:              make(map[string]*ProcessFileCounters),
 		entropyTracker:            domain.NewEntropyTracker(10 * time.Minute), // Track entropy for 10 minutes
 		modifiedHighEntropyFiles:  make(map[string]*ModifiedHighEntropyFile),  // Track modified high-entropy files
-		directoryScanInProgress:   make(map[string]bool),                      // Prevent goroutine explosion
 		entropyFileThreshold:      cfg.EntropyFileThreshold,
 		extensionFileThreshold:    cfg.ExtensionFileThreshold,
 		combinedThreshold:         cfg.CombinedThreshold,
@@ -266,6 +266,7 @@ func NewDetectionService(cfg DetectionConfig) *DetectionService {
 	// DetectionService implements the canary seams (AlertEmitter / RelatedActorProvider /
 	// TxtActivityProvider), so it wires itself into the manager.
 	ds.canaryMgr = canary.NewManager(ds, ds, ds)
+	ds.dirScanner = dirscan.NewScanner(ds, ds.ransomwareExtensions)
 
 	return ds
 }
@@ -576,7 +577,7 @@ func (ds *DetectionService) ProcessFileCreate(ctx context.Context, event *domain
 			log.Printf("[TIER 2] Triggering directory scan to find encrypted files alongside ransom notes...")
 
 			// Trigger directory scan to find ENCRYPTED FILES
-			go ds.scanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, counters.TxtFileDirectories, event.Timestamp)
+			go ds.dirScanner.ScanDirectoriesForEncryptedFiles(event.ProcessGuid, event.Image, event.ProcessID, counters.TxtFileDirectories, event.Timestamp)
 		}
 	}
 
@@ -2605,130 +2606,6 @@ func (ds *DetectionService) IsProcessFlagged(processGuid string) bool {
 	return exists
 }
 
-// scanDirectoryForRansomware scans a directory for files with ransomware extensions
-// Returns list of ransomware files found and total file count
-func (ds *DetectionService) scanDirectoryForRansomware(dirPath string) ([]string, int) {
-	ransomFiles := make([]string, 0)
-	totalFiles := 0
-
-	// Read directory contents
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		// Directory might not exist or access denied
-		log.Printf("[DIRECTORY SCAN] ERROR: Failed to read directory %s: %v", dirPath, err)
-		return ransomFiles, 0
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue // Skip subdirectories
-		}
-
-		totalFiles++
-		fileName := entry.Name()
-		filePath := filepath.Join(dirPath, fileName)
-
-		//print all the list of files
-		log.Printf("[DIRECTORY SCAN FILES] File: %s", filePath)
-
-		// Check if file has ransomware extension
-		if domain.IsRansomwareExtension(filePath, ds.ransomwareExtensions) {
-			log.Printf("[DIRECTORY SCAN] Found malicious file: %s", fileName)
-			ransomFiles = append(ransomFiles, fileName)
-		}
-	}
-
-	return ransomFiles, totalFiles
-}
-
-// processDirectoryScanResult processes the results of a directory scan and adds indicators
-// This helper function centralizes the scan result processing for progressive scans
-func (ds *DetectionService) processDirectoryScanResult(event *domain.MonitorEvent, dirPath string, ransomFiles []string, totalFiles int, scanType string) {
-	if len(ransomFiles) == 0 {
-		return
-	}
-
-	log.Printf("[DETECTION] 🚨 PATH ANALYSIS [%s]: Found %d suspicious files in %s (total files: %d)",
-		scanType, len(ransomFiles), dirPath, totalFiles)
-
-	// Show first 5 suspicious files found
-	sampleSize := len(ransomFiles)
-	if sampleSize > 5 {
-		sampleSize = 5
-	}
-	for i := 0; i < sampleSize; i++ {
-		log.Printf("    [%d] %s", i+1, ransomFiles[i])
-	}
-	if len(ransomFiles) > 5 {
-		log.Printf("    ... and %d more suspicious files", len(ransomFiles)-5)
-	}
-
-	// Calculate percentage of directory encrypted
-	encryptionPercentage := 0.0
-	if totalFiles > 0 {
-		encryptionPercentage = (float64(len(ransomFiles)) / float64(totalFiles)) * 100.0
-	}
-
-	log.Printf("[DETECTION] 🔴 PATH ENCRYPTION [%s]: %.1f%% of files modified (%d/%d files)",
-		scanType, encryptionPercentage, len(ransomFiles), totalFiles)
-
-	// Add indicator based on severity
-	var severity domain.ThreatLevel
-	var points int
-
-	// Adjust scoring based on scan type (immediate = more critical)
-	bonusPoints := 0
-	if scanType == "IMMEDIATE" {
-		bonusPoints = 5 // Immediate detection = fast encryption = more dangerous
-	} else if scanType == "IN_PROGRESS" {
-		bonusPoints = 3 // Active encryption detected
-	}
-
-	if encryptionPercentage >= 50.0 || len(ransomFiles) >= 10 {
-		// High severity: >50% encrypted OR 10+ files
-		severity = domain.ThreatCritical
-		points = 40 + bonusPoints
-	} else if len(ransomFiles) >= 3 {
-		// Medium severity: 3-9 files
-		severity = domain.ThreatHigh
-		points = 30 + bonusPoints
-	} else {
-		// Low severity: 1-2 files
-		severity = domain.ThreatMedium
-		points = 20 + bonusPoints
-	}
-
-	indicator := domain.Indicator{
-		Type:     domain.IndicatorBulkEncryption,
-		Severity: severity,
-		Points:   points,
-		Description: fmt.Sprintf("Bulk file modification detected [%s]: %d suspicious files found (%.1f%% modified)",
-			scanType, len(ransomFiles), encryptionPercentage),
-		Timestamp: event.Timestamp,
-		Evidence: map[string]string{
-			"directory":             dirPath,
-			"malicious_files":       fmt.Sprintf("%d", len(ransomFiles)),
-			"total_files":           fmt.Sprintf("%d", totalFiles),
-			"encryption_percentage": fmt.Sprintf("%.1f%%", encryptionPercentage),
-			"sample_files":          strings.Join(ransomFiles[:sampleSize], ", "),
-			"scan_type":             scanType,
-		},
-	}
-
-	score := ds.addRuleIndicator(
-		event.ProcessGuid,
-		event.Image,
-		event.ProcessID,
-		indicator,
-	)
-
-	log.Printf("[DETECTION] 🔴 BULK ENCRYPTION INDICATOR ADDED [%s]: %s (Score: %d, Points: +%d)",
-		scanType, dirPath, score, points)
-
-	// Immediately evaluate for response
-	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
-}
-
 // ProcessFileDelete handles file deletion events
 // This is critical for detecting ransomware that renames files (e.g., file.txt -> file.txt.omega)
 // Windows file renames appear as: delete original + create new (but create event may not fire for renames)
@@ -2908,67 +2785,12 @@ func (ds *DetectionService) ProcessFileDelete(ctx context.Context, event *domain
 	// FLAW #7 FIX: Deduplication prevents goroutine explosion
 	// When ransomware operates, it often encrypts entire directories
 	// Strategy: Progressive scans (0s, 2s, 5s) catch encryption at different stages
-	dirPath := filepath.Dir(event.TargetFile)
-
-	// DEDUPLICATION: Check if scan already in progress for this directory
-	ds.directoryScanMux.Lock()
-	if ds.directoryScanInProgress[dirPath] {
-		ds.directoryScanMux.Unlock()
-		log.Printf("[PATH ANALYSIS] Scan already in progress for %s, skipping duplicate", dirPath)
-		return // Scan already running for this directory
+	// Progressive directory scan (deduped per directory), now owned by dirscan.Scanner.
+	// If a scan is already running for this directory, preserve the original behavior of
+	// skipping the rest of delete handling.
+	if !ds.dirScanner.ScanDeletedFileDir(event) {
+		return
 	}
-	ds.directoryScanInProgress[dirPath] = true
-	ds.directoryScanMux.Unlock()
-
-	// Run progressive directory scan in parallel to avoid blocking event processing
-	go func() {
-		defer func() {
-			// Cleanup: Remove from in-progress map when done
-			ds.directoryScanMux.Lock()
-			delete(ds.directoryScanInProgress, dirPath)
-			ds.directoryScanMux.Unlock()
-		}()
-
-		log.Printf("[PATH ANALYSIS] Starting progressive scan for %s...", dirPath)
-
-		// SCAN 1: IMMEDIATE (catch early encryption)
-		log.Printf("[PATH ANALYSIS] Scan 1/3: Immediate check...")
-		scan1Files, scan1Total := ds.scanDirectoryForRansomware(dirPath)
-		if len(scan1Files) > 3 {
-			// Early detection: 3+ suspicious files immediately
-			log.Printf("[DETECTION] ⚡ IMMEDIATE DETECTION: %d suspicious files in %s", len(scan1Files), dirPath)
-			ds.processDirectoryScanResult(event, dirPath, scan1Files, scan1Total, "IMMEDIATE")
-			return // Alert immediately, no need to wait
-		}
-
-		// SCAN 2: After 2 seconds (catch in-progress encryption)
-		time.Sleep(2 * time.Second)
-		log.Printf("[PATH ANALYSIS] Scan 2/3: Re-checking after 2s...")
-		scan2Files, scan2Total := ds.scanDirectoryForRansomware(dirPath)
-
-		// Check if encryption is progressing
-		if len(scan2Files) > len(scan1Files)+5 {
-			// Encryption in progress: 5+ more files in 2 seconds
-			log.Printf("[DETECTION] 🔥 ENCRYPTION IN PROGRESS: %d suspicious files (+%d in 2s) in %s",
-				len(scan2Files), len(scan2Files)-len(scan1Files), dirPath)
-			ds.processDirectoryScanResult(event, dirPath, scan2Files, scan2Total, "IN_PROGRESS")
-			return // Alert on active encryption
-		}
-
-		// SCAN 3: After 5 more seconds (catch slow ransomware, total 7s from start)
-		time.Sleep(3 * time.Second)
-		log.Printf("[PATH ANALYSIS] Scan 3/3: Final check after 5s total...")
-		scan3Files, scan3Total := ds.scanDirectoryForRansomware(dirPath)
-
-		// Final check: Standard threshold
-		if len(scan3Files) > 0 {
-			log.Printf("[DETECTION] 🕒 SLOW ENCRYPTION: %d suspicious files in %s (detected over 5s)",
-				len(scan3Files), dirPath)
-			ds.processDirectoryScanResult(event, dirPath, scan3Files, scan3Total, "FINAL")
-		} else {
-			log.Printf("[PATH ANALYSIS] No significant threats detected in %s after 3 scans", dirPath)
-		}
-	}()
 
 	// CRITICAL DETECTION: Check for modify-delete pattern
 	// Classic ransomware behavior: modify file (encrypt in-place) → delete original → create .ENCRYPTED copy
@@ -3300,135 +3122,6 @@ func (ds *DetectionService) ProcessBackupPrivilege(ctx context.Context, event *d
 
 	// Evaluate and potentially trigger alert
 	ds.evaluateAndAlert(pseudoGuid, event.ProcessName, pid)
-}
-
-// scanDirectoriesForEncryptedFiles scans directories for encrypted files with ransomware extensions
-// Triggered when rapid .txt file creation is detected in Tier 2 monitoring
-// The .txt files are likely ransom notes - this function looks for ACTUAL ENCRYPTED FILES nearby
-// Only adds indicators if encrypted files are found alongside ransom notes (high confidence)
-func (ds *DetectionService) scanDirectoriesForEncryptedFiles(processGuid string, processImage string, processID int, directories []string, timestamp time.Time) {
-	log.Printf("[DIR SCAN] 🔍 Ransom note pattern detected - scanning %d directories for encrypted files", len(directories))
-	log.Printf("[DIR SCAN] Process: %s (PID: %d)", filepath.Base(processImage), processID)
-	log.Printf("[DIR SCAN] Strategy: Look for ransomware extensions alongside .txt files")
-
-	encryptedFiles := make([]string, 0)
-	encryptedFilesByExt := make(map[string]int) // Count by extension
-	ransomNoteFiles := make([]string, 0)
-	totalFilesScanned := 0
-	ransomFound := false
-
-	// Common ransom note file name patterns (case-insensitive)
-	ransomNotePatterns := []string{
-		"readme", "read_me", "read-me",
-		"how_to_decrypt", "how-to-decrypt", "how_to_recover",
-		"decrypt", "decryption", "recovery",
-		"!!!_read_me_!!!", "!!!read_me!!!",
-		"your_files", "files_encrypted",
-		"ransom", "locked", "encrypted",
-		"help_restore", "help_decrypt",
-		"restore_files", "unlock_files",
-	}
-
-	for _, dirPath := range directories {
-		entries, err := os.ReadDir(dirPath)
-		if err != nil {
-			log.Printf("[DIR SCAN] Failed to read directory %s: %v", dirPath, err)
-			continue
-		}
-
-		log.Printf("[DIR SCAN] Scanning directory: %s (%d files)", dirPath, len(entries))
-
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-
-			totalFilesScanned++
-			fileName := entry.Name()
-			fileNameLower := strings.ToLower(fileName)
-			fullPath := filepath.Join(dirPath, fileName)
-			ext := filepath.Ext(fileName)
-
-			// Check if file has ransomware extension
-			if domain.IsRansomwareExtension(fullPath, ds.ransomwareExtensions) {
-				encryptedFiles = append(encryptedFiles, fullPath)
-				encryptedFilesByExt[ext]++
-				log.Printf("[DIR SCAN] 🚨 ENCRYPTED FILE FOUND: %s (extension: %s)", fullPath, ext)
-				ransomFound = true
-				break
-			}
-
-			// Also track ransom note files for correlation analysis
-			if strings.HasSuffix(fileNameLower, ".txt") {
-				for _, pattern := range ransomNotePatterns {
-					if strings.Contains(fileNameLower, pattern) {
-						ransomNoteFiles = append(ransomNoteFiles, fullPath)
-						log.Printf("[DIR SCAN] 📝 Ransom note found: %s", fullPath)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// Analyze results
-	log.Printf("[DIR SCAN] ═══════════════════════════════════════════════════")
-	log.Printf("[DIR SCAN] Scan Results:")
-	log.Printf("[DIR SCAN]   Total files scanned: %d", totalFilesScanned)
-	log.Printf("[DIR SCAN]   Encrypted files found: %d", len(encryptedFiles))
-	log.Printf("[DIR SCAN]   Ransom notes found: %d", len(ransomNoteFiles))
-	log.Printf("[DIR SCAN]   Directories scanned: %d", len(directories))
-	log.Printf("[DIR SCAN] ═══════════════════════════════════════════════════")
-
-	// Log encrypted files by extension
-	if len(encryptedFilesByExt) > 0 {
-		log.Printf("[DIR SCAN] Encrypted files by extension:")
-		for ext, count := range encryptedFilesByExt {
-			log.Printf("[DIR SCAN]   %s: %d files", ext, count)
-		}
-	}
-
-	// CRITICAL: Only add indicators if ENCRYPTED FILES found alongside ransom notes
-	// Ransom notes alone are NOT sufficient - we need actual encrypted files
-	//if len(encryptedFiles) >= 3 && len(ransomNoteFiles) >= 1 {
-	if ransomFound {
-		log.Printf("[DIR SCAN] 🚨 HIGH CONFIDENCE DETECTION: %d encrypted files + %d ransom notes found together",
-			len(encryptedFiles), len(ransomNoteFiles))
-
-		// Add ransomware extension indicator based on actual encrypted files found
-		indicator := domain.Indicator{
-			Type:        domain.IndicatorRansomExtension,
-			Severity:    domain.ThreatCritical,
-			Points:      domain.IndicatorScores[domain.IndicatorRansomExtension],
-			Description: fmt.Sprintf("Directory scan found %d encrypted files with ransomware extensions alongside %d ransom notes", len(encryptedFiles), len(ransomNoteFiles)),
-			Timestamp:   timestamp,
-			Evidence: map[string]string{
-				"encrypted_files":  fmt.Sprintf("%d", len(encryptedFiles)),
-				"ransom_notes":     fmt.Sprintf("%d", len(ransomNoteFiles)),
-				"directories":      fmt.Sprintf("%d", len(directories)),
-				"detection_method": "directory_scan_tier2",
-				"correlation":      "encrypted_files_with_ransom_notes",
-			},
-		}
-
-		score := ds.addRuleIndicator(
-			processGuid,
-			processImage,
-			processID,
-			indicator,
-		)
-
-		log.Printf("[DIR SCAN] 🔴 ENCRYPTED FILES CONFIRMED: Added indicator based on directory scan (Score: %d)", score)
-
-		// Immediate evaluation due to high confidence correlation
-		ds.evaluateAndAlert(processGuid, processImage, processID)
-	} else if len(encryptedFiles) > 0 {
-		log.Printf("[DIR SCAN] ⚠️  Found %d encrypted files but below threshold (need 3+) or no ransom notes", len(encryptedFiles))
-		log.Printf("[DIR SCAN] Continuing to monitor process...")
-	} else {
-		log.Printf("[DIR SCAN] ℹ️  No encrypted files found in scanned directories")
-		log.Printf("[DIR SCAN] False positive: .txt files may not be ransom notes")
-	}
 }
 
 // min returns the minimum of two integers
