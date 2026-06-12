@@ -1373,45 +1373,7 @@ func (ds *DetectionService) ProcessProcessCreate(ctx context.Context, event *dom
 
 // ProcessLSASSAccess handles LSASS memory access events
 func (ds *DetectionService) ProcessLSASSAccess(ctx context.Context, event *domain.MonitorEvent) {
-	if ds.isTrustedProcess(event.Image) {
-		return
-	}
-
-	if !strings.Contains(strings.ToLower(event.TargetImage), "lsass.exe") {
-		return
-	}
-
-	ds.fileCountersMux.Lock()
-	mlCounters := ds.getOrInitMLCounters(event.ProcessGuid)
-	mlCounters.LSASSAccessHit = true
-	ds.fileCountersMux.Unlock()
-
-	indicator := domain.Indicator{
-		Type:        domain.IndicatorLSASSAccess,
-		Severity:    domain.ThreatCritical,
-		Points:      domain.IndicatorScores[domain.IndicatorLSASSAccess],
-		Description: "LSASS memory access detected",
-		Timestamp:   event.Timestamp,
-		Evidence: map[string]string{
-			"granted_access": event.GrantedAccess,
-			"target":         event.TargetImage,
-		},
-	}
-
-	score := ds.addRuleIndicator(
-		event.ProcessGuid,
-		event.Image,
-		event.ProcessID,
-		indicator,
-	)
-
-	log.Printf("[DETECTION] LSASS access: %s (Access: %s, Score: %d)",
-		event.Image, event.GrantedAccess, score)
-
-	// Propagate LSASS access to parent (ransomware may spawn child for credential dumping)
-	ds.propagateMLFlagToParent(event, false, false, true)
-
-	ds.evaluateAndAlert(event.ProcessGuid, event.Image, event.ProcessID)
+	lsassAnalyzer{sink: ds}.analyze(event)
 }
 
 // checkBrowserAndSSHAccess detects non-browser processes touching browser credential,
@@ -1868,6 +1830,15 @@ func (ds *DetectionService) ExtractFeatureVector(processGuid string) [14]float64
 	}
 
 	return features
+}
+
+// setMLCounter locks the counters map and applies set to the process's ProcessFileCounters
+// (initializing it if needed). It is the analyzerSink hook for analyzers that mutate ML
+// feature flags.
+func (ds *DetectionService) setMLCounter(processGuid string, set func(*ProcessFileCounters)) {
+	ds.fileCountersMux.Lock()
+	defer ds.fileCountersMux.Unlock()
+	set(ds.getOrInitMLCounters(processGuid))
 }
 
 // getOrInitMLCounters returns the ProcessFileCounters for a GUID, initializing ML fields if needed.
