@@ -21,8 +21,39 @@ type Alert struct {
 	RelatedProcesses []RelatedProcess
 	Evidence         map[string]interface{}
 	AutoRespond      bool
+	Strategy         ResponseStrategy // response INTENT (suspend vs terminate), decoupled from score
 	Responded        bool
 	ResponseActions  []string
+}
+
+// ResponseStrategy is the response INTENT carried on an alert, decoupled from the detection
+// score/confidence (Phase 6 finding #3 — stops the canary 0/30/100 score-laundering). Empty is
+// the default terminate-on-auto-respond behavior, so non-canary alerts are unaffected.
+type ResponseStrategy string
+
+const (
+	ResponseStrategyTerminate ResponseStrategy = ""        // default: terminate the offending process
+	ResponseStrategySuspend   ResponseStrategy = "suspend" // reversible containment: suspend, do not kill
+)
+
+// StrategyForCanaryAction maps a configured canary response action to a ResponseStrategy:
+// "suspend" -> Suspend; everything else ("terminate"/"alert_only"/unset) -> Terminate (the
+// default — for alert_only the orchestrator never acts because the alert's AutoRespond is false).
+func StrategyForCanaryAction(action string) ResponseStrategy {
+	if action == "suspend" {
+		return ResponseStrategySuspend
+	}
+	return ResponseStrategyTerminate
+}
+
+// IsCanaryCompromise reports whether any indicator on the alert is a canary-compromise type.
+func (a *Alert) IsCanaryCompromise() bool {
+	for _, ind := range a.Indicators {
+		if ind.Type == IndicatorCanaryCompromised || strings.HasPrefix(strings.ToUpper(string(ind.Type)), "CANARY_") {
+			return true
+		}
+	}
+	return false
 }
 
 // RelatedProcess captures a process related to a canary compromise alert.

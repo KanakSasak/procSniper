@@ -607,6 +607,7 @@ func (m *Manager) alertCompromised(filePath string, compromiseType string, curre
 		return false
 	}
 
+	action := m.ResponseAction()
 	alert := &domain.Alert{
 		ID:          fmt.Sprintf("CANARY_%d", time.Now().Unix()),
 		Timestamp:   time.Now(),
@@ -644,7 +645,8 @@ func (m *Manager) alertCompromised(filePath string, compromiseType string, curre
 			"attributed_image": image,
 			"related_path":     relatedPath,
 		},
-		AutoRespond: true,
+		AutoRespond: action != "alert_only",
+		Strategy:    domain.StrategyForCanaryAction(action),
 	}
 	m.AttachRelated(alert, filePath, processGuid)
 
@@ -664,15 +666,17 @@ func (m *Manager) HandleWriteOrRename(event *domain.MonitorEvent) bool {
 	log.Printf("[CANARY] REAL-TIME DETECTION: Canary file WRITE/RENAME observed: %s (response_action=%s)", event.TargetFile, action)
 	log.Printf("[CANARY] Process: %s (PID: %d, GUID: %s)", event.Image, event.ProcessID, event.ProcessGuid)
 
-	// Determine indicator points based on canary response action
+	// Indicator points reflect CONFIDENCE (a canary compromise is high-confidence ransomware),
+	// not response intent — the intent is carried as the alert's ResponseStrategy (Phase 6
+	// finding #3). alert_only stays 0 so it never reaches Critical/auto-respond; suspend and
+	// terminate are both 100 (Critical -> AutoRespond) and are distinguished by the strategy the
+	// detection-service alert builder sets from the canary action.
 	var canaryPoints int
 	switch action {
 	case "alert_only":
-		canaryPoints = 0 // Alert only, no auto-response
-	case "suspend":
-		canaryPoints = 30 // Below auto-terminate threshold, triggers suspend
-	default: // "terminate"
-		canaryPoints = 100 // Immediate auto-terminate
+		canaryPoints = 0 // alert only, no auto-response (AutoRespond stays false)
+	default: // "suspend" or "terminate" — both warrant auto-response; strategy decides which
+		canaryPoints = 100
 	}
 
 	// Correlate with ransom-note style .txt activity for very high confidence.

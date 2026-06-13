@@ -36,6 +36,7 @@ type ResponseOrchestrator struct {
 	// Statistics
 	stats struct {
 		processesTerminated     int
+		processesSuspended      int // offending processes frozen via the Suspend response strategy
 		filesQuarantined        int
 		alertsProcessed         int
 		autoResponsesBlocked    int
@@ -261,6 +262,26 @@ func (ro *ResponseOrchestrator) executeAutomatedResponse(ctx context.Context, al
 		ro.mu.Lock()
 		ro.stats.autoResponsesBlocked++
 		ro.mu.Unlock()
+		return
+	}
+
+	// Response strategy: a Suspend-strategy alert (canary-response=suspend) freezes the offending
+	// process for reversible containment / forensics instead of killing it (Phase 6 finding #3).
+	// A suspended process is NOT marked dead — it may be resumed, so its ETW events must keep
+	// flowing (no notifyProcessTerminated). Default/Terminate strategy falls through to terminate.
+	if alert.Strategy == domain.ResponseStrategySuspend {
+		log.Printf("[!] SUSPENDING PROCESS (strategy=suspend): PID %d\n", alert.ProcessID)
+		if err := ro.responseActions.SuspendProcess(uint32(alert.ProcessID)); err != nil {
+			log.Printf("[!] FAILED TO SUSPEND PROCESS: %v\n", err)
+		} else {
+			log.Printf("[+] PROCESS SUSPENDED (reversible containment): PID %d\n", alert.ProcessID)
+			ro.mu.Lock()
+			ro.stats.processesSuspended++
+			ro.mu.Unlock()
+		}
+		log.Printf("╔════════════════════════════════════════════════════════════╗\n")
+		log.Printf("║           AUTOMATED RESPONSE COMPLETE                      ║\n")
+		log.Printf("╚════════════════════════════════════════════════════════════╝\n\n")
 		return
 	}
 
@@ -546,6 +567,7 @@ func (ro *ResponseOrchestrator) GetStats() map[string]interface{} {
 		"running":                   ro.running,
 		"alerts_processed":          ro.stats.alertsProcessed,
 		"processes_terminated":      ro.stats.processesTerminated,
+		"processes_suspended":       ro.stats.processesSuspended,
 		"files_quarantined":         ro.stats.filesQuarantined,
 		"auto_responses_blocked":    ro.stats.autoResponsesBlocked,
 		"related_suspend_attempted": ro.stats.relatedSuspendAttempted,

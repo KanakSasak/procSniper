@@ -683,6 +683,13 @@ func (ds *DetectionService) evaluateAndAlert(processGuid string, image string, p
 	// Determine if auto-response is warranted
 	alert.AutoRespond = ds.threatScorer.ShouldAutoRespond(processGuid)
 
+	// Carry the canary response intent (Phase 6 finding #3): for canary-compromise alerts the
+	// response strategy (suspend vs terminate) comes from the configured canary action, decoupled
+	// from the detection score. Non-canary alerts keep the default (terminate) strategy.
+	if alert.IsCanaryCompromise() {
+		alert.Strategy = domain.StrategyForCanaryAction(ds.canaryMgr.ResponseAction())
+	}
+
 	// Send alert (priority-aware: low-priority alerts are shed first under load)
 	if ds.trySend(alert) {
 		log.Printf("[ALERT] %s - %s (PID: %d, Score: %d, Auto-Respond: %v, Mode: %s)",
