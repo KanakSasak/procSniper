@@ -154,6 +154,9 @@ func LoadResponseConfig(configPath string) (*ResponseConfig, error) {
 		config.AlertSettings.SyslogTag = "procSniper"
 	}
 
+	// Env layer: PROCSNIPER_* overrides sit above the JSON file, below CLI flags (Phase 2 e).
+	ApplyEnvOverrides(&config)
+
 	return &config, nil
 }
 
