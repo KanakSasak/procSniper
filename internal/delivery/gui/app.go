@@ -736,7 +736,7 @@ func (a *App) SetMLConfidenceThreshold(threshold float64) models.OperationResult
 
 // SetDetectionMode sets the detection mode: rules_only, hybrid, or ml_only.
 func (a *App) SetDetectionMode(mode string) models.OperationResult {
-	if mode != "rules_only" && mode != "hybrid" && mode != "ml_only" {
+	if !config.IsValidDetectionMode(mode) {
 		return models.OperationResult{
 			Success: false,
 			Message: "Invalid detection mode. Must be rules_only, hybrid, or ml_only",
@@ -747,7 +747,7 @@ func (a *App) SetDetectionMode(mode string) models.OperationResult {
 	a.mlMux.RLock()
 	mlLoaded := a.mlModelStatus.Loaded
 	a.mlMux.RUnlock()
-	if (mode == "hybrid" || mode == "ml_only") && !mlLoaded {
+	if config.DetectionModeRequiresML(mode) && !mlLoaded {
 		return models.OperationResult{
 			Success: false,
 			Message: fmt.Sprintf("Cannot set %s mode: no ML model loaded", mode),

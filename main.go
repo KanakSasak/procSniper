@@ -4,11 +4,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -59,92 +59,23 @@ func main() {
 
 	switch command {
 	case "protect":
-		// Parse protect-specific flags
-		mlModelPath := ""
-		mlConfidence := 0.75
-		mlMinIndicators := 4
-		detectionMode := "" // will be resolved after parsing
-		canaryResponse := ""
-		for i := 2; i < len(os.Args); i++ {
-			switch os.Args[i] {
-			case "--ml":
-				if i+1 < len(os.Args) {
-					mlModelPath = os.Args[i+1]
-					i++
-				} else {
-					fmt.Println("Error: --ml requires a model path")
-					os.Exit(1)
-				}
-			case "--ml-confidence":
-				if i+1 < len(os.Args) {
-					v, err := strconv.ParseFloat(os.Args[i+1], 64)
-					if err != nil || v < 0 || v > 1 {
-						fmt.Println("Error: --ml-confidence requires a value between 0.0 and 1.0")
-						os.Exit(1)
-					}
-					mlConfidence = v
-					i++
-				}
-			case "--ml-min-indicators":
-				if i+1 < len(os.Args) {
-					v, err := strconv.Atoi(os.Args[i+1])
-					if err != nil || v < 1 {
-						fmt.Println("Error: --ml-min-indicators requires a positive integer")
-						os.Exit(1)
-					}
-					mlMinIndicators = v
-					i++
-				}
-			case "--detection-mode":
-				if i+1 < len(os.Args) {
-					detectionMode = os.Args[i+1]
-					if detectionMode != "rules_only" && detectionMode != "hybrid" && detectionMode != "ml_only" {
-						fmt.Println("Error: --detection-mode must be rules_only, hybrid, or ml_only")
-						os.Exit(1)
-					}
-					i++
-				} else {
-					fmt.Println("Error: --detection-mode requires a value (rules_only, hybrid, ml_only)")
-					os.Exit(1)
-				}
-			case "--canary-response":
-				if i+1 < len(os.Args) {
-					canaryResponse = os.Args[i+1]
-					if canaryResponse != "terminate" && canaryResponse != "suspend" && canaryResponse != "alert_only" {
-						fmt.Println("Error: --canary-response must be terminate, suspend, or alert_only")
-						os.Exit(1)
-					}
-					i++
-				} else {
-					fmt.Println("Error: --canary-response requires a value (terminate, suspend, alert_only)")
-					os.Exit(1)
-				}
-			}
-		}
-		// Resolve detection mode defaults
-		if detectionMode == "" {
-			if mlModelPath != "" {
-				detectionMode = "ml_only" // ML model provided → default to ml_only
-			} else {
-				detectionMode = responseCfg.ResponseSettings.DetectionMode
-				if detectionMode == "" {
-					detectionMode = "rules_only"
-				}
-			}
-		}
-		// Validate: hybrid and ml_only require ML model
-		if (detectionMode == "hybrid" || detectionMode == "ml_only") && mlModelPath == "" {
-			fmt.Printf("Error: --detection-mode %s requires --ml <model_path>\n", detectionMode)
+		// Parse protect-specific flags via stdlib flag into the shared ProtectOptions, then
+		// resolve config-backed defaults and validate in one place (config.ProtectOptions).
+		opts := config.DefaultProtectOptions()
+		fs := flag.NewFlagSet("protect", flag.ExitOnError)
+		fs.StringVar(&opts.MLModelPath, "ml", "", "path to the ONNX ML model (enables ML detection)")
+		fs.Float64Var(&opts.MLConfidence, "ml-confidence", opts.MLConfidence, "ML malicious-probability threshold (0.0-1.0)")
+		fs.IntVar(&opts.MLMinIndicators, "ml-min-indicators", opts.MLMinIndicators, "minimum accumulated indicators before ML inference")
+		fs.StringVar(&opts.DetectionMode, "detection-mode", "", "rules_only | hybrid | ml_only")
+		fs.StringVar(&opts.CanaryResponse, "canary-response", "", "terminate | suspend | alert_only")
+		_ = fs.Parse(os.Args[2:])
+
+		opts.Resolve(responseCfg)
+		if err := opts.Validate(); err != nil {
+			fmt.Println("Error: " + err.Error())
 			os.Exit(1)
 		}
-		// Resolve canary response default
-		if canaryResponse == "" {
-			canaryResponse = responseCfg.ResponseSettings.CanaryResponseAction
-			if canaryResponse == "" {
-				canaryResponse = "terminate"
-			}
-		}
-		runProtectionMode(cfg, responseCfg, mlModelPath, mlConfidence, mlMinIndicators, detectionMode, canaryResponse)
+		runProtectionMode(cfg, responseCfg, opts.MLModelPath, opts.MLConfidence, opts.MLMinIndicators, opts.DetectionMode, opts.CanaryResponse)
 	case "config":
 		showConfiguration(responseCfg)
 	case "ml-test":
