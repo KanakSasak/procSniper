@@ -18,10 +18,22 @@ type ProcessTerminationSink interface {
 	MarkProcessTerminated(pid uint32, processGuid string, image string, at time.Time, source string)
 }
 
+// processResponder is the OS-action surface the orchestrator drives. It abstracts
+// *infrastructure.ResponseActions (a concrete cgo/Windows type) so the orchestrator's response
+// logic — terminate vs suspend, partial-failure escalation, quarantine — is unit-testable with a
+// fake responder instead of touching real processes.
+type processResponder interface {
+	EnableDebugPrivilege() error
+	SuspendProcess(pid uint32) error
+	TerminateProcessVerified(pid uint32, attempts int, wait time.Duration, escalateSuspend bool) (terminated bool, alreadyExited bool, err error)
+	IsProcessAlive(pid uint32) (bool, error)
+	QuarantineFile(sourcePath, quarantineDir string) error
+}
+
 // ResponseOrchestrator manages automated response to detected threats
 type ResponseOrchestrator struct {
 	detectionService *DetectionService
-	responseActions  *infrastructure.ResponseActions
+	responseActions  processResponder
 	responseConfig   *config.ResponseConfig
 	wg               sync.WaitGroup
 	mu               sync.RWMutex
@@ -49,7 +61,7 @@ type ResponseOrchestrator struct {
 // NewResponseOrchestrator creates a new response orchestrator
 func NewResponseOrchestrator(
 	detectionService *DetectionService,
-	responseActions *infrastructure.ResponseActions,
+	responseActions processResponder,
 	responseConfig *config.ResponseConfig,
 ) *ResponseOrchestrator {
 	ro := &ResponseOrchestrator{
