@@ -15,6 +15,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"procSniper/config"
+	"procSniper/internal/app"
 	"procSniper/internal/delivery/gui/events"
 	"procSniper/internal/delivery/gui/logger"
 	"procSniper/internal/delivery/gui/models"
@@ -27,12 +28,13 @@ import (
 type App struct {
 	ctx context.Context
 
-	// Services
+	// Composition root + the components it wires (cached so the read/setter methods below can
+	// read them directly; the agent owns construction, lifecycle, and teardown).
+	agent                *app.Agent
 	detectionService     *usecase.DetectionService
 	responseOrchestrator *usecase.ResponseOrchestrator
 	etwConsumer          *infrastructure.KernelETWConsumer
 	securityLogConsumer  *infrastructure.SecurityLogConsumer
-	responseActions      *infrastructure.ResponseActions
 
 	// Configuration
 	cfg         *config.Config
@@ -48,10 +50,9 @@ type App struct {
 	isProtecting bool
 	protectMux   sync.RWMutex
 
-	// Background goroutine control
-	stopStats     chan struct{}
-	stopLogs      chan struct{}
-	protectCancel context.CancelFunc // cancels the per-run protection context on Stop
+	// Background goroutine control (GUI presentation goroutines: stats + alert streaming).
+	stopStats chan struct{}
+	stopLogs  chan struct{}
 
 	// ML Model state
 	mlModelStatus models.MLModelStatus
@@ -119,117 +120,51 @@ func (a *App) StartProtection() models.OperationResult {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(a.ctx)
-
-	// Initialize detection service
-	a.detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
-		EntropyFileThreshold:        a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		ExtensionFileThreshold:      a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		CombinedThreshold:           a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		RenameExtThreshold:          a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		EnableRansomNoteDetection:   a.cfg.EnableRansomNoteDetection,
-		RansomwareExtensions:        a.cfg.RansomwareExtensions,
-		TrustedProcesses:            a.responseCfg.Whitelist.Processes,
-		IOVelocityMonitorThreshold:  float64(a.responseCfg.DetectionThresholds.IOVelocityMonitorThreshold),
-		IOVelocityAnalyzeThreshold:  float64(a.responseCfg.DetectionThresholds.IOVelocityAnalyzeThreshold),
-		IOVelocityCriticalThreshold: float64(a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute),
-	})
-
-	// Wire ML settings/callback into the fresh DetectionService.
+	// Build the protection graph via the shared composition root (internal/app). Detection mode and
+	// canary action fall back to config inside app.New (matching the prior GUI behavior). A loaded ML
+	// model is owned by the GUI across Start/Stop cycles, so it is INJECTED — the agent must not close
+	// it on Stop (ownsPredictor stays false). Without a model loaded, ML stays disabled (as before).
+	var opts []app.Option
 	a.mlMux.RLock()
-	a.applyMLSettingsToDetectionServiceLocked()
+	if a.mlPredictor != nil {
+		callback := func(activity *domain.MLInferenceActivity) {
+			if activity == nil || a.eventEmitter == nil {
+				return
+			}
+			a.eventEmitter.EmitMLPrediction(a.mlPredictionVMFromActivity(activity))
+		}
+		opts = append(opts, app.WithMLPredictor(a.mlPredictor, a.mlModelStatus.Enabled, a.mlModelStatus.ConfidenceThreshold, callback))
+	}
 	a.mlMux.RUnlock()
 
-	// Apply detection mode and canary response from config
-	if a.responseCfg != nil {
-		if a.responseCfg.ResponseSettings.DetectionMode != "" {
-			a.detectionService.SetDetectionMode(a.responseCfg.ResponseSettings.DetectionMode)
-		}
-		if a.responseCfg.ResponseSettings.CanaryResponseAction != "" {
-			a.detectionService.SetCanaryResponseAction(a.responseCfg.ResponseSettings.CanaryResponseAction)
-		}
-	}
-
-	// Setup canary files
-	if err := a.detectionService.SetupCanaryFiles(); err != nil {
-		log.Printf("[GUI] WARNING: Failed to setup canary files: %v", err)
-	} else {
-		go a.detectionService.StartCanaryMonitoring(ctx)
-	}
-
-	// Start periodic maintenance: evicts stale per-process detection state to bound memory.
-	go a.detectionService.StartMaintenance(ctx)
-
-	// Initialize response actions
-	var err error
-	a.responseActions, err = infrastructure.NewResponseActions()
+	agent, err := app.New(a.cfg, a.responseCfg, opts...)
 	if err != nil {
-		cancel()
 		return models.OperationResult{
 			Success: false,
-			Message: "Failed to initialize response actions: " + err.Error(),
+			Message: err.Error(),
 		}
 	}
 
-	// Enable process self-protection (DACL hardening)
-	if err := infrastructure.ProtectCurrentProcess(); err != nil {
-		log.Printf("[GUI] WARNING: Failed to enable self-protection: %v", err)
-	}
-
-	// Initialize response orchestrator
-	a.responseOrchestrator = usecase.NewResponseOrchestrator(
-		a.detectionService,
-		a.responseActions,
-		a.responseCfg,
-	)
-
-	// Initialize Kernel ETW consumer
-	a.etwConsumer = infrastructure.NewKernelETWConsumer(
-		a.detectionService,
-		a.cfg.WorkerPoolSize,
-	)
-
-	// Route successful termination outcomes into ETW dead-PID suppression.
-	a.responseOrchestrator.SetProcessTerminationSink(a.etwConsumer)
-
-	if err := a.responseOrchestrator.Start(ctx); err != nil {
-		cancel()
+	if err := agent.Start(a.ctx); err != nil {
 		return models.OperationResult{
 			Success: false,
-			Message: "Failed to start response orchestrator: " + err.Error(),
-		}
-	}
-	if err := a.etwConsumer.Start(ctx); err != nil {
-		cancel()
-		a.responseOrchestrator.Stop()
-		return models.OperationResult{
-			Success: false,
-			Message: "Failed to start ETW consumer: " + err.Error(),
+			Message: err.Error(),
 		}
 	}
 
-	// Initialize Security Log consumer
-	a.securityLogConsumer = infrastructure.NewSecurityLogConsumer(a.detectionService, a.cfg)
-	if err := a.securityLogConsumer.Start(ctx); err != nil {
-		log.Printf("[GUI] WARNING: Security Log consumer failed: %v", err)
-		a.securityLogConsumer = nil
-	}
+	a.agent = agent
+	// Cache the wired components so the GUI's stats/threat/ML-setter methods read them directly.
+	a.detectionService = agent.DetectionService()
+	a.responseOrchestrator = agent.Orchestrator()
+	a.etwConsumer = agent.ETWConsumer()
+	a.securityLogConsumer = agent.SecurityLogConsumer()
 
 	a.isProtecting = true
-	a.protectCancel = cancel // stored so StopProtection can cancel ctx-bound goroutines
 	a.stopStats = make(chan struct{})
 
-	// Start statistics reporter
-	go a.reportStatistics(ctx)
-
-	// Start alert streaming to frontend
-	go a.streamAlerts(ctx)
-
-	// Harden all current OS threads (must run after goroutines are started)
-	if err := infrastructure.ProtectCurrentThreads(); err != nil {
-		log.Printf("[GUI] WARNING: Failed to enable thread protection: %v", err)
-	}
-	go infrastructure.StartPeriodicThreadProtection(ctx)
+	// GUI presentation goroutines (frontend stats + alert streaming) — stopped via stopStats in Stop.
+	go a.reportStatistics()
+	go a.streamAlerts()
 
 	log.Println("[GUI] Protection started successfully")
 
@@ -251,32 +186,17 @@ func (a *App) StopProtection() models.OperationResult {
 		}
 	}
 
+	// Stop the GUI presentation goroutines first (they read the components the agent is about to
+	// stop), then tear down the whole graph via the composition root. The agent cancels the run
+	// context, JOINS its background goroutines (canary monitor, maintenance, periodic thread
+	// protection) via a WaitGroup — a real join in place of the old fixed 2s sleep — stops the
+	// components in reverse order, and removes the canary files. The GUI-owned ML predictor is NOT
+	// closed here; it persists across Start/Stop via LoadMLModel/UnloadMLModel.
 	close(a.stopStats)
 
-	// Cancel the per-run context so ctx-bound goroutines (canary monitor, maintenance,
-	// stats reporter, alert streamer, periodic thread protection) actually exit. Previously
-	// cancel was never stored, so these leaked and accumulated on every Stop/Start cycle.
-	if a.protectCancel != nil {
-		a.protectCancel()
-		a.protectCancel = nil
-	}
-
-	// Stop components in reverse order
-	if a.securityLogConsumer != nil {
-		a.securityLogConsumer.Stop()
-	}
-
-	if a.etwConsumer != nil {
-		a.etwConsumer.Stop()
-	}
-
-	if a.responseOrchestrator != nil {
-		a.responseOrchestrator.Stop()
-	}
-
-	// Cleanup canary files
-	if a.detectionService != nil {
-		a.detectionService.CleanupCanaryFiles()
+	if a.agent != nil {
+		a.agent.Stop()
+		a.agent = nil
 	}
 
 	a.isProtecting = false
@@ -831,15 +751,14 @@ func (a *App) SelectMLModelFile() string {
 	return selection
 }
 
-// reportStatistics periodically emits statistics to the frontend
-func (a *App) reportStatistics(ctx context.Context) {
+// reportStatistics periodically emits statistics to the frontend. Stopped via stopStats (closed in
+// StopProtection); the run context it used to watch is now owned by the composition root.
+func (a *App) reportStatistics() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-a.stopStats:
 			return
 		case <-ticker.C:
@@ -853,8 +772,8 @@ func (a *App) reportStatistics(ctx context.Context) {
 	}
 }
 
-// streamAlerts streams alerts to the frontend
-func (a *App) streamAlerts(ctx context.Context) {
+// streamAlerts streams alerts to the frontend. Stopped via stopStats (closed in StopProtection).
+func (a *App) streamAlerts() {
 	if a.detectionService == nil {
 		return
 	}
@@ -866,8 +785,6 @@ func (a *App) streamAlerts(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-a.stopStats:
 			return
 		case alert, ok := <-alertChan:
