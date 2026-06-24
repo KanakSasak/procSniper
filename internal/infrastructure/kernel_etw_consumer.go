@@ -251,20 +251,32 @@ func (kc *KernelETWConsumer) Stop() {
 	log.Println("[+] Kernel ETW event consumer stopped")
 }
 
+// ETWConsumerStats is a snapshot of the consumer's runtime counters.
+type ETWConsumerStats struct {
+	Running                 bool
+	WorkerPoolSize          int
+	ChannelLength           int
+	ChannelCapacity         int
+	EventsReceived          uint64
+	EventsDropped           uint64
+	EventsDroppedByID       map[string]uint64
+	EventsSuppressedDeadPID uint64
+}
+
 // GetStats returns consumer statistics.
-func (kc *KernelETWConsumer) GetStats() map[string]interface{} {
+func (kc *KernelETWConsumer) GetStats() ETWConsumerStats {
 	kc.mu.RLock()
 	defer kc.mu.RUnlock()
 
-	return map[string]interface{}{
-		"running":                    kc.running,
-		"worker_pool_size":           kc.workerPoolSize,
-		"channel_length":             len(kc.eventChannel),
-		"channel_capacity":           cap(kc.eventChannel),
-		"events_received":            atomic.LoadUint64(&kc.eventsReceived),
-		"events_dropped":             atomic.LoadUint64(&kc.eventsDropped),
-		"events_dropped_by_id":       kc.dropsByEventID(),
-		"events_suppressed_dead_pid": atomic.LoadUint64(&kc.eventsSuppressedDeadPID),
+	return ETWConsumerStats{
+		Running:                 kc.running,
+		WorkerPoolSize:          kc.workerPoolSize,
+		ChannelLength:           len(kc.eventChannel),
+		ChannelCapacity:         cap(kc.eventChannel),
+		EventsReceived:          atomic.LoadUint64(&kc.eventsReceived),
+		EventsDropped:           atomic.LoadUint64(&kc.eventsDropped),
+		EventsDroppedByID:       kc.dropsByEventID(),
+		EventsSuppressedDeadPID: atomic.LoadUint64(&kc.eventsSuppressedDeadPID),
 	}
 }
 

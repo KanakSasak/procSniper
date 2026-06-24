@@ -197,34 +197,34 @@ func reportStatistics(agent *app.Agent, stop chan struct{}) {
 			log.Println()
 			log.Println("═══════════════════ STATISTICS ═══════════════════")
 			log.Printf("[ETW] Running: %v, Queue: %d/%d, Workers: %d\n",
-				etwStats["running"],
-				etwStats["channel_length"],
-				etwStats["channel_capacity"],
-				etwStats["worker_pool_size"],
+				etwStats.Running,
+				etwStats.ChannelLength,
+				etwStats.ChannelCapacity,
+				etwStats.WorkerPoolSize,
 			)
-			log.Printf("[ETW] Events dropped: total=%v by_id=%v\n",
-				etwStats["events_dropped"],
-				etwStats["events_dropped_by_id"],
+			log.Printf("[ETW] Events dropped: total=%d by_id=%v\n",
+				etwStats.EventsDropped,
+				etwStats.EventsDroppedByID,
 			)
 			log.Printf("[Detect] Alerts dropped: total=%d critical=%d high=%d other=%d\n",
-				dropStats["alerts_dropped_total"],
-				dropStats["alerts_dropped_critical"],
-				dropStats["alerts_dropped_high"],
-				dropStats["alerts_dropped_other"],
+				dropStats.AlertsDroppedTotal,
+				dropStats.AlertsDroppedCritical,
+				dropStats.AlertsDroppedHigh,
+				dropStats.AlertsDroppedOther,
 			)
 			log.Printf("[Response] Alerts: %d, Terminated: %d, Quarantined: %d, Blocked: %d\n",
-				orchestratorStats["alerts_processed"],
-				orchestratorStats["processes_terminated"],
-				orchestratorStats["files_quarantined"],
-				orchestratorStats["auto_responses_blocked"],
+				orchestratorStats.AlertsProcessed,
+				orchestratorStats.ProcessesTerminated,
+				orchestratorStats.FilesQuarantined,
+				orchestratorStats.AutoResponsesBlocked,
 			)
 			log.Printf("[Response] Related Suspends: attempted=%d success=%d failed=%d\n",
-				orchestratorStats["related_suspend_attempted"],
-				orchestratorStats["related_suspend_success"],
-				orchestratorStats["related_suspend_failed"],
+				orchestratorStats.RelatedSuspendAttempted,
+				orchestratorStats.RelatedSuspendSuccess,
+				orchestratorStats.RelatedSuspendFailed,
 			)
 			log.Printf("[Canary] Honeypot files deployed: %d\n",
-				canaryStats["total_canaries"],
+				canaryStats.TotalCanaries,
 			)
 			log.Println("══════════════════════════════════════════════════")
 			log.Println()

@@ -23,19 +23,6 @@ func newGateTestOrchestrator(rc *config.ResponseConfig) *ResponseOrchestrator {
 	return NewResponseOrchestrator(nil, nil, rc)
 }
 
-func statInt(t *testing.T, stats map[string]interface{}, key string) int {
-	t.Helper()
-	v, ok := stats[key]
-	if !ok {
-		t.Fatalf("stat %q missing", key)
-	}
-	n, ok := v.(int)
-	if !ok {
-		t.Fatalf("stat %q is %T, want int", key, v)
-	}
-	return n
-}
-
 // The documented hazard fix: a false detection verdict must not be upgraded to termination
 // by score >= CriticalScoreThreshold, ThreatHigh/Critical level, or an extension match.
 func TestProcessAlert_AutoRespondFalseSuppressesTerminationAtHighScore(t *testing.T) {
@@ -69,10 +56,10 @@ func TestProcessAlert_AutoRespondFalseSuppressesTerminationAtHighScore(t *testin
 			ro.processAlert(context.Background(), alert)
 
 			stats := ro.GetStats()
-			if got := statInt(t, stats, "processes_terminated"); got != 0 {
+			if got := stats.ProcessesTerminated; got != 0 {
 				t.Errorf("processes_terminated = %d, want 0 (false verdict must not terminate)", got)
 			}
-			if got := statInt(t, stats, "auto_responses_blocked"); got != 1 {
+			if got := stats.AutoResponsesBlocked; got != 1 {
 				t.Errorf("auto_responses_blocked = %d, want 1", got)
 			}
 		})
@@ -100,14 +87,14 @@ func TestProcessAlert_AutoRespondTruePassesGateAtQualifyingLevel(t *testing.T) {
 	ro.processAlert(context.Background(), alert)
 
 	stats := ro.GetStats()
-	if got := statInt(t, stats, "alerts_processed"); got != 1 {
+	if got := stats.AlertsProcessed; got != 1 {
 		t.Errorf("alerts_processed = %d, want 1", got)
 	}
-	if got := statInt(t, stats, "processes_terminated"); got != 0 {
+	if got := stats.ProcessesTerminated; got != 0 {
 		t.Errorf("processes_terminated = %d, want 0 (PID guard, no live kill)", got)
 	}
 	// Incremented by the invalid-PID guard, proving execution passed BOTH gates.
-	if got := statInt(t, stats, "auto_responses_blocked"); got != 1 {
+	if got := stats.AutoResponsesBlocked; got != 1 {
 		t.Errorf("auto_responses_blocked = %d, want 1 (reached the invalid-PID guard)", got)
 	}
 }
@@ -150,10 +137,10 @@ func TestProcessAlert_ConfigVetoDowngradesTrueVerdict(t *testing.T) {
 			ro.processAlert(context.Background(), base())
 
 			stats := ro.GetStats()
-			if got := statInt(t, stats, "processes_terminated"); got != 0 {
+			if got := stats.ProcessesTerminated; got != 0 {
 				t.Errorf("processes_terminated = %d, want 0 (config veto must suppress a true verdict)", got)
 			}
-			if got := statInt(t, stats, "auto_responses_blocked"); got != 1 {
+			if got := stats.AutoResponsesBlocked; got != 1 {
 				t.Errorf("auto_responses_blocked = %d, want 1", got)
 			}
 		})
@@ -188,7 +175,7 @@ func TestProcessAlert_NoConfigFlagCanUpgradeFalseVerdict(t *testing.T) {
 						Indicators:  []domain.Indicator{{Type: domain.IndicatorRansomExtension}},
 					}
 					ro.processAlert(context.Background(), alert)
-					if got := statInt(t, ro.GetStats(), "processes_terminated"); got != 0 {
+					if got := ro.GetStats().ProcessesTerminated; got != 0 {
 						t.Fatalf("ate=%v tcs=%v tem=%v thr=%d: processes_terminated=%d, want 0",
 							ate, tcs, tem, thr, got)
 					}

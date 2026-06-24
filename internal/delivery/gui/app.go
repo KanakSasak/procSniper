@@ -50,9 +50,8 @@ type App struct {
 	isProtecting bool
 	protectMux   sync.RWMutex
 
-	// Background goroutine control (GUI presentation goroutines: stats + alert streaming).
-	stopStats chan struct{}
-	stopLogs  chan struct{}
+	// Background streaming goroutines (dashboard stats, alerts, logs).
+	streamer *streamer
 
 	// ML Model state
 	mlModelStatus models.MLModelStatus
@@ -63,8 +62,6 @@ type App struct {
 // NewApp creates a new App instance
 func NewApp() *App {
 	return &App{
-		stopStats:  make(chan struct{}),
-		stopLogs:   make(chan struct{}),
 		logCapture: logger.GetLogCapture(),
 	}
 }
@@ -73,6 +70,7 @@ func NewApp() *App {
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
 	a.eventEmitter = events.NewEmitter(ctx)
+	a.streamer = newStreamer(a.eventEmitter, a.logCapture)
 
 	// Load configuration
 	a.cfg = config.Load()
@@ -131,7 +129,7 @@ func (a *App) StartProtection() models.OperationResult {
 			if activity == nil || a.eventEmitter == nil {
 				return
 			}
-			a.eventEmitter.EmitMLPrediction(a.mlPredictionVMFromActivity(activity))
+			a.eventEmitter.EmitMLPrediction(models.MLPredictionVMFromActivity(activity))
 		}
 		opts = append(opts, app.WithMLPredictor(a.mlPredictor, a.mlModelStatus.Enabled, a.mlModelStatus.ConfidenceThreshold, callback))
 	}
@@ -160,11 +158,14 @@ func (a *App) StartProtection() models.OperationResult {
 	a.securityLogConsumer = agent.SecurityLogConsumer()
 
 	a.isProtecting = true
-	a.stopStats = make(chan struct{})
 
-	// GUI presentation goroutines (frontend stats + alert streaming) — stopped via stopStats in Stop.
-	go a.reportStatistics()
-	go a.streamAlerts()
+	// GUI presentation streams (frontend dashboard stats + alert streaming) — stopped in StopProtection.
+	a.streamer.startProtectionStreams(
+		a.detectionService.GetAlertChannel(),
+		a.responseOrchestrator.ForwardAlertToSyslog,
+		a.GetDashboardStats,
+		a.GetActiveThreats,
+	)
 
 	log.Println("[GUI] Protection started successfully")
 
@@ -192,7 +193,7 @@ func (a *App) StopProtection() models.OperationResult {
 	// protection) via a WaitGroup — a real join in place of the old fixed 2s sleep — stops the
 	// components in reverse order, and removes the canary files. The GUI-owned ML predictor is NOT
 	// closed here; it persists across Start/Stop via LoadMLModel/UnloadMLModel.
-	close(a.stopStats)
+	a.streamer.stopProtectionStreams()
 
 	if a.agent != nil {
 		a.agent.Stop()
@@ -216,137 +217,49 @@ func (a *App) IsProtecting() bool {
 	return a.isProtecting
 }
 
-// GetDashboardStats returns current statistics for the dashboard
+// GetDashboardStats returns current statistics for the dashboard.
 func (a *App) GetDashboardStats() models.DashboardStats {
-	stats := models.DashboardStats{
-		ProtectionStatus: "Stopped",
-	}
-
 	a.protectMux.RLock()
 	isProtecting := a.isProtecting
 	a.protectMux.RUnlock()
 
 	if !isProtecting {
-		return stats
+		return models.DashboardStats{ProtectionStatus: "Stopped"}
 	}
 
-	stats.ProtectionStatus = "Active"
-
-	// Get ETW stats
+	var (
+		etw         infrastructure.ETWConsumerStats
+		orch        usecase.OrchestrationStats
+		entropy     domain.EntropyStats
+		canaryCount int
+		threatCount int
+		highIO      int
+	)
 	if a.etwConsumer != nil {
-		etwStats := a.etwConsumer.GetStats()
-		if running, ok := etwStats["running"].(bool); ok {
-			stats.ETWConnected = running
-		}
-		if queueLen, ok := etwStats["channel_length"].(int); ok {
-			stats.WorkerQueueDepth = queueLen
-		}
-		// ETW diagnostics
-		if v, ok := etwStats["events_received"].(uint64); ok {
-			stats.ETWDiagnostics.EventsReceived = v
-		}
-		if v, ok := etwStats["events_dropped"].(uint64); ok {
-			stats.ETWDiagnostics.EventsDropped = v
-		}
-		if v, ok := etwStats["events_suppressed_dead_pid"].(uint64); ok {
-			stats.ETWDiagnostics.EventsSuppressedDeadPID = v
-		}
-		if v, ok := etwStats["worker_pool_size"].(int); ok {
-			stats.ETWDiagnostics.WorkerPoolSize = v
-		}
-		if v, ok := etwStats["channel_capacity"].(int); ok {
-			stats.ETWDiagnostics.ChannelCapacity = v
-		}
-		if v, ok := etwStats["channel_length"].(int); ok {
-			stats.ETWDiagnostics.ChannelLength = v
-		}
+		etw = a.etwConsumer.GetStats()
 	}
-
-	// Get orchestrator stats
 	if a.responseOrchestrator != nil {
-		orchStats := a.responseOrchestrator.GetStats()
-		if alerts, ok := orchStats["alerts_processed"].(int); ok {
-			stats.AlertsProcessed = alerts
-		}
-		if terminated, ok := orchStats["processes_terminated"].(int); ok {
-			stats.ProcessesTerminated = terminated
-		}
-		if quarantined, ok := orchStats["files_quarantined"].(int); ok {
-			stats.FilesQuarantined = quarantined
-		}
-		if blocked, ok := orchStats["auto_responses_blocked"].(int); ok {
-			stats.AutoResponsesBlocked = blocked
-		}
+		orch = a.responseOrchestrator.GetStats()
 	}
-
-	// Get canary stats and detection service stats
 	if a.detectionService != nil {
-		canaryStats := a.detectionService.GetCanaryStats()
-		if total, ok := canaryStats["total_canaries"].(int); ok {
-			stats.CanaryFilesCount = total
-		}
-
-		// Active threats count
-		threats := a.detectionService.GetAllThreats()
-		stats.ActiveThreatsCount = len(threats)
-
-		// High I/O process count
-		stats.HighIOProcessCount = a.detectionService.GetHighIOProcessCount()
-
-		// Entropy stats
-		entropyStats := a.detectionService.GetEntropyStats()
-		if v, ok := entropyStats["tracked_files"].(int); ok {
-			stats.EntropyStats.TrackedFiles = v
-		}
-		if v, ok := entropyStats["modified_files"].(int); ok {
-			stats.EntropyStats.ModifiedFiles = v
-		}
-		if v, ok := entropyStats["significant_increases"].(int); ok {
-			stats.EntropyStats.SignificantIncreases = v
-		}
+		canaryCount = a.detectionService.GetCanaryStats().TotalCanaries
+		threatCount = len(a.detectionService.GetAllThreats())
+		highIO = a.detectionService.GetHighIOProcessCount()
+		entropy = a.detectionService.GetEntropyStats()
 	}
 
+	stats := models.DashboardStatsFromStats(etw, orch, canaryCount, entropy)
+	stats.ActiveThreatsCount = threatCount
+	stats.HighIOProcessCount = highIO
 	return stats
 }
 
-// GetConfiguration returns the current configuration
+// GetConfiguration returns the current configuration.
 func (a *App) GetConfiguration() models.ConfigViewModel {
-	if a.responseCfg == nil {
-		return models.ConfigViewModel{}
-	}
-
-	return models.ConfigViewModel{
-		Version:     a.responseCfg.Version,
-		LastUpdated: a.responseCfg.LastUpdated,
-		DetectionThresholds: models.DetectionThresholdsVM{
-			HighEntropyFileThreshold:             a.responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-			RansomwareExtensionFileThreshold:     a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-			RansomwareExtensionRenameThreshold:   a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-			CombinedEntropyAndExtensionThreshold: a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-			IOVelocityThresholdPerMinute:         a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute,
-		},
-		ResponseSettings: models.ResponseSettingsVM{
-			AutoTerminateEnabled:      a.responseCfg.ResponseSettings.AutoTerminateEnabled,
-			CriticalScoreThreshold:    a.responseCfg.ResponseSettings.CriticalScoreThreshold,
-			InvestigationMode:         a.responseCfg.ResponseSettings.InvestigationMode,
-			QuarantineFiles:           a.responseCfg.ResponseSettings.QuarantineFiles,
-			QuarantineDirectory:       a.responseCfg.ResponseSettings.QuarantineDirectory,
-			ImmediateResponse:         a.responseCfg.ResponseSettings.ImmediateResponse,
-			TerminateOnExtensionMatch: a.responseCfg.ResponseSettings.TerminateOnExtensionMatch,
-			SuspendBeforeTerminate:    a.responseCfg.ResponseSettings.SuspendBeforeTerminate,
-			DetectionMode:             a.responseCfg.ResponseSettings.DetectionMode,
-			CanaryResponseAction:      a.responseCfg.ResponseSettings.CanaryResponseAction,
-		},
-		Whitelist: models.WhitelistVM{
-			Enabled:   a.responseCfg.Whitelist.Enabled,
-			Paths:     a.responseCfg.Whitelist.Paths,
-			Processes: a.responseCfg.Whitelist.Processes,
-		},
-		RansomwareExtensions: a.responseCfg.RansomwareExtensions,
-	}
+	return models.ConfigViewModelFromResponseConfig(a.responseCfg)
 }
 
-// SaveConfiguration saves the configuration
+// SaveConfiguration writes the edited configuration back and persists it.
 func (a *App) SaveConfiguration(cfg models.ConfigViewModel) models.OperationResult {
 	if a.responseCfg == nil {
 		return models.OperationResult{
@@ -355,31 +268,8 @@ func (a *App) SaveConfiguration(cfg models.ConfigViewModel) models.OperationResu
 		}
 	}
 
-	// Update config values
-	a.responseCfg.DetectionThresholds.HighEntropyFileThreshold = cfg.DetectionThresholds.HighEntropyFileThreshold
-	a.responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold = cfg.DetectionThresholds.RansomwareExtensionFileThreshold
-	a.responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold = cfg.DetectionThresholds.RansomwareExtensionRenameThreshold
-	a.responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold = cfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold
-	a.responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute = cfg.DetectionThresholds.IOVelocityThresholdPerMinute
+	cfg.ApplyToResponseConfig(a.responseCfg)
 
-	a.responseCfg.ResponseSettings.AutoTerminateEnabled = cfg.ResponseSettings.AutoTerminateEnabled
-	a.responseCfg.ResponseSettings.CriticalScoreThreshold = cfg.ResponseSettings.CriticalScoreThreshold
-	a.responseCfg.ResponseSettings.InvestigationMode = cfg.ResponseSettings.InvestigationMode
-	a.responseCfg.ResponseSettings.QuarantineFiles = cfg.ResponseSettings.QuarantineFiles
-	a.responseCfg.ResponseSettings.QuarantineDirectory = cfg.ResponseSettings.QuarantineDirectory
-	a.responseCfg.ResponseSettings.ImmediateResponse = cfg.ResponseSettings.ImmediateResponse
-	a.responseCfg.ResponseSettings.TerminateOnExtensionMatch = cfg.ResponseSettings.TerminateOnExtensionMatch
-	a.responseCfg.ResponseSettings.SuspendBeforeTerminate = cfg.ResponseSettings.SuspendBeforeTerminate
-	a.responseCfg.ResponseSettings.DetectionMode = cfg.ResponseSettings.DetectionMode
-	a.responseCfg.ResponseSettings.CanaryResponseAction = cfg.ResponseSettings.CanaryResponseAction
-
-	a.responseCfg.Whitelist.Enabled = cfg.Whitelist.Enabled
-	a.responseCfg.Whitelist.Paths = cfg.Whitelist.Paths
-	a.responseCfg.Whitelist.Processes = cfg.Whitelist.Processes
-
-	a.responseCfg.RansomwareExtensions = cfg.RansomwareExtensions
-
-	// Save to file
 	if err := a.responseCfg.SaveConfig("config/ransomware_extensions.json"); err != nil {
 		return models.OperationResult{
 			Success: false,
@@ -421,18 +311,7 @@ func (a *App) GetEntropyStats() models.EntropyStatsVM {
 		return models.EntropyStatsVM{}
 	}
 
-	stats := a.detectionService.GetEntropyStats()
-	result := models.EntropyStatsVM{}
-	if v, ok := stats["tracked_files"].(int); ok {
-		result.TrackedFiles = v
-	}
-	if v, ok := stats["modified_files"].(int); ok {
-		result.ModifiedFiles = v
-	}
-	if v, ok := stats["significant_increases"].(int); ok {
-		result.SignificantIncreases = v
-	}
-	return result
+	return models.EntropyStatsVMFromStats(a.detectionService.GetEntropyStats())
 }
 
 // LoadMLModel loads an ONNX model file and initializes the inference session.
@@ -536,59 +415,8 @@ func (a *App) applyMLSettingsToDetectionServiceLocked() {
 		if activity == nil || a.eventEmitter == nil {
 			return
 		}
-		a.eventEmitter.EmitMLPrediction(a.mlPredictionVMFromActivity(activity))
+		a.eventEmitter.EmitMLPrediction(models.MLPredictionVMFromActivity(activity))
 	})
-}
-
-func (a *App) mlPredictionVMFromActivity(activity *domain.MLInferenceActivity) models.MLPredictionVM {
-	processName := "UNKNOWN"
-	processID := activity.ProcessID
-	label := "unknown"
-	confidence := 0.0
-	probabilities := [3]float64{}
-	timestamp := activity.Timestamp
-
-	if strings.TrimSpace(activity.Image) != "" {
-		processName = filepath.Base(activity.Image)
-	}
-
-	if pred := activity.Prediction; pred != nil {
-		if strings.TrimSpace(pred.Image) != "" {
-			processName = filepath.Base(pred.Image)
-		}
-		processID = pred.ProcessID
-		if strings.TrimSpace(pred.LabelName) != "" {
-			label = pred.LabelName
-		}
-		confidence = pred.Confidence
-		probabilities = pred.Probabilities
-		if timestamp.IsZero() {
-			timestamp = pred.Timestamp
-		}
-	}
-
-	if timestamp.IsZero() {
-		timestamp = time.Now()
-	}
-
-	return models.MLPredictionVM{
-		ProcessName:         processName,
-		ProcessID:           processID,
-		Label:               label,
-		Confidence:          confidence,
-		Probabilities:       probabilities,
-		Stage:               activity.Stage,
-		Reason:              activity.Reason,
-		Decision:            activity.Decision,
-		DecisionCategory:    activity.DecisionCategory,
-		DecisionScore:       activity.DecisionScore,
-		DecisionAutoRespond: activity.DecisionAutoRespond,
-		Threshold:           activity.Threshold,
-		ModeEnabled:         activity.ModeEnabled,
-		PredictorReady:      activity.PredictorReady,
-		Error:               activity.Error,
-		Timestamp:           timestamp.Format(time.RFC3339),
-	}
 }
 
 // GetMLModelStatus returns current ML model info
@@ -751,55 +579,6 @@ func (a *App) SelectMLModelFile() string {
 	return selection
 }
 
-// reportStatistics periodically emits statistics to the frontend. Stopped via stopStats (closed in
-// StopProtection); the run context it used to watch is now owned by the composition root.
-func (a *App) reportStatistics() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.stopStats:
-			return
-		case <-ticker.C:
-			stats := a.GetDashboardStats()
-			a.eventEmitter.EmitStatsUpdate(stats)
-
-			// Emit threat updates
-			threats := a.GetActiveThreats()
-			a.eventEmitter.EmitThreatUpdate(threats)
-		}
-	}
-}
-
-// streamAlerts streams alerts to the frontend. Stopped via stopStats (closed in StopProtection).
-func (a *App) streamAlerts() {
-	if a.detectionService == nil {
-		return
-	}
-
-	alertChan := a.detectionService.GetAlertChannel()
-	if alertChan == nil {
-		return
-	}
-
-	for {
-		select {
-		case <-a.stopStats:
-			return
-		case alert, ok := <-alertChan:
-			if !ok {
-				return
-			}
-			a.eventEmitter.EmitAlert(models.AlertFromDomain(alert))
-			// Forward to syslog (alerts are split between orchestrator and GUI stream)
-			if a.responseOrchestrator != nil {
-				a.responseOrchestrator.ForwardAlertToSyslog(alert)
-			}
-		}
-	}
-}
-
 // GetLogs returns recent log entries
 func (a *App) GetLogs(limit int) []logger.LogEntry {
 	if limit <= 0 {
@@ -813,36 +592,12 @@ func (a *App) ClearLogs() {
 	a.logCapture.Clear()
 }
 
-// StartLogStream starts streaming logs to the frontend
+// StartLogStream starts streaming logs to the frontend.
 func (a *App) StartLogStream() {
-	a.stopLogs = make(chan struct{})
-	go a.streamLogs()
+	a.streamer.startLogStream()
 }
 
-// StopLogStream stops the log streaming
+// StopLogStream stops the log streaming.
 func (a *App) StopLogStream() {
-	select {
-	case <-a.stopLogs:
-		// Already closed
-	default:
-		close(a.stopLogs)
-	}
-}
-
-// streamLogs streams log entries to the frontend
-func (a *App) streamLogs() {
-	logChan := a.logCapture.Subscribe()
-	defer a.logCapture.Unsubscribe(logChan)
-
-	for {
-		select {
-		case <-a.stopLogs:
-			return
-		case entry, ok := <-logChan:
-			if !ok {
-				return
-			}
-			a.eventEmitter.EmitLogEntry(entry)
-		}
-	}
+	a.streamer.stopLogStream()
 }

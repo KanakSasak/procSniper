@@ -570,21 +570,34 @@ func (ro *ResponseOrchestrator) ForwardAlertToSyslog(alert *domain.Alert) {
 	ro.sendSyslogAlert(alert)
 }
 
+// OrchestrationStats is a snapshot of the orchestrator's counters.
+type OrchestrationStats struct {
+	Running                 bool
+	AlertsProcessed         int
+	ProcessesTerminated     int
+	ProcessesSuspended      int
+	FilesQuarantined        int
+	AutoResponsesBlocked    int
+	RelatedSuspendAttempted int
+	RelatedSuspendSuccess   int
+	RelatedSuspendFailed    int
+}
+
 // GetStats returns orchestrator statistics
-func (ro *ResponseOrchestrator) GetStats() map[string]interface{} {
+func (ro *ResponseOrchestrator) GetStats() OrchestrationStats {
 	ro.mu.RLock()
 	defer ro.mu.RUnlock()
 
-	return map[string]interface{}{
-		"running":                   ro.running,
-		"alerts_processed":          ro.stats.alertsProcessed,
-		"processes_terminated":      ro.stats.processesTerminated,
-		"processes_suspended":       ro.stats.processesSuspended,
-		"files_quarantined":         ro.stats.filesQuarantined,
-		"auto_responses_blocked":    ro.stats.autoResponsesBlocked,
-		"related_suspend_attempted": ro.stats.relatedSuspendAttempted,
-		"related_suspend_success":   ro.stats.relatedSuspendSuccess,
-		"related_suspend_failed":    ro.stats.relatedSuspendFailed,
+	return OrchestrationStats{
+		Running:                 ro.running,
+		AlertsProcessed:         ro.stats.alertsProcessed,
+		ProcessesTerminated:     ro.stats.processesTerminated,
+		ProcessesSuspended:      ro.stats.processesSuspended,
+		FilesQuarantined:        ro.stats.filesQuarantined,
+		AutoResponsesBlocked:    ro.stats.autoResponsesBlocked,
+		RelatedSuspendAttempted: ro.stats.relatedSuspendAttempted,
+		RelatedSuspendSuccess:   ro.stats.relatedSuspendSuccess,
+		RelatedSuspendFailed:    ro.stats.relatedSuspendFailed,
 	}
 }
 

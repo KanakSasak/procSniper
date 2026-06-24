@@ -59,7 +59,7 @@ func TestExecuteResponse_TerminateStrategy(t *testing.T) {
 	if fake.suspendCalls != 0 {
 		t.Errorf("suspendCalls = %d, want 0 (default strategy terminates, not suspends)", fake.suspendCalls)
 	}
-	if got := statInt(t, ro.GetStats(), "processes_terminated"); got != 1 {
+	if got := ro.GetStats().ProcessesTerminated; got != 1 {
 		t.Errorf("processes_terminated = %d, want 1", got)
 	}
 }
@@ -78,10 +78,10 @@ func TestExecuteResponse_SuspendStrategy(t *testing.T) {
 	if fake.terminateCalls != 0 {
 		t.Errorf("terminateCalls = %d, want 0 (suspend strategy must NOT terminate)", fake.terminateCalls)
 	}
-	if got := statInt(t, ro.GetStats(), "processes_suspended"); got != 1 {
+	if got := ro.GetStats().ProcessesSuspended; got != 1 {
 		t.Errorf("processes_suspended = %d, want 1", got)
 	}
-	if got := statInt(t, ro.GetStats(), "processes_terminated"); got != 0 {
+	if got := ro.GetStats().ProcessesTerminated; got != 0 {
 		t.Errorf("processes_terminated = %d, want 0", got)
 	}
 }

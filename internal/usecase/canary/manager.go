@@ -114,11 +114,14 @@ func (m *Manager) Count() int {
 	return len(m.files)
 }
 
+// Stats is a snapshot of canary deployment state.
+type Stats struct {
+	TotalCanaries int
+}
+
 // Stats returns canary statistics for the GUI/CLI.
-func (m *Manager) Stats() map[string]interface{} {
-	return map[string]interface{}{
-		"total_canaries": m.Count(),
-	}
+func (m *Manager) Stats() Stats {
+	return Stats{TotalCanaries: m.Count()}
 }
 
 // Match resolves a target path to a tracked canonical canary path.

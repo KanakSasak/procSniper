@@ -1405,7 +1405,7 @@ func (ds *DetectionService) CleanupCanaryFiles() {
 }
 
 // GetCanaryStats returns statistics about canary files
-func (ds *DetectionService) GetCanaryStats() map[string]interface{} {
+func (ds *DetectionService) GetCanaryStats() canary.Stats {
 	return ds.canaryMgr.Stats()
 }
 
@@ -1430,13 +1430,9 @@ func (ds *DetectionService) GetHighIOProcessCount() int {
 }
 
 // GetEntropyStats returns entropy tracker statistics
-func (ds *DetectionService) GetEntropyStats() map[string]interface{} {
+func (ds *DetectionService) GetEntropyStats() domain.EntropyStats {
 	if ds.entropyTracker == nil {
-		return map[string]interface{}{
-			"tracked_files":         0,
-			"modified_files":        0,
-			"significant_increases": 0,
-		}
+		return domain.EntropyStats{}
 	}
 	return ds.entropyTracker.GetStats()
 }
@@ -1614,14 +1610,23 @@ func (ds *DetectionService) recordDroppedAlert(sev domain.ThreatLevel) {
 	}
 }
 
+// AlertDropStats counts shed/dropped alerts by priority.
+type AlertDropStats struct {
+	AlertsDroppedTotal    uint64
+	AlertsDroppedCritical uint64
+	AlertsDroppedHigh     uint64
+	AlertsDroppedOther    uint64
+	AlertsShedLowPriority uint64
+}
+
 // GetDropStats returns a snapshot of alert-drop counters for statistics reporting.
-func (ds *DetectionService) GetDropStats() map[string]uint64 {
-	return map[string]uint64{
-		"alerts_dropped_total":     atomic.LoadUint64(&ds.alertsDropped),
-		"alerts_dropped_critical":  atomic.LoadUint64(&ds.alertsDroppedCritical),
-		"alerts_dropped_high":      atomic.LoadUint64(&ds.alertsDroppedHigh),
-		"alerts_dropped_other":     atomic.LoadUint64(&ds.alertsDroppedOther),
-		"alerts_shed_low_priority": atomic.LoadUint64(&ds.alertsShedLowPriority),
+func (ds *DetectionService) GetDropStats() AlertDropStats {
+	return AlertDropStats{
+		AlertsDroppedTotal:    atomic.LoadUint64(&ds.alertsDropped),
+		AlertsDroppedCritical: atomic.LoadUint64(&ds.alertsDroppedCritical),
+		AlertsDroppedHigh:     atomic.LoadUint64(&ds.alertsDroppedHigh),
+		AlertsDroppedOther:    atomic.LoadUint64(&ds.alertsDroppedOther),
+		AlertsShedLowPriority: atomic.LoadUint64(&ds.alertsShedLowPriority),
 	}
 }
 
