@@ -34,60 +34,93 @@ func okResult(success bool, msg string) models.OperationResult {
 // --- protection lifecycle (mirrors the retired gui.App, re-fronted over HTTP) ---
 
 // StartProtection builds and starts the agent, caches its components, and launches the SSE feeds.
+//
+// Locking discipline (important): the ML state is snapshotted under s.mlMux and that lock is
+// RELEASED before s.mu is ever taken, and the slow agent build/start runs holding NO lock. This
+// keeps a single global lock order (s.mlMux -> s.mu, never the reverse) so it cannot deadlock the
+// ML handlers, and never blocks status/stats reads during the multi-second ETW startup.
 func (s *Server) StartProtection() models.OperationResult {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.isProtecting {
+	already := s.isProtecting
+	s.mu.Unlock()
+	if already {
 		return okResult(false, "Protection is already running")
 	}
 
-	var opts []app.Option
+	// Snapshot ML state under mlMux only (released here).
 	s.mlMux.RLock()
-	if s.mlPredictor != nil {
-		opts = append(opts, app.WithMLPredictor(s.mlPredictor, s.mlStatus.Enabled, s.mlStatus.ConfidenceThreshold, s.mlBroadcastCallback()))
-	}
+	mlPredictor := s.mlPredictor
+	mlEnabled := s.mlStatus.Enabled
+	mlConfidence := s.mlStatus.ConfidenceThreshold
 	s.mlMux.RUnlock()
 
+	var opts []app.Option
+	if mlPredictor != nil {
+		opts = append(opts, app.WithMLPredictor(mlPredictor, mlEnabled, mlConfidence, s.mlBroadcastCallback()))
+	}
+
+	// Build + start the agent without holding any lock.
 	agent, err := app.New(s.cfg, s.responseCfg, opts...)
 	if err != nil {
 		return okResult(false, err.Error())
 	}
 	if err := agent.Start(context.Background()); err != nil {
+		agent.Stop() // tear down any partial startup (ETW sessions, canaries) on failure
 		return okResult(false, err.Error())
 	}
 
+	det := agent.DetectionService()
+	// The orchestrator is the SOLE consumer of the alert channel (so it responds to AND syslogs
+	// every alert); the UI receives alerts via this observer instead of competing for the channel.
+	det.RegisterAlertObserver(func(a *domain.Alert) {
+		s.hub.broadcast("alert:new", models.AlertFromDomain(a))
+	})
+
+	stop := make(chan struct{})
+	s.mu.Lock()
+	if s.isProtecting {
+		// Lost a concurrent start race — discard this agent.
+		s.mu.Unlock()
+		agent.Stop()
+		return okResult(false, "Protection is already running")
+	}
 	s.agent = agent
-	s.detection = agent.DetectionService()
+	s.detection = det
 	s.orchestrator = agent.Orchestrator()
 	s.etw = agent.ETWConsumer()
+	s.stopStreams = stop
 	s.isProtecting = true
-	s.stopStreams = make(chan struct{})
+	s.feedWG.Add(2)
+	s.mu.Unlock()
 
-	go s.runStatsFeed(s.stopStreams)
-	go s.runAlertsFeed(s.stopStreams)
-	go s.runLogsFeed(s.stopStreams)
+	go s.runStatsFeed(stop)
+	go s.runLogsFeed(stop)
 
 	log.Println("[API] protection started")
 	return okResult(true, "Protection started")
 }
 
-// StopProtection stops the SSE feeds and tears the agent down (WaitGroup join inside agent.Stop).
+// StopProtection signals + joins the SSE feeds, then tears the agent down. It releases s.mu before
+// the join + agent.Stop() so status/stats reads are not blocked during the multi-second teardown.
 func (s *Server) StopProtection() models.OperationResult {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.isProtecting {
+		s.mu.Unlock()
 		return okResult(false, "Protection is not running")
 	}
-	if s.stopStreams != nil {
-		close(s.stopStreams)
-		s.stopStreams = nil
-	}
-	if s.agent != nil {
-		s.agent.Stop()
-		s.agent = nil
-	}
-	s.detection, s.orchestrator, s.etw = nil, nil, nil
+	agent := s.agent
+	stop := s.stopStreams
+	s.agent, s.detection, s.orchestrator, s.etw, s.stopStreams = nil, nil, nil, nil, nil
 	s.isProtecting = false
+	s.mu.Unlock()
+
+	if stop != nil {
+		close(stop)
+	}
+	s.feedWG.Wait() // join the feeds before stopping the components they read
+	if agent != nil {
+		agent.Stop()
+	}
 	log.Println("[API] protection stopped")
 	return okResult(true, "Protection stopped")
 }
@@ -149,6 +182,7 @@ func (s *Server) threats() []models.ThreatViewModel {
 // --- SSE feeds (the streamer.go loops, broadcasting over SSE instead of Wails) ---
 
 func (s *Server) runStatsFeed(stop chan struct{}) {
+	defer s.feedWG.Done()
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {
@@ -162,34 +196,8 @@ func (s *Server) runStatsFeed(stop chan struct{}) {
 	}
 }
 
-func (s *Server) runAlertsFeed(stop chan struct{}) {
-	s.mu.Lock()
-	det, orch := s.detection, s.orchestrator
-	s.mu.Unlock()
-	if det == nil {
-		return
-	}
-	ch := det.GetAlertChannel()
-	if ch == nil {
-		return
-	}
-	for {
-		select {
-		case <-stop:
-			return
-		case a, ok := <-ch:
-			if !ok {
-				return
-			}
-			s.hub.broadcast("alert:new", models.AlertFromDomain(a))
-			if orch != nil {
-				orch.ForwardAlertToSyslog(a)
-			}
-		}
-	}
-}
-
 func (s *Server) runLogsFeed(stop chan struct{}) {
+	defer s.feedWG.Done()
 	ch := s.logCapture.Subscribe()
 	defer s.logCapture.Unsubscribe(ch)
 	for {
@@ -340,7 +348,11 @@ func (s *Server) handleMLEnable(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// Require an explicit body: a missing/garbage body must not silently disable ML.
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, okResult(false, "invalid request body: "+err.Error()))
+		return
+	}
 	s.mlMux.Lock()
 	defer s.mlMux.Unlock()
 	if !s.mlStatus.Loaded && req.Enabled {
@@ -361,7 +373,12 @@ func (s *Server) handleMLConfidence(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Threshold float64 `json:"threshold"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// Require an explicit body: a missing/garbage body must not silently zero the threshold
+	// (which would open the ML gate to fire on everything).
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, okResult(false, "invalid request body: "+err.Error()))
+		return
+	}
 	if req.Threshold < 0.0 || req.Threshold > 1.0 {
 		writeJSON(w, okResult(false, "Threshold must be between 0.0 and 1.0"))
 		return

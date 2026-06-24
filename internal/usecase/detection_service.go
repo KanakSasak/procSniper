@@ -188,8 +188,16 @@ type DetectionService struct {
 
 	// ML inference subsystem (predictor, gate, cooldown, decision policy). Detection-mode
 	// orchestration stays on the service; the ML mechanics live in mlEngine (Phase 6).
-	ml            *mlEngine
-	detectionMode string // "rules_only", "hybrid", "ml_only"
+	ml              *mlEngine
+	detectionMode   string // "rules_only", "hybrid", "ml_only"
+	detectionModeMu sync.RWMutex
+
+	// alertObservers are notified on every raised alert (for the UI/SSE feed), IN ADDITION to the
+	// orchestrator's alert channel. This keeps the orchestrator the sole channel consumer (so it
+	// responds to every alert) while observers also see every alert — fixing the prior split where
+	// a second channel consumer stole ~half the alerts from the responder.
+	alertObservers   []func(*domain.Alert)
+	alertObserversMu sync.RWMutex
 
 	// Alert-drop accounting (atomic). Dropped alerts were previously log-only and invisible.
 	alertsDropped         uint64 // total alerts not delivered (channel full OR low-priority watermark shed)
@@ -812,12 +820,31 @@ func (ds *DetectionService) SetMLPredictionCallback(cb func(*domain.MLInferenceA
 	ds.ml.SetPredictionCallback(cb)
 }
 
+// RegisterAlertObserver registers a callback fired on every raised alert (for the UI/SSE feed),
+// in addition to the orchestrator's alert channel. Observers run synchronously on the detection
+// path, so they must be fast and non-blocking (e.g. a lossy SSE broadcast).
+func (ds *DetectionService) RegisterAlertObserver(cb func(*domain.Alert)) {
+	ds.alertObserversMu.Lock()
+	ds.alertObservers = append(ds.alertObservers, cb)
+	ds.alertObserversMu.Unlock()
+}
+
+func (ds *DetectionService) notifyAlertObservers(alert *domain.Alert) {
+	ds.alertObserversMu.RLock()
+	for _, cb := range ds.alertObservers {
+		cb(alert)
+	}
+	ds.alertObserversMu.RUnlock()
+}
+
 func (ds *DetectionService) isMLModeEnabled() bool {
 	return ds.ml.Enabled()
 }
 
 // SetDetectionMode sets the detection mode: "rules_only", "hybrid", or "ml_only".
 func (ds *DetectionService) SetDetectionMode(mode string) {
+	ds.detectionModeMu.Lock()
+	defer ds.detectionModeMu.Unlock()
 	switch mode {
 	case "rules_only", "hybrid", "ml_only":
 		ds.detectionMode = mode
@@ -827,8 +854,11 @@ func (ds *DetectionService) SetDetectionMode(mode string) {
 	log.Printf("[CONFIG] Detection mode set to: %s", ds.detectionMode)
 }
 
-// GetDetectionMode returns the current detection mode.
+// GetDetectionMode returns the current detection mode. Read on the ETW hot path while the API/GUI
+// may write it, so it is mutex-guarded.
 func (ds *DetectionService) GetDetectionMode() string {
+	ds.detectionModeMu.RLock()
+	defer ds.detectionModeMu.RUnlock()
 	if ds.detectionMode == "" {
 		return "rules_only"
 	}
@@ -1582,6 +1612,9 @@ const (
 // racy-but-monotone read — a stale value only mis-sheds a LOW alert at the margin, never a HIGH
 // one (high-priority alerts skip the watermark check entirely).
 func (ds *DetectionService) trySend(alert *domain.Alert) bool {
+	// Fan out to UI/SSE observers (lossy, non-blocking) for every raised alert, independent of the
+	// orchestrator channel below.
+	ds.notifyAlertObservers(alert)
 	if !alert.IsHighPriority() && len(ds.alertChan) >= alertShedWatermark {
 		atomic.AddUint64(&ds.alertsShedLowPriority, 1)
 		ds.recordDroppedAlert(alert.Severity)

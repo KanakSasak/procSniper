@@ -63,9 +63,10 @@ type Manager struct {
 	actorsMu sync.RWMutex
 	actors   map[string]Actor // normalized canonical canary path -> actor
 
-	// responseAction is set once at startup (before goroutines) and read on the hot path;
-	// lock-free, matching the original DetectionService behavior.
-	responseAction string
+	// responseAction is the canary response action. It can be changed at runtime via the API/GUI
+	// while the canary monitor + ETW workers read it on the hot path, so it is mutex-guarded.
+	responseAction   string
+	responseActionMu sync.RWMutex
 }
 
 // NewManager builds a canary Manager wired to the detection-pipeline seams.
@@ -82,6 +83,8 @@ func NewManager(emitter AlertEmitter, related RelatedActorProvider, txt TxtActiv
 
 // SetResponseAction sets the canary response action ("terminate"/"suspend"/"alert_only").
 func (m *Manager) SetResponseAction(action string) {
+	m.responseActionMu.Lock()
+	defer m.responseActionMu.Unlock()
 	switch action {
 	case "terminate", "suspend", "alert_only":
 		m.responseAction = action
@@ -91,8 +94,11 @@ func (m *Manager) SetResponseAction(action string) {
 	log.Printf("[CONFIG] Canary response action set to: %s", m.responseAction)
 }
 
-// ResponseAction returns the current canary response action (default "terminate").
+// ResponseAction returns the current canary response action (default "terminate"). Read on the
+// hot path while the API/GUI may write it, so it is mutex-guarded.
 func (m *Manager) ResponseAction() string {
+	m.responseActionMu.RLock()
+	defer m.responseActionMu.RUnlock()
 	if m.responseAction == "" {
 		return "terminate"
 	}

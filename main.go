@@ -9,8 +9,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows/svc"
 
 	"procSniper/config"
 	"procSniper/internal/app"
@@ -20,6 +23,14 @@ import (
 )
 
 func main() {
+	// If the Windows SCM launched us as a service, our cwd is System32 — re-root to the exe
+	// directory so the config/logs/model/canary relative paths resolve against the install dir.
+	if isService, _ := svc.IsWindowsService(); isService {
+		if exe, err := os.Executable(); err == nil {
+			_ = os.Chdir(filepath.Dir(exe))
+		}
+	}
+
 	// Setup logging to both console and file
 	logFile, err := infrastructure.SetupLogging("logs")
 	if err != nil {
@@ -80,6 +91,8 @@ func main() {
 		runProtectionMode(cfg, responseCfg, opts.MLModelPath, opts.MLConfidence, opts.MLMinIndicators, opts.DetectionMode, opts.CanaryResponse)
 	case "serve":
 		runServe(cfg, responseCfg)
+	case "service":
+		runService(cfg, responseCfg)
 	case "config":
 		showConfiguration(responseCfg)
 	case "ml-test":
@@ -260,14 +273,22 @@ func runServe(cfg *config.Config, responseCfg *config.ResponseConfig) {
 			log.Printf("[API] WARNING: could not write token file: %v", err)
 		}
 	}
-	// Foreground/dev mode prints the token so you can curl/open the console. The service writes it to
-	// an ACL'd file instead (--token-file) and does not log it.
-	log.Printf("[API] console: http://%s/#token=%s", *addr, srv.Token())
+	// Never persist the token to the (file-backed) log. With --token-file, the token goes only to
+	// that file (the service path); otherwise, in foreground/dev, print the tokenized console URL
+	// to stdout ONLY (fmt bypasses the log file), so it isn't written to logs/.
+	log.Printf("[API] console listening on http://%s/ (bearer token required)", *addr)
+	if *tokenFile == "" {
+		fmt.Printf("[API] open console: http://%s/#token=%s\n", *addr, srv.Token())
+	}
 
 	if *auto {
-		if res := srv.StartProtection(); !res.Success {
-			log.Printf("[API] auto-start protection: %s", res.Message)
-		}
+		// Start protection in the background so the API listener comes up immediately — the console
+		// must be reachable even while protection is starting (or if ETW fails to start).
+		go func() {
+			if res := srv.StartProtection(); !res.Success {
+				log.Printf("[API] auto-start protection: %s", res.Message)
+			}
+		}()
 	}
 
 	go func() {
@@ -456,6 +477,7 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  procSniper protect       - Start real-time protection (requires admin)")
 	fmt.Println("  procSniper serve         - Run the local HTTP/SSE API + browser console (headless)")
+	fmt.Println("  procSniper service ...   - Manage the Windows service (install|remove|start|stop)")
 	fmt.Println("  procSniper config        - Show current configuration")
 	fmt.Println("  procSniper ml-test       - Test ML model with predefined scenarios")
 	fmt.Println("  procSniper version       - Show version information")

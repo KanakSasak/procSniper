@@ -20,6 +20,7 @@ type sseEvent struct {
 type sseHub struct {
 	mu      sync.RWMutex
 	clients map[chan sseEvent]struct{}
+	closed  bool
 }
 
 func newSSEHub() *sseHub {
@@ -29,9 +30,26 @@ func newSSEHub() *sseHub {
 func (h *sseHub) subscribe() chan sseEvent {
 	ch := make(chan sseEvent, 64)
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		close(ch) // hub is shutting down — hand back an already-closed channel so serveStream exits
+		return ch
+	}
 	h.clients[ch] = struct{}{}
 	h.mu.Unlock()
 	return ch
+}
+
+// Close disconnects every client and refuses new subscribers (used on server shutdown so SSE
+// handlers return and http.Shutdown can complete).
+func (h *sseHub) Close() {
+	h.mu.Lock()
+	for ch := range h.clients {
+		delete(h.clients, ch)
+		close(ch)
+	}
+	h.closed = true
+	h.mu.Unlock()
 }
 
 func (h *sseHub) unsubscribe(ch chan sseEvent) {

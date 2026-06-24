@@ -13,8 +13,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -49,7 +51,8 @@ type Server struct {
 	orchestrator *usecase.ResponseOrchestrator
 	etw          *infrastructure.KernelETWConsumer
 	isProtecting bool
-	stopStreams  chan struct{} // stops the per-run SSE feed goroutines
+	stopStreams  chan struct{}  // stops the per-run SSE feed goroutines
+	feedWG       sync.WaitGroup // joins the feed goroutines on Stop
 
 	// ML model state, owned across protection runs (guarded by mlMux)
 	mlMux       sync.RWMutex
@@ -61,6 +64,23 @@ type Server struct {
 
 // NewServer builds the API server. staticFS is the embedded frontend build (cmd/gui/dist) or nil.
 func NewServer(addr string, cfg *config.Config, responseCfg *config.ResponseConfig, staticFS fs.FS) (*Server, error) {
+	// Enforce loopback-only binding: the whole threat model (plaintext HTTP + a single bearer
+	// token, SSE token in the query string) assumes the API is unreachable from the network. A
+	// non-loopback or all-interfaces (":port") addr would collapse that, so reject it here rather
+	// than trust the flag default.
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid addr %q: %w", addr, err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("addr %q binds all interfaces; specify a loopback host (e.g. 127.0.0.1)", addr)
+	}
+	if host != "localhost" {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("addr host %q is not loopback; the API must bind 127.0.0.1 or ::1 only", host)
+		}
+	}
+
 	token, err := generateToken()
 	if err != nil {
 		return nil, err
@@ -108,9 +128,12 @@ func (s *Server) ListenAndServe() error {
 	return nil
 }
 
-// Shutdown stops protection (idempotent) then the HTTP server.
+// Shutdown stops protection (idempotent), ends the SSE streams, then stops the HTTP server.
+// Closing the hub first is essential: SSE handlers block until their client disconnects, so
+// http.Shutdown would otherwise wait on never-idle connections until ctx expires.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.StopProtection()
+	s.hub.Close()
 	return s.http.Shutdown(ctx)
 }
 
@@ -129,12 +152,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/logs", s.auth(s.handleLogs)) // GET (?limit) + DELETE (clear)
 
 	// control
-	mux.HandleFunc("/api/protect/start", s.auth(s.handleStart))
-	mux.HandleFunc("/api/protect/stop", s.auth(s.handleStop))
-	mux.HandleFunc("/api/ml/load", s.auth(s.handleMLLoad))
-	mux.HandleFunc("/api/ml/unload", s.auth(s.handleMLUnload))
-	mux.HandleFunc("/api/ml/enable", s.auth(s.handleMLEnable))
-	mux.HandleFunc("/api/ml/confidence", s.auth(s.handleMLConfidence))
+	mux.HandleFunc("/api/protect/start", s.auth(requirePOST(s.handleStart)))
+	mux.HandleFunc("/api/protect/stop", s.auth(requirePOST(s.handleStop)))
+	mux.HandleFunc("/api/ml/load", s.auth(requirePOST(s.handleMLLoad)))
+	mux.HandleFunc("/api/ml/unload", s.auth(requirePOST(s.handleMLUnload)))
+	mux.HandleFunc("/api/ml/enable", s.auth(requirePOST(s.handleMLEnable)))
+	mux.HandleFunc("/api/ml/confidence", s.auth(requirePOST(s.handleMLConfidence)))
 	mux.HandleFunc("/api/detection-mode", s.auth(s.handleDetectionMode))
 	mux.HandleFunc("/api/canary-action", s.auth(s.handleCanaryAction))
 
@@ -172,16 +195,41 @@ func tokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// requirePOST rejects non-POST verbs on a mutating endpoint (a GET must be safe/idempotent, and
+// side-effecting control endpoints must not be triggerable by a prefetch or accidental GET).
+func requirePOST(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
 // staticHandler serves the embedded SPA, falling back to index.html for client-side routes.
 func (s *Server) staticHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(s.staticFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// An unrouted /api/* path must 404 — never impersonate the SPA (and never expose
+		// index.html for a mistyped/unauthenticated API probe).
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
 		p := strings.TrimPrefix(r.URL.Path, "/")
 		if p == "" {
 			p = "index.html"
 		}
 		if _, err := fs.Stat(s.staticFS, p); err != nil {
-			// Not a real asset → SPA route: serve index.html.
+			// A missing path whose last segment has an extension is a real asset 404 (e.g. a stale
+			// bundle reference) — returning index.html there would feed HTML to a <script>/<link>.
+			last := p[strings.LastIndexByte(p, '/')+1:]
+			if strings.Contains(last, ".") {
+				http.NotFound(w, r)
+				return
+			}
+			// Extensionless path → client-side SPA route: serve index.html.
 			indexBytes, e := fs.ReadFile(s.staticFS, "index.html")
 			if e != nil {
 				http.NotFound(w, r)
