@@ -113,8 +113,15 @@ func (et *EntropyTracker) Cleanup() int {
 	return removed
 }
 
+// EntropyStats is a snapshot of the entropy tracker's state.
+type EntropyStats struct {
+	TrackedFiles         int
+	ModifiedFiles        int
+	SignificantIncreases int
+}
+
 // GetStats returns tracker statistics
-func (et *EntropyTracker) GetStats() map[string]interface{} {
+func (et *EntropyTracker) GetStats() EntropyStats {
 	et.mu.RLock()
 	defer et.mu.RUnlock()
 
@@ -130,9 +137,9 @@ func (et *EntropyTracker) GetStats() map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
-		"tracked_files":         len(et.records),
-		"modified_files":        modifiedFiles,
-		"significant_increases": significantIncreases,
+	return EntropyStats{
+		TrackedFiles:         len(et.records),
+		ModifiedFiles:        modifiedFiles,
+		SignificantIncreases: significantIncreases,
 	}
 }

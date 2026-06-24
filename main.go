@@ -9,15 +9,28 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows/svc"
+
 	"procSniper/config"
+	"procSniper/internal/app"
+	"procSniper/internal/delivery/api"
 	"procSniper/internal/infrastructure"
 	"procSniper/internal/usecase"
 )
 
 func main() {
+	// If the Windows SCM launched us as a service, our cwd is System32 — re-root to the exe
+	// directory so the config/logs/model/canary relative paths resolve against the install dir.
+	if isService, _ := svc.IsWindowsService(); isService {
+		if exe, err := os.Executable(); err == nil {
+			_ = os.Chdir(filepath.Dir(exe))
+		}
+	}
+
 	// Setup logging to both console and file
 	logFile, err := infrastructure.SetupLogging("logs")
 	if err != nil {
@@ -76,6 +89,10 @@ func main() {
 			os.Exit(1)
 		}
 		runProtectionMode(cfg, responseCfg, opts.MLModelPath, opts.MLConfidence, opts.MLMinIndicators, opts.DetectionMode, opts.CanaryResponse)
+	case "serve":
+		runServe(cfg, responseCfg)
+	case "service":
+		runService(cfg, responseCfg)
 	case "config":
 		showConfiguration(responseCfg)
 	case "ml-test":
@@ -88,7 +105,9 @@ func main() {
 	}
 }
 
-// runProtectionMode starts real-time protection
+// runProtectionMode starts real-time protection via the shared composition root (internal/app).
+// It owns only the CLI-specific concerns — console banners, the stats console reporter, and signal
+// handling; the object graph and its lifecycle live in app.Agent (shared with the GUI surface).
 func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, mlModelPath string, mlConfidence float64, mlMinIndicators int, detectionMode string, canaryResponse string) {
 	log.Println("[*] Initializing real-time protection...")
 
@@ -97,16 +116,7 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 		log.Printf("[!] Failed to cleanup old logs: %v\n", err)
 	}
 
-	// Create context with cancellation for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Declare detection service and security log consumer at function scope for cleanup access
-	var detectionService *usecase.DetectionService
-	var securityLogConsumer *infrastructure.SecurityLogConsumer
-
-	// Initialize detection service with thresholds from config
-	log.Println("[*] Initializing detection engine...")
+	// Detection threshold summary (console context before the engine comes up).
 	log.Printf("[*] Detection thresholds:")
 	log.Printf("    - High Entropy: %d files", responseCfg.DetectionThresholds.HighEntropyFileThreshold)
 	log.Printf("    - Ransomware Extension: %d files", responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold)
@@ -114,113 +124,27 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 		responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold)
 	log.Printf("    - Combined (High Entropy + Extension): %d files (IMMEDIATE TERMINATION)",
 		responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold)
-	log.Printf("[*] Detection mode:")
 	log.Printf("    - Ransom Note Detection: %v (focus on behavioral detection)", cfg.EnableRansomNoteDetection)
 
-	detectionService = usecase.NewDetectionService(usecase.DetectionConfig{
-		EntropyFileThreshold:        responseCfg.DetectionThresholds.HighEntropyFileThreshold,
-		ExtensionFileThreshold:      responseCfg.DetectionThresholds.RansomwareExtensionFileThreshold,
-		CombinedThreshold:           responseCfg.DetectionThresholds.CombinedEntropyAndExtensionThreshold,
-		RenameExtThreshold:          responseCfg.DetectionThresholds.RansomwareExtensionRenameThreshold,
-		EnableRansomNoteDetection:   cfg.EnableRansomNoteDetection,
-		RansomwareExtensions:        cfg.RansomwareExtensions,
-		TrustedProcesses:            responseCfg.Whitelist.Processes,
-		IOVelocityMonitorThreshold:  float64(responseCfg.DetectionThresholds.IOVelocityMonitorThreshold),
-		IOVelocityAnalyzeThreshold:  float64(responseCfg.DetectionThresholds.IOVelocityAnalyzeThreshold),
-		IOVelocityCriticalThreshold: float64(responseCfg.DetectionThresholds.IOVelocityThresholdPerMinute),
-	})
-	log.Println("[+] Detection engine initialized")
-
-	// Apply detection mode and canary response settings
-	detectionService.SetDetectionMode(detectionMode)
-	detectionService.SetCanaryResponseAction(canaryResponse)
-
-	// Load ML model if specified
-	var mlPredictor *infrastructure.ONNXPredictor
+	// Build the protection graph via the shared composition root.
+	opts := []app.Option{app.WithDetectionMode(detectionMode, canaryResponse)}
 	if mlModelPath != "" {
-		log.Printf("[*] Loading ML model: %s", mlModelPath)
-		predictor, err := infrastructure.NewONNXPredictor(mlModelPath, "")
-		if err != nil {
-			log.Fatalf("[!] Failed to load ML model: %v", err)
-		}
-		mlPredictor = predictor
-		detectionService.SetMLPredictor(predictor)
-		detectionService.SetMLEnabled(true)
-		detectionService.SetMLConfidence(mlConfidence)
-		detectionService.SetMLMinIndicators(mlMinIndicators)
-		log.Printf("[+] ML model loaded successfully")
-		log.Printf("[*] ML detection mode:")
-		log.Printf("    - Confidence threshold: %.2f", mlConfidence)
-		log.Printf("    - Min features before inference: %d", mlMinIndicators)
+		opts = append(opts, app.WithMLModelPath(mlModelPath, mlConfidence, mlMinIndicators))
 	}
-
-	// Setup canary files (honeypot detection)
-	log.Println("[*] Setting up canary files for honeypot detection...")
-	if err := detectionService.SetupCanaryFiles(); err != nil {
-		log.Printf("[!] WARNING: Failed to setup canary files: %v\n", err)
-		log.Println("[!] Honeypot detection will be disabled")
-	} else {
-		log.Println("[+] Canary files deployed successfully")
-		// Start canary monitoring in background
-		go detectionService.StartCanaryMonitoring(ctx)
-	}
-
-	// Start periodic maintenance: evicts stale per-process detection state to bound memory.
-	go detectionService.StartMaintenance(ctx)
-
-	// Initialize response actions
-	log.Println("[*] Initializing response actions...")
-	responseActions, err := infrastructure.NewResponseActions()
+	agent, err := app.New(cfg, responseCfg, opts...)
 	if err != nil {
-		log.Fatalf("[!] Failed to initialize response actions: %v\n", err)
+		log.Fatalf("[!] Failed to initialize protection: %v\n", err)
 	}
-	log.Println("[+] Response actions initialized")
-
-	// Enable process self-protection (DACL hardening)
-	// This prevents ransomware from killing procSniper via TerminateProcess
-	log.Println("[*] Enabling process self-protection...")
-	if err := infrastructure.ProtectCurrentProcess(); err != nil {
-		log.Printf("[!] WARNING: Failed to enable self-protection: %v", err)
-		log.Println("[!] procSniper may be vulnerable to process termination by malware")
+	if mlModelPath != "" {
+		log.Printf("[*] ML detection: confidence threshold %.2f, min features before inference %d", mlConfidence, mlMinIndicators)
 	}
 
-	// Initialize response orchestrator
-	log.Println("[*] Initializing response orchestrator...")
-	responseOrchestrator := usecase.NewResponseOrchestrator(
-		detectionService,
-		responseActions,
-		responseCfg,
-	)
+	// Context for graceful shutdown; the agent derives a child of it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Initialize Kernel ETW event consumer
-	log.Println("[*] Initializing Kernel ETW event consumer...")
-	etwConsumer := infrastructure.NewKernelETWConsumer(
-		detectionService,
-		cfg.WorkerPoolSize,
-	)
-
-	// Route successful termination outcomes into ETW dead-PID suppression.
-	responseOrchestrator.SetProcessTerminationSink(etwConsumer)
-
-	if err := responseOrchestrator.Start(ctx); err != nil {
-		log.Fatalf("[!] Failed to start response orchestrator: %v\n", err)
-	}
-	if err := etwConsumer.Start(ctx); err != nil {
-		responseOrchestrator.Stop()
-		log.Fatalf("[!] Failed to start ETW consumer: %v\n", err)
-	}
-
-	// Initialize Security Log consumer for BackupRead/BackupWrite API detection
-	log.Println("[*] Initializing Windows Security Log consumer...")
-	log.Println("[*] Monitoring for BackupRead/BackupWrite API usage (file creation detection bypass)...")
-	securityLogConsumer = infrastructure.NewSecurityLogConsumer(detectionService, cfg)
-	if err := securityLogConsumer.Start(ctx); err != nil {
-		log.Printf("[!] WARNING: Failed to start Security Log consumer: %v\n", err)
-		log.Println("[!] BackupRead/BackupWrite API detection will be disabled")
-		log.Println("[!] NOTE: Requires Administrator privileges and Security log access")
-		securityLogConsumer = nil // Set to nil so we don't try to stop it later
-	} else {
-		log.Println("[+] Security Log consumer started successfully")
+	if err := agent.Start(ctx); err != nil {
+		log.Fatalf("[!] Failed to start protection: %v\n", err)
 	}
 
 	// Print configuration summary
@@ -239,21 +163,15 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	log.Printf("[*] Canary response action: %s\n", canaryResponse)
 	log.Printf("[*] Ransomware extensions monitored: %d\n", len(responseCfg.RansomwareExtensions))
 	log.Printf("[*] Worker pool size: %d\n", cfg.WorkerPoolSize)
-	log.Printf("[*] ML detection: %v\n", mlPredictor != nil)
+	log.Printf("[*] ML detection: %v\n", mlModelPath != "")
 	log.Println()
 	log.Println("[+] procSniper is now protecting your system")
 	log.Println("[*] Press Ctrl+C to stop...")
 	log.Println()
 
-	// Start statistics reporter
+	// Start statistics reporter (CLI console output)
 	stopStats := make(chan struct{})
-	go reportStatistics(ctx, etwConsumer, responseOrchestrator, detectionService, stopStats)
-
-	// Harden all current OS threads (must run after goroutines are started)
-	if err := infrastructure.ProtectCurrentThreads(); err != nil {
-		log.Printf("[!] WARNING: Failed to enable thread protection: %v", err)
-	}
-	go infrastructure.StartPeriodicThreadProtection(ctx)
+	go reportStatistics(agent, stopStats)
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
@@ -265,32 +183,9 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	log.Println("[*] Shutdown signal received, stopping protection...")
 	close(stopStats)
 
-	// Cancel context to stop all components
-	cancel()
-
-	// Wait a moment for graceful shutdown
-	time.Sleep(2 * time.Second)
-
-	// Stop components in reverse order
-	if securityLogConsumer != nil {
-		log.Println("[*] Stopping Security Log consumer...")
-		securityLogConsumer.Stop()
-	}
-
-	log.Println("[*] Stopping ETW consumer...")
-	etwConsumer.Stop()
-
-	log.Println("[*] Stopping response orchestrator...")
-	responseOrchestrator.Stop()
-
-	if mlPredictor != nil {
-		log.Println("[*] Closing ML model...")
-		mlPredictor.Close()
-	}
-
-	// Cleanup canary files
-	log.Println("[*] Cleaning up canary files...")
-	detectionService.CleanupCanaryFiles()
+	// Tear down the whole graph (cancels ctx, joins background goroutines, stops components in
+	// reverse order, closes the owned ML predictor, removes canary files).
+	agent.Stop()
 
 	log.Println()
 	log.Println("╔════════════════════════════════════════════════════════════╗")
@@ -299,65 +194,117 @@ func runProtectionMode(cfg *config.Config, responseCfg *config.ResponseConfig, m
 	log.Println("[+] procSniper shutdown complete")
 }
 
-// reportStatistics periodically reports system statistics
-func reportStatistics(
-	ctx context.Context,
-	etwConsumer *infrastructure.KernelETWConsumer,
-	responseOrchestrator *usecase.ResponseOrchestrator,
-	detectionService *usecase.DetectionService,
-	stop chan struct{},
-) {
+// reportStatistics periodically reports system statistics, reading the live components through the
+// composition root. Stops when the stop channel is closed (during shutdown, before agent.Stop()).
+func reportStatistics(agent *app.Agent, stop chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-stop:
 			return
 		case <-ticker.C:
-			etwStats := etwConsumer.GetStats()
-			orchestratorStats := responseOrchestrator.GetStats()
-			canaryStats := detectionService.GetCanaryStats()
-			dropStats := detectionService.GetDropStats()
+			etwStats := agent.ETWConsumer().GetStats()
+			orchestratorStats := agent.Orchestrator().GetStats()
+			canaryStats := agent.DetectionService().GetCanaryStats()
+			dropStats := agent.DetectionService().GetDropStats()
 
 			log.Println()
 			log.Println("═══════════════════ STATISTICS ═══════════════════")
 			log.Printf("[ETW] Running: %v, Queue: %d/%d, Workers: %d\n",
-				etwStats["running"],
-				etwStats["channel_length"],
-				etwStats["channel_capacity"],
-				etwStats["worker_pool_size"],
+				etwStats.Running,
+				etwStats.ChannelLength,
+				etwStats.ChannelCapacity,
+				etwStats.WorkerPoolSize,
 			)
-			log.Printf("[ETW] Events dropped: total=%v by_id=%v\n",
-				etwStats["events_dropped"],
-				etwStats["events_dropped_by_id"],
+			log.Printf("[ETW] Events dropped: total=%d by_id=%v\n",
+				etwStats.EventsDropped,
+				etwStats.EventsDroppedByID,
 			)
 			log.Printf("[Detect] Alerts dropped: total=%d critical=%d high=%d other=%d\n",
-				dropStats["alerts_dropped_total"],
-				dropStats["alerts_dropped_critical"],
-				dropStats["alerts_dropped_high"],
-				dropStats["alerts_dropped_other"],
+				dropStats.AlertsDroppedTotal,
+				dropStats.AlertsDroppedCritical,
+				dropStats.AlertsDroppedHigh,
+				dropStats.AlertsDroppedOther,
 			)
 			log.Printf("[Response] Alerts: %d, Terminated: %d, Quarantined: %d, Blocked: %d\n",
-				orchestratorStats["alerts_processed"],
-				orchestratorStats["processes_terminated"],
-				orchestratorStats["files_quarantined"],
-				orchestratorStats["auto_responses_blocked"],
+				orchestratorStats.AlertsProcessed,
+				orchestratorStats.ProcessesTerminated,
+				orchestratorStats.FilesQuarantined,
+				orchestratorStats.AutoResponsesBlocked,
 			)
 			log.Printf("[Response] Related Suspends: attempted=%d success=%d failed=%d\n",
-				orchestratorStats["related_suspend_attempted"],
-				orchestratorStats["related_suspend_success"],
-				orchestratorStats["related_suspend_failed"],
+				orchestratorStats.RelatedSuspendAttempted,
+				orchestratorStats.RelatedSuspendSuccess,
+				orchestratorStats.RelatedSuspendFailed,
 			)
 			log.Printf("[Canary] Honeypot files deployed: %d\n",
-				canaryStats["total_canaries"],
+				canaryStats.TotalCanaries,
 			)
 			log.Println("══════════════════════════════════════════════════")
 			log.Println()
 		}
 	}
+}
+
+// runServe runs the local HTTP+SSE API server (foreground). This is the headless delivery surface
+// the Windows service will host; in the foreground it's the dev/iteration path (browser console over
+// http://127.0.0.1:PORT). The detection engine is the same internal/app.Agent the CLI/service use.
+func runServe(cfg *config.Config, responseCfg *config.ResponseConfig) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8787", "listen address (loopback only)")
+	auto := fs.Bool("auto", false, "start protection immediately on boot")
+	tokenFile := fs.String("token-file", "", "write the API bearer token to this path (for the tray/operator)")
+	_ = fs.Parse(os.Args[2:])
+
+	staticFS, err := frontendFS()
+	if err != nil {
+		log.Printf("[API] WARNING: frontend assets unavailable, serving API only: %v", err)
+		staticFS = nil
+	}
+
+	srv, err := api.NewServer(*addr, cfg, responseCfg, staticFS)
+	if err != nil {
+		log.Fatalf("[API] failed to initialize server: %v", err)
+	}
+	if *tokenFile != "" {
+		if err := srv.WriteTokenFile(*tokenFile); err != nil {
+			log.Printf("[API] WARNING: could not write token file: %v", err)
+		}
+	}
+	// Never persist the token to the (file-backed) log. With --token-file, the token goes only to
+	// that file (the service path); otherwise, in foreground/dev, print the tokenized console URL
+	// to stdout ONLY (fmt bypasses the log file), so it isn't written to logs/.
+	log.Printf("[API] console listening on http://%s/ (bearer token required)", *addr)
+	if *tokenFile == "" {
+		fmt.Printf("[API] open console: http://%s/#token=%s\n", *addr, srv.Token())
+	}
+
+	if *auto {
+		// Start protection in the background so the API listener comes up immediately — the console
+		// must be reachable even while protection is starting (or if ETW fails to start).
+		go func() {
+			if res := srv.StartProtection(); !res.Success {
+				log.Printf("[API] auto-start protection: %s", res.Message)
+			}
+		}()
+	}
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		<-sigChan
+		log.Println("[API] shutdown signal received")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatalf("[API] server error: %v", err)
+	}
+	log.Println("[API] server stopped")
 }
 
 // showConfiguration displays current configuration
@@ -529,6 +476,8 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  procSniper protect       - Start real-time protection (requires admin)")
+	fmt.Println("  procSniper serve         - Run the local HTTP/SSE API + browser console (headless)")
+	fmt.Println("  procSniper service ...   - Manage the Windows service (install|remove|start|stop)")
 	fmt.Println("  procSniper config        - Show current configuration")
 	fmt.Println("  procSniper ml-test       - Test ML model with predefined scenarios")
 	fmt.Println("  procSniper version       - Show version information")
