@@ -14,6 +14,7 @@ import (
 
 	"procSniper/config"
 	"procSniper/internal/app"
+	"procSniper/internal/delivery/api"
 	"procSniper/internal/infrastructure"
 	"procSniper/internal/usecase"
 )
@@ -77,6 +78,8 @@ func main() {
 			os.Exit(1)
 		}
 		runProtectionMode(cfg, responseCfg, opts.MLModelPath, opts.MLConfidence, opts.MLMinIndicators, opts.DetectionMode, opts.CanaryResponse)
+	case "serve":
+		runServe(cfg, responseCfg)
 	case "config":
 		showConfiguration(responseCfg)
 	case "ml-test":
@@ -230,6 +233,57 @@ func reportStatistics(agent *app.Agent, stop chan struct{}) {
 			log.Println()
 		}
 	}
+}
+
+// runServe runs the local HTTP+SSE API server (foreground). This is the headless delivery surface
+// the Windows service will host; in the foreground it's the dev/iteration path (browser console over
+// http://127.0.0.1:PORT). The detection engine is the same internal/app.Agent the CLI/service use.
+func runServe(cfg *config.Config, responseCfg *config.ResponseConfig) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8787", "listen address (loopback only)")
+	auto := fs.Bool("auto", false, "start protection immediately on boot")
+	tokenFile := fs.String("token-file", "", "write the API bearer token to this path (for the tray/operator)")
+	_ = fs.Parse(os.Args[2:])
+
+	staticFS, err := frontendFS()
+	if err != nil {
+		log.Printf("[API] WARNING: frontend assets unavailable, serving API only: %v", err)
+		staticFS = nil
+	}
+
+	srv, err := api.NewServer(*addr, cfg, responseCfg, staticFS)
+	if err != nil {
+		log.Fatalf("[API] failed to initialize server: %v", err)
+	}
+	if *tokenFile != "" {
+		if err := srv.WriteTokenFile(*tokenFile); err != nil {
+			log.Printf("[API] WARNING: could not write token file: %v", err)
+		}
+	}
+	// Foreground/dev mode prints the token so you can curl/open the console. The service writes it to
+	// an ACL'd file instead (--token-file) and does not log it.
+	log.Printf("[API] console: http://%s/#token=%s", *addr, srv.Token())
+
+	if *auto {
+		if res := srv.StartProtection(); !res.Success {
+			log.Printf("[API] auto-start protection: %s", res.Message)
+		}
+	}
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		<-sigChan
+		log.Println("[API] shutdown signal received")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatalf("[API] server error: %v", err)
+	}
+	log.Println("[API] server stopped")
 }
 
 // showConfiguration displays current configuration
@@ -401,6 +455,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  procSniper protect       - Start real-time protection (requires admin)")
+	fmt.Println("  procSniper serve         - Run the local HTTP/SSE API + browser console (headless)")
 	fmt.Println("  procSniper config        - Show current configuration")
 	fmt.Println("  procSniper ml-test       - Test ML model with predefined scenarios")
 	fmt.Println("  procSniper version       - Show version information")
